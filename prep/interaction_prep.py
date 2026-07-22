@@ -1,7 +1,7 @@
 """
 prepare_interaction_dataset.py
 
-Processes videos to generate data/interaction/master_v3.csv for interaction
+Processes videos to generate data/annotated/annotated_interaction.csv for interaction
 detection training.
 
 Pipeline per video:
@@ -12,7 +12,13 @@ Pipeline per video:
      a. Save the union (merged) crop as the context image.
      b. Run HRNet on each individual cattle crop → keypoints in frame-space.
      c. Save both poses as .npy.
-  5. Write master_v3.csv; label_v1 / label_v2 are left blank for human annotation.
+  5. Write annotated_interaction.csv; label_v1 / label_v2 are left blank for human annotation.
+
+Output layout (split assigned per source video, 6:2:2 train:val:test, so pairs
+from the same video never leak across splits):
+  data/interaction/{split}/crops/{video_stem}/frame_XXXXXXXX_pair_XX.jpg
+  data/interaction/{split}/poses/{video_stem}/frame_XXXXXXXX_pair_XX_{1,2}.npy
+  data/annotated/annotated_interaction.csv
 
 Supports incremental runs — already-processed videos are skipped unless
 --overwrite is passed.
@@ -21,7 +27,7 @@ Usage (from CattleAct root):
   python scripts/prepare_interaction_dataset.py \\
       --video_dir "/user/work/sf24225/data/Full_behav/Videos to process batch 1 - social contacts" \\
       --output_dir data/interaction \\
-      --yolo_ckpt  checkpoints/best.pt \\
+      --yolo_ckpt  checkpoints/yolo.pt \\
       --hrnet_ckpt checkpoints/hrnet_w32_ap10k_256x256-18aac840_20211029.pth \\
       [--sample_fps 1] [--iou_low 0.2] [--iou_high 0.7] \\
       [--yolo_conf 0.3] [--yolo_imgsz 1280] [--device cuda] \\
@@ -31,6 +37,7 @@ Usage (from CattleAct root):
 import argparse
 import csv
 import os
+import random
 import sys
 from itertools import combinations
 from pathlib import Path
@@ -52,10 +59,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.hrnet import HRNetW32
 
 # ── Config (see global_config.yaml at the repository root) ────────────────────
-_CFG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "global_config.yaml")
-with open(_CFG_PATH) as _f:
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+with open(os.path.join(_REPO_ROOT, "global_config.yaml")) as _f:
     _CFG = yaml.safe_load(_f)
+
+
+def _resolve(p):
+    """Resolve config paths relative to the repo root, not the CWD."""
+    return p if os.path.isabs(p) else os.path.join(_REPO_ROOT, p)
 
 NUM_JOINTS  = _CFG["hrnet"]["num_joints"]
 INPUT_SIZE  = _CFG["hrnet"]["input_size"]
@@ -71,7 +82,7 @@ CSV_FIELDNAMES = [
     "image_path", "bbox1_xyxy", "bbox2_xyxy", "merged_bbox_xyxy",
     "pose_path_1", "pose_path_2",
     "label_v1", "label_v2",
-    "source_video", "frame_number",
+    "source_video", "frame_number", "split",
 ]
 
 
@@ -228,9 +239,35 @@ def _extract_boxes(results) -> List[Tuple[int, int, int, int]]:
 
 # ── Per-video processing ───────────────────────────────────────────────────────
 
+def assign_videos_622(video_names: List[str], seed: int) -> dict:
+    """Split source videos 6:2:2 (train:val:test). Assigning at video level
+    keeps pairs sampled from the same footage out of both train and test.
+    Deterministic for a fixed seed and video set."""
+    order = sorted(video_names)
+    random.Random(seed).shuffle(order)
+    n = len(order)
+    if n < 3:
+        print(f"[WARN] only {n} video(s); cannot form 6:2:2. All -> train.")
+        return {v: "train" for v in order}
+    n_test = max(1, round(n * _CFG["split"]["test_ratio"]))
+    n_val  = max(1, round(n * _CFG["split"]["val_ratio"]))
+    n_test = min(n_test, n - 2)
+    n_val  = min(n_val, n - 1 - n_test)
+    assignment = {}
+    for i, v in enumerate(order):
+        if i < n_test:
+            assignment[v] = "test"
+        elif i < n_test + n_val:
+            assignment[v] = "val"
+        else:
+            assignment[v] = "train"
+    return assignment
+
+
 def process_video(
     video_path: str,
     output_dir: str,
+    split: str,
     yolo_model: YOLO,
     hrnet_model: HRNetPoseModel,
     device: torch.device,
@@ -253,8 +290,8 @@ def process_video(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_step  = max(1, int(round(src_fps / sample_fps)))
 
-    crops_dir = os.path.join(output_dir, "crops", video_stem)
-    poses_dir = os.path.join(output_dir, "poses", video_stem)
+    crops_dir = os.path.join(output_dir, split, "crops", video_stem)
+    poses_dir = os.path.join(output_dir, split, "poses", video_stem)
     os.makedirs(crops_dir, exist_ok=True)
     os.makedirs(poses_dir, exist_ok=True)
 
@@ -292,9 +329,13 @@ def process_video(
                     continue
 
                 # ── Save context crop ─────────────────────────────────────────
+                # CSV paths are stored relative to the repo root so the CSV in
+                # data/annotated/ is unambiguous about where the files live.
                 stem     = f"frame_{frame_idx:08d}_pair_{pair_idx:02d}"
-                crop_rel = os.path.join("crops", video_stem, f"{stem}.jpg")
-                cv2.imwrite(os.path.join(output_dir, crop_rel), merged_crop)
+                crop_abs = os.path.join(output_dir, split, "crops", video_stem,
+                                        f"{stem}.jpg")
+                crop_rel = os.path.relpath(crop_abs, _REPO_ROOT)
+                cv2.imwrite(crop_abs, merged_crop)
 
                 # ── HRNet pose (both cattle in one forward pass) ───────────────
                 pil1 = Image.fromarray(cv2.cvtColor(crop1, cv2.COLOR_BGR2RGB))
@@ -308,10 +349,14 @@ def process_video(
                 kps2 = keypoints_to_frame_space(
                     kps_all[1], crop2.shape[1], crop2.shape[0], bbox2[0], bbox2[1])
 
-                pose_rel1 = os.path.join("poses", video_stem, f"{stem}_1.npy")
-                pose_rel2 = os.path.join("poses", video_stem, f"{stem}_2.npy")
-                np.save(os.path.join(output_dir, pose_rel1), kps1)
-                np.save(os.path.join(output_dir, pose_rel2), kps2)
+                pose_abs1 = os.path.join(output_dir, split, "poses", video_stem,
+                                         f"{stem}_1.npy")
+                pose_abs2 = os.path.join(output_dir, split, "poses", video_stem,
+                                         f"{stem}_2.npy")
+                pose_rel1 = os.path.relpath(pose_abs1, _REPO_ROOT)
+                pose_rel2 = os.path.relpath(pose_abs2, _REPO_ROOT)
+                np.save(pose_abs1, kps1)
+                np.save(pose_abs2, kps2)
 
                 rows.append({
                     "image_path":       crop_rel,
@@ -324,6 +369,7 @@ def process_video(
                     "label_v2":         "",
                     "source_video":     video_name,
                     "frame_number":     frame_idx,
+                    "split":            split,
                 })
 
             pbar.update(1)
@@ -339,7 +385,7 @@ def process_video(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build master_v3.csv for interaction detection training."
+        description="Build annotated_interaction.csv for interaction detection training."
     )
     icfg = _CFG["interaction_prep"]
     parser.add_argument("--video_dir",  required=True,
@@ -361,12 +407,17 @@ def main():
     parser.add_argument("--device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--overwrite",  action="store_true",
-                        help="Re-process videos already in master_v3.csv.")
+                        help="Re-process videos already in annotated_interaction.csv.")
     args = parser.parse_args()
 
     device = torch.device(args.device)
+    args.output_dir = _resolve(args.output_dir)
+    args.yolo_ckpt  = _resolve(args.yolo_ckpt)
+    args.hrnet_ckpt = _resolve(args.hrnet_ckpt)
     os.makedirs(args.output_dir, exist_ok=True)
-    csv_path = os.path.join(args.output_dir, "master_v3.csv")
+    annotated_dir = _resolve(_CFG["paths"]["annotated_dir"])
+    os.makedirs(annotated_dir, exist_ok=True)
+    csv_path = os.path.join(annotated_dir, "annotated_interaction.csv")
 
     # Load existing rows so the script can be run incrementally
     existing_rows     = []
@@ -391,6 +442,14 @@ def main():
         print("Nothing to do. Use --overwrite to reprocess.")
         return
 
+    # Assign splits over the full video set so the assignment stays stable
+    # across incremental runs (fixed seed, same video list).
+    assignment = assign_videos_622([p.name for p in video_paths],
+                                   _CFG["random_seed"])
+    print("Video split (6:2:2):")
+    for name, sp in sorted(assignment.items(), key=lambda kv: (kv[1], kv[0])):
+        print(f"  [{sp}] {name}")
+
     print("Loading YOLO …")
     yolo_model  = YOLO(args.yolo_ckpt)
     print("Loading HRNet …")
@@ -401,6 +460,7 @@ def main():
         rows = process_video(
             video_path  = str(vp),
             output_dir  = args.output_dir,
+            split       = assignment[vp.name],
             yolo_model  = yolo_model,
             hrnet_model = hrnet_model,
             device      = device,

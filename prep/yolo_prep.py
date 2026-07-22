@@ -18,10 +18,11 @@ Expected directory structure (set DATA_ROOT below):
     ...
 
 Output:
-  data/yolo_cattle/
-    images/train/  images/val/  images/test/
-    labels/train/  labels/val/  labels/test/
-    cattle.yaml
+  data/object/
+    train/images/  train/labels/
+    val/images/    val/labels/
+    test/images/   test/labels/
+    object.yaml
 
 YOLO OBB label format per line:
   0 x1 y1 x2 y2 x3 y3 x4 y4   (class_id + 4 corners, normalized 0-1)
@@ -34,13 +35,18 @@ import cv2
 import yaml
 
 # ── Config (see global_config.yaml at the repository root) ────────────────────
-_CFG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "global_config.yaml")
-with open(_CFG_PATH) as _f:
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+with open(os.path.join(_REPO_ROOT, "global_config.yaml")) as _f:
     _CFG = yaml.safe_load(_f)
 
-DATA_ROOT   = _CFG["paths"]["data_root"]
-OUTPUT_DIR  = _CFG["yolo_prep"]["output_dir"]
+
+def _resolve(p):
+    """Resolve config paths relative to the repo root, not the CWD."""
+    return p if os.path.isabs(p) else os.path.join(_REPO_ROOT, p)
+
+
+DATA_ROOT   = _resolve(_CFG["paths"]["data_root"])
+OUTPUT_DIR  = _resolve(_CFG["yolo_prep"]["output_dir"])
 FRAME_STEP  = _CFG["yolo_prep"]["frame_step"]
 VAL_RATIO   = _CFG["split"]["val_ratio"]
 TEST_RATIO  = _CFG["split"]["test_ratio"]
@@ -119,8 +125,8 @@ def process_session(session_id, tracklets_path, video_path, split, split_counts)
             continue
 
         stem  = f"{session_id}_frame_{fn:06d}"
-        img_path   = os.path.join(OUTPUT_DIR, "images", split, stem + ".jpg")
-        label_path = os.path.join(OUTPUT_DIR, "labels", split, stem + ".txt")
+        img_path   = os.path.join(OUTPUT_DIR, split, "images", stem + ".jpg")
+        label_path = os.path.join(OUTPUT_DIR, split, "labels", stem + ".txt")
 
         cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
         with open(label_path, "w") as lf:
@@ -167,8 +173,8 @@ def main():
     random.seed(RANDOM_SEED)
 
     for split in ("train", "val", "test"):
-        os.makedirs(os.path.join(OUTPUT_DIR, "images", split), exist_ok=True)
-        os.makedirs(os.path.join(OUTPUT_DIR, "labels", split), exist_ok=True)
+        os.makedirs(os.path.join(OUTPUT_DIR, split, "images"), exist_ok=True)
+        os.makedirs(os.path.join(OUTPUT_DIR, split, "labels"), exist_ok=True)
 
     sessions = discover_sessions(DATA_ROOT)
     print(f"Found {len(sessions)} sessions:")
@@ -187,15 +193,15 @@ def main():
         process_session(session_id, tracklets_path, video_path,
                         assignment[camera], split_counts)
 
-    yaml_path = os.path.join(OUTPUT_DIR, "cattle.yaml")
+    yaml_path = os.path.join(OUTPUT_DIR, "object.yaml")
     abs_output = os.path.abspath(OUTPUT_DIR)
     with open(yaml_path, "w") as yf:
         yf.write(f"path: {abs_output}\n")
-        yf.write("train: images/train\n")
-        yf.write("val: images/val\n")
-        yf.write("test: images/test\n\n")
+        yf.write("train: train/images\n")
+        yf.write("val: val/images\n")
+        yf.write("test: test/images\n\n")
         yf.write("nc: 1\n")
-        yf.write("names: ['cattle']\n")
+        yf.write("names: ['object']\n")
 
     print(f"\n=== Summary ===")
     print(f"Train: {split_counts['train']} frames, "
@@ -205,7 +211,7 @@ def main():
     print(f"\nTo train:")
     print(f"  yolo obb train model=yolo11n-obb.pt data={yaml_path} epochs=50 imgsz=1280")
     print(f"To evaluate on the unseen test split:")
-    print(f"  yolo obb val model=<best.pt> data={yaml_path} split=test imgsz=1280")
+    print(f"  yolo obb val model=checkpoints/yolo.pt data={yaml_path} split=test imgsz=1280")
 
 
 if __name__ == "__main__":

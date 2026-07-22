@@ -10,14 +10,15 @@ split:
   test_ratio: 0.2
 
 paths:
+  annotated_dir: data/annotated   # annotated_{action,interaction}.csv live here
   data_root: /user/work/sf24225/data/Full_behav/Marco
   clips_dir: /user/work/sf24225/data/Full_behav/Marco/clips
   hrnet_ckpt: checkpoints/hrnet_w32_ap10k_256x256-18aac840_20211029.pth
-  yolo_ckpt: checkpoints/best.pt
+  yolo_ckpt: checkpoints/yolo.pt
 
 # ── YOLO OBB dataset prep (prep/yolo_prep.py) ─────────────────────────────────
 yolo_prep:
-  output_dir: data/yolo_cattle
+  output_dir: data/object
   frame_step: 16          # sample every N frames (~1 per second at 16 fps)
   camera_dirs: [camera128, camera133, camera26, camera27, camera48]
 

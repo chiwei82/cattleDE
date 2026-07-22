@@ -1,0 +1,12 @@
+# Derived from the imports in prep/*.py.
+# Note: ultralytics already depends on torch, torchvision, opencv-python,
+# numpy, pillow, pyyaml, and tqdm — they are pinned here explicitly because
+# the scripts import them directly.
+ultralytics
+torch
+torchvision
+opencv-python
+numpy
+pillow
+pyyaml
+tqdm

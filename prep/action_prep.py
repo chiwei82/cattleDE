@@ -34,9 +34,9 @@ Pose:
   pose_path stays empty and training falls back to image-only augmentation.
 
 Output:
-  data/action/crops/{split}/{label}/{session}_{clip}_f{n:04d}.jpg
-  data/action/poses/{split}/{label}/{session}_{clip}_f{n:04d}.npy  (if HRNet)
-  data/action/master.csv
+  data/action/{split}/crops/{label}/{session}_{clip}_f{n:04d}.jpg
+  data/action/{split}/poses/{label}/{session}_{clip}_f{n:04d}.npy  (if HRNet)
+  data/annotated/annotated_action.csv
 """
 
 import csv
@@ -54,18 +54,23 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ── Config (see global_config.yaml at the repository root) ────────────────────
-_CFG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "global_config.yaml")
-with open(_CFG_PATH) as _f:
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+with open(os.path.join(_REPO_ROOT, "global_config.yaml")) as _f:
     _CFG = yaml.safe_load(_f)
 
-CLIPS_BASE_DIR = _CFG["paths"]["clips_dir"]
-OUTPUT_DIR     = _CFG["action_prep"]["output_dir"]
+
+def _resolve(p):
+    """Resolve config paths relative to the repo root, not the CWD."""
+    return p if os.path.isabs(p) else os.path.join(_REPO_ROOT, p)
+
+
+CLIPS_BASE_DIR = _resolve(_CFG["paths"]["clips_dir"])
+OUTPUT_DIR     = _resolve(_CFG["action_prep"]["output_dir"])
 SAMPLE_EVERY   = _CFG["action_prep"]["sample_every"]
 VAL_RATIO      = _CFG["split"]["val_ratio"]
 TEST_RATIO     = _CFG["split"]["test_ratio"]
 RANDOM_SEED    = _CFG["random_seed"]
-HRNET_CKPT     = _CFG["paths"]["hrnet_ckpt"]
+HRNET_CKPT     = _resolve(_CFG["paths"]["hrnet_ckpt"])
 POSE_BATCH     = _CFG["action_prep"]["pose_batch"]
 
 SPLITS = ("train", "val", "test")
@@ -122,21 +127,23 @@ def extract_frames(clip_path, label, session_id, clip_stem, split,
         frame_idx += 1
     cap.release()
 
+    # CSV paths are stored relative to the repo root so the CSV in
+    # data/annotated/ is unambiguous about where the files live.
     rows = []
     for frame_idx, frame in sampled:
         stem = f"{session_id}_{clip_stem}_f{frame_idx:04d}"
-        rel  = os.path.join("crops", split, label, stem + ".jpg")
-        cv2.imwrite(os.path.join(OUTPUT_DIR, rel), frame,
-                    [cv2.IMWRITE_JPEG_QUALITY, 95])
-        rows.append({"image_path": rel, "Label": label, "pose_path": ""})
+        img_abs = os.path.join(OUTPUT_DIR, split, "crops", label, stem + ".jpg")
+        cv2.imwrite(img_abs, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        rows.append({"image_path": os.path.relpath(img_abs, _REPO_ROOT),
+                     "Label": label, "pose_path": ""})
 
     if pose_model is not None and sampled:
         poses = estimate_poses([f for _, f in sampled], pose_model, device)
         for row, (frame_idx, _), kps in zip(rows, sampled, poses):
             stem = f"{session_id}_{clip_stem}_f{frame_idx:04d}"
-            pose_rel = os.path.join("poses", split, label, stem + ".npy")
-            np.save(os.path.join(OUTPUT_DIR, pose_rel), kps)
-            row["pose_path"] = pose_rel
+            pose_abs = os.path.join(OUTPUT_DIR, split, "poses", label, stem + ".npy")
+            np.save(pose_abs, kps)
+            row["pose_path"] = os.path.relpath(pose_abs, _REPO_ROOT)
 
     return rows
 
@@ -197,8 +204,8 @@ def assign_groups_622(groups, seed):
 def main():
     for split in SPLITS:
         for label in LABEL_MAP.values():
-            os.makedirs(os.path.join(OUTPUT_DIR, "crops", split, label), exist_ok=True)
-            os.makedirs(os.path.join(OUTPUT_DIR, "poses", split, label), exist_ok=True)
+            os.makedirs(os.path.join(OUTPUT_DIR, split, "crops", label), exist_ok=True)
+            os.makedirs(os.path.join(OUTPUT_DIR, split, "poses", label), exist_ok=True)
 
     clips = discover_clips()
     print(f"Total clips: {len(clips)}")
@@ -235,7 +242,9 @@ def main():
         all_rows.extend(rows)
         split_label_counts[(split, clip["label"])] += len(rows)
 
-    csv_path = os.path.join(OUTPUT_DIR, "master.csv")
+    annotated_dir = _resolve(_CFG["paths"]["annotated_dir"])
+    os.makedirs(annotated_dir, exist_ok=True)
+    csv_path = os.path.join(annotated_dir, "annotated_action.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["image_path", "Label", "pose_path"])
         writer.writeheader()
@@ -251,7 +260,7 @@ def main():
     for split in SPLITS:
         total = sum(v for (s, _), v in split_label_counts.items() if s == split)
         print(f"  [{split}] total: {total}")
-    print(f"master.csv -> {csv_path}")
+    print(f"annotated_action.csv -> {csv_path}")
     print('\nNOTE: load with split_type="date" '
           "(src.dataset.split_action_dataset_entries) so the split in the "
           "image path is respected.")
