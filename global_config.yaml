@@ -1,0 +1,45 @@
+# Global configuration shared by the prep scripts (prep/*.py).
+# Each script loads this file from the repository root.
+
+# ── Shared ─────────────────────────────────────────────────────────────────────
+random_seed: 42
+
+# train:val:test = 6:2:2
+split:
+  val_ratio: 0.2
+  test_ratio: 0.2
+
+paths:
+  data_root: /user/work/sf24225/data/Full_behav/Marco
+  clips_dir: /user/work/sf24225/data/Full_behav/Marco/clips
+  hrnet_ckpt: checkpoints/hrnet_w32_ap10k_256x256-18aac840_20211029.pth
+  yolo_ckpt: checkpoints/best.pt
+
+# ── YOLO OBB dataset prep (prep/yolo_prep.py) ─────────────────────────────────
+yolo_prep:
+  output_dir: data/yolo_cattle
+  frame_step: 16          # sample every N frames (~1 per second at 16 fps)
+  camera_dirs: [camera128, camera133, camera26, camera27, camera48]
+
+# ── Interaction dataset prep (prep/interaction_prep.py) ───────────────────────
+interaction_prep:
+  output_dir: data/interaction
+  sample_fps: 1.0
+  iou_low: 0.2
+  iou_high: 0.7
+  yolo_conf: 0.3
+  yolo_imgsz: 1280
+  nested_thresh: 0.85
+
+# ── Action dataset prep (prep/action_prep.py) ─────────────────────────────────
+action_prep:
+  output_dir: data/action
+  sample_every: 8         # 1 frame every N frames (16 fps clips -> 2 fps)
+  pose_batch: 32          # HRNet inference batch size
+  labels: [standing, stepping, walking, lying, transitiondown, transitionup, sniffingbed]
+
+# ── HRNet constants ────────────────────────────────────────────────────────────
+hrnet:
+  num_joints: 17
+  input_size: 256
+  hmap_size: 64
