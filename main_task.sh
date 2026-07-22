@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-cd /user/work/yx25778/CattleDE
+cd /user/work/yx25778/cattleDE
 
 module load languages/python/3.12.3
 source venv/bin/activate
