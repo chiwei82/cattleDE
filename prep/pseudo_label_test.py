@@ -139,14 +139,17 @@ def main():
         dst_img = os.path.join(out_images, name)
         os.symlink(os.path.abspath(img_path), dst_img)
 
-    # Dataset yaml for evaluation. Write both the split key and a `val:` key
-    # (some ultralytics versions require `val:` to exist even for split=test).
+    # Dataset yaml for evaluation. Ultralytics requires BOTH `train:` and `val:`
+    # keys in every data YAML, so point all splits at the pseudo images; the
+    # split= arg selects which one val mode actually loads.
     yaml_path = os.path.join(PSEUDO_DIR, "object_pseudo.yaml")
+    rel = f"{SPLIT}/images"
     with open(yaml_path, "w") as yf:
         yf.write(f"path: {os.path.abspath(PSEUDO_DIR)}\n")
-        yf.write(f"val: {SPLIT}/images\n")
-        if SPLIT != "val":
-            yf.write(f"{SPLIT}: {SPLIT}/images\n")
+        yf.write(f"train: {rel}\n")
+        yf.write(f"val: {rel}\n")
+        if SPLIT not in ("train", "val"):
+            yf.write(f"{SPLIT}: {rel}\n")
         yf.write("\nnc: 1\n")
         yf.write("names: ['object']\n")
 
