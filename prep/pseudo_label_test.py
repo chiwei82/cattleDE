@@ -139,24 +139,50 @@ def main():
         dst_img = os.path.join(out_images, name)
         os.symlink(os.path.abspath(img_path), dst_img)
 
-    # Dataset yaml for evaluation.
+    # Dataset yaml for evaluation. Write both the split key and a `val:` key
+    # (some ultralytics versions require `val:` to exist even for split=test).
     yaml_path = os.path.join(PSEUDO_DIR, "object_pseudo.yaml")
     with open(yaml_path, "w") as yf:
         yf.write(f"path: {os.path.abspath(PSEUDO_DIR)}\n")
-        yf.write(f"{SPLIT}: {SPLIT}/images\n\n")
-        yf.write("nc: 1\n")
+        yf.write(f"val: {SPLIT}/images\n")
+        if SPLIT != "val":
+            yf.write(f"{SPLIT}: {SPLIT}/images\n")
+        yf.write("\nnc: 1\n")
         yf.write("names: ['object']\n")
 
     print(f"\n=== Pseudo-labeling summary ({SPLIT}) ===")
     print(f"Original labels:      {n_orig}")
-    print(f"Added by COCO model:  {n_added}  "
-          f"(+{n_added / n_orig * 100:.1f}%)" if n_orig else "")
+    if n_orig:
+        print(f"Added by COCO model:  {n_added}  (+{n_added / n_orig * 100:.1f}%)")
+    else:
+        print(f"Added by COCO model:  {n_added}")
     print(f"Images gaining boxes: {n_imgs_touched} / {len(names)}")
     print(f"Pseudo dataset:       {PSEUDO_DIR}")
     print(f"YAML:                 {yaml_path}")
-    print(f"\nRe-evaluate:")
-    print(f"  yolo obb val model={_CFG['paths']['yolo_ckpt']} "
-          f"data={yaml_path} split={SPLIT} imgsz={_CFG['yolo_train']['imgsz']}")
+
+    # ── Re-evaluate the trained model against the pseudo-labels ────────────────
+    # Use an ABSOLUTE project path: ultralytics prepends its default runs dir to
+    # relative project= paths, producing runs/obb/runs/obb/... doubling.
+    yolo_ckpt = _resolve(_CFG["paths"]["yolo_ckpt"])
+    if not os.path.exists(yolo_ckpt):
+        print(f"\n[WARN] trained model not found at {yolo_ckpt}; skipping eval. "
+              f"Run manually once it exists:\n"
+              f"  yolo obb val model={yolo_ckpt} data={yaml_path} "
+              f"split={SPLIT} imgsz={_CFG['yolo_train']['imgsz']}")
+        return
+
+    print(f"\n=== Evaluating {yolo_ckpt} against pseudo-labels ({SPLIT}) ===")
+    run_dir = os.path.join(_REPO_ROOT, _CFG["yolo_train"]["run_dir"])
+    metrics = YOLO(yolo_ckpt).val(
+        data=yaml_path,
+        split=SPLIT,
+        imgsz=_CFG["yolo_train"]["imgsz"],
+        project=run_dir,
+        name=f"{_CFG['yolo_train']['run_name']}_pseudo_{SPLIT}",
+        exist_ok=True,
+    )
+    print(f"Results saved under {run_dir}/"
+          f"{_CFG['yolo_train']['run_name']}_pseudo_{SPLIT}")
 
 
 if __name__ == "__main__":
