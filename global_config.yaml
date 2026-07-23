@@ -35,6 +35,20 @@ yolo_prep:
   frame_step: 16          # sample every N frames (~1 per second at 16 fps)
   camera_dirs: [camera128, camera133, camera26, camera27, camera48]
 
+# ── Pseudo-labeling test split with an independent COCO model ─────────────────
+# (prep/pseudo_label_test.py) Auto-fills missing cattle labels using an
+# off-the-shelf COCO detector — NO manual annotation. Output is a pseudo-label
+# set, not human-verified ground truth.
+pseudo_label:
+  split: test             # which split of yolo_prep.output_dir to augment
+  model: yolo11x.pt       # COCO-pretrained detector (auto-downloads)
+  coco_cow_class: 19      # "cow" class id in COCO
+  conf: 0.25              # COCO detection confidence threshold
+  imgsz: 1280
+  iou_match_thresh: 0.3   # a COCO box with max IoU < this vs existing labels
+                          # counts as a missing cow and gets added
+  pseudo_suffix: _pseudo  # output dataset dir = <output_dir><suffix>
+
 # ── Interaction dataset prep (prep/interaction_prep.py) ───────────────────────
 interaction_prep:
   video_dir: "/user/work/sf24225/data/Full_behav/Videos to process batch 1 - social contacts"
