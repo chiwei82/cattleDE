@@ -26,9 +26,9 @@ yolo_prep:
 interaction_prep:
   output_dir: data/interaction
   sample_fps: 1.0
-  iou_low: 0.2
-  iou_high: 0.7
-  yolo_conf: 0.3
+  iou_low: 0.1
+  iou_high: 0.8
+  yolo_conf: 0.8
   yolo_imgsz: 1280
   nested_thresh: 0.85
 
