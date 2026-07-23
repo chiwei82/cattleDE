@@ -20,7 +20,7 @@ module load languages/python/3.12.3
 source venv/bin/activate
 
 DATA_YAML=data/object/object.yaml
-RUN_DIR=log/yolo          # ultralytics writes runs here
+RUN_DIR=runs/obb/log/yolo          # ultralytics writes runs here
 RUN_NAME=obb_train
 IMGSZ=1280
 EPOCHS=50
@@ -32,15 +32,15 @@ EPOCHS=50
 # fi
 
 # ── 2. Train (disabled for now — dataset prep only) ───────────────────────────
-echo "=== Training YOLO OBB ==="
-yolo obb train \
-    model=yolo11n-obb.pt \
-    data="$DATA_YAML" \
-    epochs=$EPOCHS \
-    imgsz=$IMGSZ \
-    project="$RUN_DIR" \
-    name="$RUN_NAME" \
-    exist_ok=True
+# echo "=== Training YOLO OBB ==="
+# yolo obb train \
+#     model=yolo11n-obb.pt \
+#     data="$DATA_YAML" \
+#     epochs=$EPOCHS \
+#     imgsz=$IMGSZ \
+#     project="$RUN_DIR" \
+#     name="$RUN_NAME" \
+#     exist_ok=True
 
 # Publish the best checkpoint where the downstream scripts expect it
 BEST="$RUN_DIR/$RUN_NAME/weights/best.pt"
