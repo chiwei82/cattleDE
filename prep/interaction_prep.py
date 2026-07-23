@@ -291,9 +291,10 @@ def process_video(
     frame_step  = max(1, int(round(src_fps / sample_fps)))
 
     crops_dir = os.path.join(output_dir, split, "crops", video_stem)
-    poses_dir = os.path.join(output_dir, split, "poses", video_stem)
     os.makedirs(crops_dir, exist_ok=True)
-    os.makedirs(poses_dir, exist_ok=True)
+    if hrnet_model is not None:
+        poses_dir = os.path.join(output_dir, split, "poses", video_stem)
+        os.makedirs(poses_dir, exist_ok=True)
 
     rows      = []
     frame_idx = 0
@@ -338,25 +339,29 @@ def process_video(
                 cv2.imwrite(crop_abs, merged_crop)
 
                 # ── HRNet pose (both cattle in one forward pass) ───────────────
-                pil1 = Image.fromarray(cv2.cvtColor(crop1, cv2.COLOR_BGR2RGB))
-                pil2 = Image.fromarray(cv2.cvtColor(crop2, cv2.COLOR_BGR2RGB))
-                heatmaps = run_hrnet([pil1, pil2], hrnet_model, device)  # (2,J,64,64)
-                kps_all  = decode_heatmaps(heatmaps)                      # (2,J,3)
+                # Skipped when use_pose is off (hrnet_model is None):
+                # pose columns stay empty and downstream trains image-only.
+                pose_rel1 = pose_rel2 = ""
+                if hrnet_model is not None:
+                    pil1 = Image.fromarray(cv2.cvtColor(crop1, cv2.COLOR_BGR2RGB))
+                    pil2 = Image.fromarray(cv2.cvtColor(crop2, cv2.COLOR_BGR2RGB))
+                    heatmaps = run_hrnet([pil1, pil2], hrnet_model, device)  # (2,J,64,64)
+                    kps_all  = decode_heatmaps(heatmaps)                      # (2,J,3)
 
-                # Convert to frame-space coordinates
-                kps1 = keypoints_to_frame_space(
-                    kps_all[0], crop1.shape[1], crop1.shape[0], bbox1[0], bbox1[1])
-                kps2 = keypoints_to_frame_space(
-                    kps_all[1], crop2.shape[1], crop2.shape[0], bbox2[0], bbox2[1])
+                    # Convert to frame-space coordinates
+                    kps1 = keypoints_to_frame_space(
+                        kps_all[0], crop1.shape[1], crop1.shape[0], bbox1[0], bbox1[1])
+                    kps2 = keypoints_to_frame_space(
+                        kps_all[1], crop2.shape[1], crop2.shape[0], bbox2[0], bbox2[1])
 
-                pose_abs1 = os.path.join(output_dir, split, "poses", video_stem,
-                                         f"{stem}_1.npy")
-                pose_abs2 = os.path.join(output_dir, split, "poses", video_stem,
-                                         f"{stem}_2.npy")
-                pose_rel1 = os.path.relpath(pose_abs1, _REPO_ROOT)
-                pose_rel2 = os.path.relpath(pose_abs2, _REPO_ROOT)
-                np.save(pose_abs1, kps1)
-                np.save(pose_abs2, kps2)
+                    pose_abs1 = os.path.join(output_dir, split, "poses", video_stem,
+                                             f"{stem}_1.npy")
+                    pose_abs2 = os.path.join(output_dir, split, "poses", video_stem,
+                                             f"{stem}_2.npy")
+                    pose_rel1 = os.path.relpath(pose_abs1, _REPO_ROOT)
+                    pose_rel2 = os.path.relpath(pose_abs2, _REPO_ROOT)
+                    np.save(pose_abs1, kps1)
+                    np.save(pose_abs2, kps2)
 
                 rows.append({
                     "image_path":       crop_rel,
@@ -454,8 +459,12 @@ def main():
 
     print("Loading YOLO …")
     yolo_model  = YOLO(args.yolo_ckpt)
-    print("Loading HRNet …")
-    hrnet_model = load_hrnet(args.hrnet_ckpt, device)
+    hrnet_model = None
+    if _CFG["interaction_prep"]["use_pose"]:
+        print("Loading HRNet …")
+        hrnet_model = load_hrnet(args.hrnet_ckpt, device)
+    else:
+        print("use_pose is off — skipping HRNet; pose columns will be empty.")
 
     all_new_rows = []
     for vp in tqdm(to_process, desc="Videos"):

@@ -74,6 +74,12 @@ RUN_DIR="$PWD/$CFG_RUN_DIR"
 # echo "=== Done. Dataset built at data/object ==="
 
 # ── 4. Interaction dataset prep (video_dir comes from global_config.yaml) ─────
+# Filter parameters changed (yolo_conf/iou/sample_fps), so previous outputs are
+# stale AND the incremental-resume logic would skip every video if the old CSV
+# is still present. Clean rebuild:
+echo "=== Removing stale interaction outputs ==="
+rm -rf data/interaction data/annotated/annotated_interaction.csv
+
 echo "=== Building interaction dataset ==="
 python prep/interaction_prep.py
 

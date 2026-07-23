@@ -49,6 +49,7 @@ interaction_prep:
 # ── Action dataset prep (prep/action_prep.py) ─────────────────────────────────
 action_prep:
   output_dir: data/action
+  use_pose: false         # false = skip HRNet entirely; pose_path stays empty
   sample_every: 8         # 1 frame every N frames (16 fps clips -> 2 fps)
   pose_batch: 32          # HRNet inference batch size
   labels: [standing, stepping, walking, lying, transitiondown, transitionup, sniffingbed]
