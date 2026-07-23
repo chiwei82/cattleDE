@@ -460,7 +460,7 @@ def main():
     print("Loading YOLO …")
     yolo_model  = YOLO(args.yolo_ckpt)
     hrnet_model = None
-    if _CFG["interaction_prep"]["use_pose"]:
+    if _CFG["interaction_prep"].get("use_pose", False):
         print("Loading HRNet …")
         hrnet_model = load_hrnet(args.hrnet_ckpt, device)
     else:

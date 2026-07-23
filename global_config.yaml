@@ -39,6 +39,7 @@ yolo_prep:
 interaction_prep:
   video_dir: "/user/work/sf24225/data/Full_behav/Videos to process batch 1 - social contacts"
   output_dir: data/interaction
+  use_pose: false         # false = skip HRNet entirely; pose columns stay empty
   sample_fps: 1.0
   iou_low: 0.1
   iou_high: 0.8

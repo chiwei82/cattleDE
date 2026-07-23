@@ -81,7 +81,7 @@ LABEL_MAP = {label: label for label in _CFG["action_prep"]["labels"]}
 def load_pose_model():
     """Load the AP-10K HRNet if use_pose is on and HRNET_CKPT exists;
     otherwise continue without pose."""
-    if not _CFG["action_prep"]["use_pose"]:
+    if not _CFG["action_prep"].get("use_pose", False):
         print("use_pose is off — skipping HRNet; pose_path will be empty.")
         return None, None
     if not os.path.exists(HRNET_CKPT):
