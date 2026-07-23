@@ -57,7 +57,7 @@ interaction_prep:
   sample_fps: 1.0
   iou_low: 0.1
   iou_high: 0.8
-  yolo_conf: 0.489 # based on best f1-score
+  yolo_conf: 0.6 # based on best f1-score
   yolo_imgsz: 1280
   nested_thresh: 0.85
 
