@@ -388,8 +388,9 @@ def main():
         description="Build annotated_interaction.csv for interaction detection training."
     )
     icfg = _CFG["interaction_prep"]
-    parser.add_argument("--video_dir",  required=True,
-                        help="Folder containing input videos.")
+    parser.add_argument("--video_dir",  default=icfg["video_dir"],
+                        help="Folder containing input videos "
+                             "(default: interaction_prep.video_dir in global_config.yaml).")
     parser.add_argument("--output_dir", default=icfg["output_dir"])
     parser.add_argument("--yolo_ckpt",  default=_CFG["paths"]["yolo_ckpt"])
     parser.add_argument("--hrnet_ckpt", default=_CFG["paths"]["hrnet_ckpt"])
@@ -411,6 +412,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device)
+    args.video_dir  = _resolve(args.video_dir)
     args.output_dir = _resolve(args.output_dir)
     args.yolo_ckpt  = _resolve(args.yolo_ckpt)
     args.hrnet_ckpt = _resolve(args.hrnet_ckpt)

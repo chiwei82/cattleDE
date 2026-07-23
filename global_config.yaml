@@ -16,6 +16,19 @@ paths:
   hrnet_ckpt: checkpoints/hrnet_w32_ap10k_256x256-18aac840_20211029.pth
   yolo_ckpt: checkpoints/yolo.pt
 
+# ── YOLO OBB training (main_task.sh) ──────────────────────────────────────────
+yolo_train:
+  model: yolo11n-obb.pt   # base model to fine-tune
+  epochs: 50
+  imgsz: 1280
+  run_dir: log/yolo       # ultralytics run output (relative to repo root)
+  run_name: obb_train
+
+# ── Pose visualization (prep/pose_vis.py) ─────────────────────────────────────
+pose_vis:
+  num_samples: 20
+  conf_kp: 0.3            # min keypoint confidence to draw
+
 # ── YOLO OBB dataset prep (prep/yolo_prep.py) ─────────────────────────────────
 yolo_prep:
   output_dir: data/object
@@ -24,6 +37,7 @@ yolo_prep:
 
 # ── Interaction dataset prep (prep/interaction_prep.py) ───────────────────────
 interaction_prep:
+  video_dir: "/user/work/sf24225/data/Full_behav/Videos to process batch 1 - social contacts"
   output_dir: data/interaction
   sample_fps: 1.0
   iou_low: 0.1

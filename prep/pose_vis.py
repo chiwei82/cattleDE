@@ -63,13 +63,14 @@ def draw_pose(img, kps, conf_thresh):
 
 def main():
     icfg = _CFG["interaction_prep"]
+    pcfg = _CFG["pose_vis"]
     parser = argparse.ArgumentParser(
         description="Draw HRNet skeletons on random dataset frames."
     )
-    parser.add_argument("--num",       type=int,   default=20,
-                        help="Number of frames to sample (default 20).")
-    parser.add_argument("--conf_kp",   type=float, default=0.3,
-                        help="Min keypoint confidence to draw (default 0.3).")
+    parser.add_argument("--num",       type=int,   default=pcfg["num_samples"],
+                        help="Number of frames to sample.")
+    parser.add_argument("--conf_kp",   type=float, default=pcfg["conf_kp"],
+                        help="Min keypoint confidence to draw.")
     parser.add_argument("--yolo_ckpt",  default=_CFG["paths"]["yolo_ckpt"])
     parser.add_argument("--hrnet_ckpt", default=_CFG["paths"]["hrnet_ckpt"])
     parser.add_argument("--yolo_conf",  type=float, default=icfg["yolo_conf"])
