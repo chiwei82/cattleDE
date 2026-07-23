@@ -20,7 +20,9 @@ module load languages/python/3.12.3
 source venv/bin/activate
 
 DATA_YAML=data/object/object.yaml
-RUN_DIR=runs/obb/log/yolo          # ultralytics writes runs here
+# Absolute path: ultralytics prepends its default runs dir (runs/obb/) to any
+# RELATIVE project= path, which is how runs/obb/runs/obb/... doubling happens.
+RUN_DIR="$PWD/log/yolo"            # ultralytics writes runs here
 RUN_NAME=obb_train
 IMGSZ=1280
 EPOCHS=50
