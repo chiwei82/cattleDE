@@ -1,15 +1,23 @@
 """
-Auto-fill missing cattle labels in a split using an independent COCO detector.
+Auto-fill missing cattle labels across all splits using an independent COCO
+detector, producing a corrected dataset the OBB model can be RETRAINED on.
 
-Motivation: the original labels (from tracklets.json) miss some cattle, which
-inflates false positives when evaluating the trained detector. This script runs
-an off-the-shelf COCO-pretrained YOLO (class "cow") as an INDEPENDENT second
-opinion, and adds any cow it finds that has no overlapping existing label.
+Motivation: the original labels (from tracklets.json) miss ~22% of cattle.
+During training those unlabeled cattle act as negatives, so the model is
+punished for confidently detecting real cows -> it learns to output low
+confidence (high recall only at a low confidence threshold). Filling the
+missing labels removes that penalty.
 
-No manual annotation is involved. The result is a PSEUDO-LABEL set, not
-human-verified ground truth: COCO has its own errors and its cattle are mostly
-side-view (vs this dataset's overhead view), so treat the corrected metric as
-"evaluated against independent pseudo-labels", not as a clean ground truth.
+Method: run an off-the-shelf COCO-pretrained YOLO (class "cow") as an
+INDEPENDENT second opinion on every split, and add any cow it finds that has no
+overlapping existing label.
+
+Caveats (state these when reporting results):
+  - NO manual annotation — this is a pseudo-label set, not clean ground truth.
+  - COCO outputs AXIS-ALIGNED boxes; added labels therefore have no orientation,
+    which slightly degrades OBB tightness supervision on the added ~22%.
+  - COCO's cattle are mostly side-view vs this dataset's overhead view, so it
+    may also miss some cattle (a recall ceiling this cannot fix).
 
 Output (does NOT touch the original dataset):
   <output_dir><suffix>/
@@ -17,12 +25,8 @@ Output (does NOT touch the original dataset):
     <split>/labels/   -> original labels + added cow boxes (axis-aligned OBB)
     object_pseudo.yaml
 
-Evaluate the trained model against it:
-  yolo obb val model=checkpoints/yolo.pt \\
-      data=data/object_pseudo/object_pseudo.yaml split=<split> imgsz=1280
-
 Usage (from the repo root, on a machine with the venv):
-  python prep/pseudo_label_test.py
+  python prep/pseudo_label.py
 """
 
 import os
@@ -46,7 +50,7 @@ def _resolve(p):
 
 PCFG        = _CFG["pseudo_label"]
 DATASET_DIR = _resolve(_CFG["yolo_prep"]["output_dir"])
-SPLIT       = PCFG["split"]
+SPLITS      = PCFG["splits"]
 PSEUDO_DIR  = _resolve(_CFG["yolo_prep"]["output_dir"] + PCFG["pseudo_suffix"])
 
 
@@ -74,25 +78,21 @@ def aabb_to_obb_norm(x1, y1, x2, y2, w, h):
     return "0 " + " ".join(f"{c:.6f}" for c in corners)
 
 
-def main():
-    images_dir = os.path.join(DATASET_DIR, SPLIT, "images")
-    labels_dir = os.path.join(DATASET_DIR, SPLIT, "labels")
+def process_split(split, model):
+    """Build the pseudo-labeled version of one split. Returns (n_orig, n_added)."""
+    images_dir = os.path.join(DATASET_DIR, split, "images")
+    labels_dir = os.path.join(DATASET_DIR, split, "labels")
     if not os.path.isdir(images_dir):
-        print(f"[ERROR] {images_dir} not found. Run prep/yolo_prep.py first.")
-        sys.exit(1)
+        print(f"[WARN] {images_dir} not found, skipping split '{split}'.")
+        return 0, 0
 
-    out_images = os.path.join(PSEUDO_DIR, SPLIT, "images")
-    out_labels = os.path.join(PSEUDO_DIR, SPLIT, "labels")
-    if os.path.isdir(PSEUDO_DIR):
-        shutil.rmtree(PSEUDO_DIR)           # clean rebuild
+    out_images = os.path.join(PSEUDO_DIR, split, "images")
+    out_labels = os.path.join(PSEUDO_DIR, split, "labels")
     os.makedirs(out_images, exist_ok=True)
     os.makedirs(out_labels, exist_ok=True)
 
-    print(f"Loading COCO model {PCFG['model']} ...")
-    model = YOLO(PCFG["model"])
-
     names = sorted(f for f in os.listdir(images_dir) if f.endswith(".jpg"))
-    print(f"{len(names)} images in split '{SPLIT}'.")
+    print(f"\n[{split}] {len(names)} images")
 
     n_orig = n_added = n_imgs_touched = 0
     for name in names:
@@ -136,56 +136,52 @@ def main():
             f.write("\n".join(existing_lines + added_lines))
             if existing_lines or added_lines:
                 f.write("\n")
-        dst_img = os.path.join(out_images, name)
-        os.symlink(os.path.abspath(img_path), dst_img)
+        os.symlink(os.path.abspath(img_path), os.path.join(out_images, name))
 
-    # Dataset yaml for evaluation. Ultralytics requires BOTH `train:` and `val:`
-    # keys in every data YAML, so point all splits at the pseudo images; the
-    # split= arg selects which one val mode actually loads.
+    pct = f"(+{n_added / n_orig * 100:.1f}%)" if n_orig else ""
+    print(f"[{split}] original {n_orig}, added {n_added} {pct}, "
+          f"images touched {n_imgs_touched}/{len(names)}")
+    return n_orig, n_added
+
+
+def main():
+    if "train" not in SPLITS or "val" not in SPLITS:
+        print("[ERROR] pseudo_label.splits must include both 'train' and 'val' "
+              "(ultralytics requires both keys to train).")
+        sys.exit(1)
+
+    if os.path.isdir(PSEUDO_DIR):
+        shutil.rmtree(PSEUDO_DIR)           # clean rebuild
+    os.makedirs(PSEUDO_DIR, exist_ok=True)
+
+    print(f"Loading COCO model {PCFG['model']} ...")
+    model = YOLO(PCFG["model"])
+
+    built, tot_orig, tot_added = [], 0, 0
+    for split in SPLITS:
+        n_orig, n_added = process_split(split, model)
+        if n_orig or n_added:
+            built.append(split)
+            tot_orig += n_orig
+            tot_added += n_added
+
+    # One dataset yaml covering every built split.
     yaml_path = os.path.join(PSEUDO_DIR, "object_pseudo.yaml")
-    rel = f"{SPLIT}/images"
     with open(yaml_path, "w") as yf:
         yf.write(f"path: {os.path.abspath(PSEUDO_DIR)}\n")
-        yf.write(f"train: {rel}\n")
-        yf.write(f"val: {rel}\n")
-        if SPLIT not in ("train", "val"):
-            yf.write(f"{SPLIT}: {rel}\n")
+        for split in built:
+            yf.write(f"{split}: {split}/images\n")
         yf.write("\nnc: 1\n")
         yf.write("names: ['object']\n")
 
-    print(f"\n=== Pseudo-labeling summary ({SPLIT}) ===")
-    print(f"Original labels:      {n_orig}")
-    if n_orig:
-        print(f"Added by COCO model:  {n_added}  (+{n_added / n_orig * 100:.1f}%)")
-    else:
-        print(f"Added by COCO model:  {n_added}")
-    print(f"Images gaining boxes: {n_imgs_touched} / {len(names)}")
-    print(f"Pseudo dataset:       {PSEUDO_DIR}")
-    print(f"YAML:                 {yaml_path}")
-
-    # ── Re-evaluate the trained model against the pseudo-labels ────────────────
-    # Use an ABSOLUTE project path: ultralytics prepends its default runs dir to
-    # relative project= paths, producing runs/obb/runs/obb/... doubling.
-    yolo_ckpt = _resolve(_CFG["paths"]["yolo_ckpt"])
-    if not os.path.exists(yolo_ckpt):
-        print(f"\n[WARN] trained model not found at {yolo_ckpt}; skipping eval. "
-              f"Run manually once it exists:\n"
-              f"  yolo obb val model={yolo_ckpt} data={yaml_path} "
-              f"split={SPLIT} imgsz={_CFG['yolo_train']['imgsz']}")
-        return
-
-    print(f"\n=== Evaluating {yolo_ckpt} against pseudo-labels ({SPLIT}) ===")
-    run_dir = os.path.join(_REPO_ROOT, _CFG["yolo_train"]["run_dir"])
-    metrics = YOLO(yolo_ckpt).val(
-        data=yaml_path,
-        split=SPLIT,
-        imgsz=_CFG["yolo_train"]["imgsz"],
-        project=run_dir,
-        name=f"{_CFG['yolo_train']['run_name']}_pseudo_{SPLIT}",
-        exist_ok=True,
-    )
-    print(f"Results saved under {run_dir}/"
-          f"{_CFG['yolo_train']['run_name']}_pseudo_{SPLIT}")
+    pct = f"(+{tot_added / tot_orig * 100:.1f}%)" if tot_orig else ""
+    print(f"\n=== Pseudo-labeling summary ===")
+    print(f"Splits built:   {built}")
+    print(f"Total original: {tot_orig}")
+    print(f"Total added:    {tot_added} {pct}")
+    print(f"Pseudo dataset: {PSEUDO_DIR}")
+    print(f"YAML:           {yaml_path}")
+    print(f"\nNext: retrain on this dataset (see main_task.sh).")
 
 
 if __name__ == "__main__":

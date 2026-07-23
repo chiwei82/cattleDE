@@ -23,12 +23,18 @@ source venv/bin/activate
 eval "$(python3 <<'PY'
 import shlex, yaml
 c = yaml.safe_load(open("global_config.yaml"))
-print(f"DATA_YAML={shlex.quote(c['yolo_prep']['output_dir'] + '/object.yaml')}")
-print(f"MODEL={shlex.quote(str(c['yolo_train']['model']))}")
-print(f"EPOCHS={shlex.quote(str(c['yolo_train']['epochs']))}")
-print(f"IMGSZ={shlex.quote(str(c['yolo_train']['imgsz']))}")
-print(f"CFG_RUN_DIR={shlex.quote(str(c['yolo_train']['run_dir']))}")
-print(f"RUN_NAME={shlex.quote(str(c['yolo_train']['run_name']))}")
+def q(v): return shlex.quote(str(v))
+print(f"DATA_YAML={q(c['yolo_prep']['output_dir'] + '/object.yaml')}")
+print(f"MODEL={q(c['yolo_train']['model'])}")
+print(f"EPOCHS={q(c['yolo_train']['epochs'])}")
+print(f"IMGSZ={q(c['yolo_train']['imgsz'])}")
+print(f"CFG_RUN_DIR={q(c['yolo_train']['run_dir'])}")
+print(f"RUN_NAME={q(c['yolo_train']['run_name'])}")
+# Pseudo-label retrain
+pseudo_dir = c['yolo_prep']['output_dir'] + c['pseudo_label']['pseudo_suffix']
+print(f"PSEUDO_YAML={q(pseudo_dir + '/object_pseudo.yaml')}")
+print(f"PSEUDO_NAME={q(c['pseudo_label']['run_name'])}")
+print(f"PSEUDO_CKPT={q(c['pseudo_label']['ckpt_out'])}")
 PY
 )"
 # Absolute path: ultralytics prepends its default runs dir (runs/obb/) to any
@@ -73,20 +79,48 @@ RUN_DIR="$PWD/$CFG_RUN_DIR"
 
 # echo "=== Done. Dataset built at data/object ==="
 
-# ── 4. Interaction dataset prep (video_dir comes from global_config.yaml) ─────
-# Filter parameters changed (yolo_conf/iou/sample_fps), so previous outputs are
-# stale AND the incremental-resume logic would skip every video if the old CSV
-# is still present. Clean rebuild:
-echo "=== Removing stale interaction outputs ==="
-rm -rf data/interaction data/annotated/annotated_interaction.csv
+# ── 4. Pseudo-label all splits with the independent COCO model ────────────────
+# Fills the ~22% missing cattle labels so retraining no longer punishes the
+# model for detecting real cows (the cause of confidence suppression).
+echo "=== Building pseudo-labeled dataset (all splits) ==="
+python prep/pseudo_label.py
 
-echo "=== Building interaction dataset ==="
-python prep/interaction_prep.py
+# ── 5. Retrain the OBB model on the corrected labels ──────────────────────────
+echo "=== Retraining YOLO OBB on pseudo-labels ==="
+yolo obb train \
+    model="$MODEL" \
+    data="$PSEUDO_YAML" \
+    epochs=$EPOCHS \
+    imgsz=$IMGSZ \
+    project="$RUN_DIR" \
+    name="$PSEUDO_NAME" \
+    exist_ok=True
 
-# ── 5. Pose visualization sanity check (simu/pose) ────────────────────────────
-# Sample count and keypoint threshold come from pose_vis in global_config.yaml.
-echo "=== Rendering pose visualizations ==="
-python prep/pose_vis.py
+# Publish the retrained best.pt under a NEW name (does not overwrite yolo.pt,
+# so you can compare before switching interaction_prep over to it).
+PSEUDO_BEST="$RUN_DIR/$PSEUDO_NAME/weights/best.pt"
+mkdir -p "$(dirname "$PSEUDO_CKPT")"
+cp "$PSEUDO_BEST" "$PSEUDO_CKPT"
+echo "Retrained checkpoint copied to $PSEUDO_CKPT"
 
-echo "=== Done. Interaction data in data/interaction, pose check in simu/pose ==="
+# ── 6. Evaluate the retrained model on the pseudo test split ──────────────────
+echo "=== Evaluating retrained model on pseudo test split ==="
+yolo obb val \
+    model="$PSEUDO_CKPT" \
+    data="$PSEUDO_YAML" \
+    split=test \
+    imgsz=$IMGSZ \
+    project="$RUN_DIR" \
+    name="${PSEUDO_NAME}_test" \
+    exist_ok=True
+
+echo "=== Done. Retrained model: $PSEUDO_CKPT ==="
+echo "    Compare F1/P/R curves in $RUN_DIR/${PSEUDO_NAME}_test against the"
+echo "    original model. If better, point paths.yolo_ckpt at $PSEUDO_CKPT."
+
+# ── (later) Interaction dataset prep — run AFTER settling on a detector ────────
+# echo "=== Building interaction dataset ==="
+# rm -rf data/interaction data/annotated/annotated_interaction.csv
+# python prep/interaction_prep.py
+# python prep/pose_vis.py
 
