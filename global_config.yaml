@@ -14,7 +14,7 @@ paths:
   data_root: /user/work/sf24225/data/Full_behav/Marco
   clips_dir: /user/work/sf24225/data/Full_behav/Marco/clips
   hrnet_ckpt: checkpoints/hrnet_w32_ap10k_256x256-18aac840_20211029.pth
-  yolo_ckpt: checkpoints/yolo.pt
+  yolo_ckpt: checkpoints/yolo_pseudo.pt  # retrained on pseudo-labels (fixes confidence suppression)
 
 # ── YOLO OBB training (main_task.sh) ──────────────────────────────────────────
 yolo_train:

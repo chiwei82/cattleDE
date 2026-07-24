@@ -79,48 +79,49 @@ RUN_DIR="$PWD/$CFG_RUN_DIR"
 
 # echo "=== Done. Dataset built at data/object ==="
 
-# ── 4. Pseudo-label all splits with the independent COCO model ────────────────
-# Fills the ~22% missing cattle labels so retraining no longer punishes the
-# model for detecting real cows (the cause of confidence suppression).
-echo "=== Building pseudo-labeled dataset (all splits) ==="
-python prep/pseudo_label.py
+# ── 4-6. Pseudo-label + retrain + eval (DONE — retrained model published) ─────
+# Completed: checkpoints/yolo_pseudo.pt is now paths.yolo_ckpt. Re-enable this
+# block only to rebuild the pseudo dataset or retrain the detector.
+# echo "=== Building pseudo-labeled dataset (all splits) ==="
+# python prep/pseudo_label.py
+#
+# echo "=== Retraining YOLO OBB on pseudo-labels ==="
+# yolo obb train \
+#     model="$MODEL" \
+#     data="$PSEUDO_YAML" \
+#     epochs=$EPOCHS \
+#     imgsz=$IMGSZ \
+#     project="$RUN_DIR" \
+#     name="$PSEUDO_NAME" \
+#     exist_ok=True
+#
+# PSEUDO_BEST="$RUN_DIR/$PSEUDO_NAME/weights/best.pt"
+# mkdir -p "$(dirname "$PSEUDO_CKPT")"
+# cp "$PSEUDO_BEST" "$PSEUDO_CKPT"
+# echo "Retrained checkpoint copied to $PSEUDO_CKPT"
+#
+# echo "=== Evaluating retrained model on pseudo test split ==="
+# yolo obb val \
+#     model="$PSEUDO_CKPT" \
+#     data="$PSEUDO_YAML" \
+#     split=test \
+#     imgsz=$IMGSZ \
+#     project="$RUN_DIR" \
+#     name="${PSEUDO_NAME}_test" \
+#     exist_ok=True
 
-# ── 5. Retrain the OBB model on the corrected labels ──────────────────────────
-echo "=== Retraining YOLO OBB on pseudo-labels ==="
-yolo obb train \
-    model="$MODEL" \
-    data="$PSEUDO_YAML" \
-    epochs=$EPOCHS \
-    imgsz=$IMGSZ \
-    project="$RUN_DIR" \
-    name="$PSEUDO_NAME" \
-    exist_ok=True
+# ── 7. Interaction dataset prep (uses the retrained detector via config) ──────
+# yolo_conf=0.6 (F1-optimal for the retrained model); paths.yolo_ckpt now points
+# at checkpoints/yolo_pseudo.pt. Clean rebuild since the detector changed:
+echo "=== Removing stale interaction outputs ==="
+rm -rf data/interaction data/annotated/annotated_interaction.csv
 
-# Publish the retrained best.pt under a NEW name (does not overwrite yolo.pt,
-# so you can compare before switching interaction_prep over to it).
-PSEUDO_BEST="$RUN_DIR/$PSEUDO_NAME/weights/best.pt"
-mkdir -p "$(dirname "$PSEUDO_CKPT")"
-cp "$PSEUDO_BEST" "$PSEUDO_CKPT"
-echo "Retrained checkpoint copied to $PSEUDO_CKPT"
+echo "=== Building interaction dataset ==="
+python prep/interaction_prep.py
 
-# ── 6. Evaluate the retrained model on the pseudo test split ──────────────────
-echo "=== Evaluating retrained model on pseudo test split ==="
-yolo obb val \
-    model="$PSEUDO_CKPT" \
-    data="$PSEUDO_YAML" \
-    split=test \
-    imgsz=$IMGSZ \
-    project="$RUN_DIR" \
-    name="${PSEUDO_NAME}_test" \
-    exist_ok=True
+# ── 8. Pose visualization sanity check (simu/pose) ────────────────────────────
+echo "=== Rendering pose visualizations ==="
+python prep/pose_vis.py
 
-echo "=== Done. Retrained model: $PSEUDO_CKPT ==="
-echo "    Compare F1/P/R curves in $RUN_DIR/${PSEUDO_NAME}_test against the"
-echo "    original model. If better, point paths.yolo_ckpt at $PSEUDO_CKPT."
-
-# ── (later) Interaction dataset prep — run AFTER settling on a detector ────────
-# echo "=== Building interaction dataset ==="
-# rm -rf data/interaction data/annotated/annotated_interaction.csv
-# python prep/interaction_prep.py
-# python prep/pose_vis.py
+echo "=== Done. Interaction data in data/interaction, pose check in simu/pose ==="
 
