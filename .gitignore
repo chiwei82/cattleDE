@@ -2,3 +2,4 @@ venv/
 data/
 log/
 .DS_Store
+*.pyc

@@ -110,18 +110,37 @@ RUN_DIR="$PWD/$CFG_RUN_DIR"
 #     name="${PSEUDO_NAME}_test" \
 #     exist_ok=True
 
-# ── 7. Interaction dataset prep (uses the retrained detector via config) ──────
-# yolo_conf=0.6 (F1-optimal for the retrained model); paths.yolo_ckpt now points
-# at checkpoints/yolo_pseudo.pt. Clean rebuild since the detector changed:
-echo "=== Removing stale interaction outputs ==="
-rm -rf data/interaction data/annotated/annotated_interaction.csv
+# ── 7. Action dataset prep (data/action + annotated_action.csv) ───────────────
+echo "=== Building action dataset ==="
+python prep/action_prep.py
 
-echo "=== Building interaction dataset ==="
+# ── 8. Action classification training (image-only, 7-class, 6:2:2) ────────────
+# Produces paths.action_ckpt (timm ViT-B/16), whose latent space the interaction
+# model reuses.
+echo "=== Training action classifier ==="
+python -m train.action_with_image
+
+# ── 9. Interaction dataset prep — generates pair candidates to annotate ───────
+# uses the OBB detector (paths.yolo_ckpt) + config yolo_conf/iou_low/iou_high.
+echo "=== Building interaction dataset (pair candidates) ==="
+rm -rf data/interaction data/annotated/annotated_interaction.csv
 python prep/interaction_prep.py
 
-# ── 8. Pose visualization sanity check (simu/pose) ────────────────────────────
-echo "=== Rendering pose visualizations ==="
-python prep/pose_vis.py
+# ── 10. Interaction training (BINARY, image-only) — DISABLED until labelled ───
+# annotated_interaction.csv has blank label_v1/label_v2 (human annotation). Once
+# you fill the labels (or add a has_interaction column), uncomment to train the
+# interaction model, which inits its ViT backbone from paths.action_ckpt.
+# echo "=== Training interaction classifier (binary) ==="
+# python -m train.interaction_with_image
 
-echo "=== Done. Interaction data in data/interaction, pose check in simu/pose ==="
+# ── 11. Demo video (detection -> per-cow action -> binary interaction) ────────
+# Needs BOTH checkpoints: paths.action_ckpt (from step 8) and
+# paths.interaction_ckpt (from step 10). Enable after interaction is trained.
+# The input video path is hard-coded inside scripts/short_demo.py.
+# echo "=== Rendering demo video ==="
+# python scripts/short_demo.py
+
+echo "=== Done. action_ckpt + interaction candidates ready. ==="
+echo "    Next: annotate label_v1/label_v2 in data/annotated/annotated_interaction.csv,"
+echo "    then uncomment steps 10-11 to train interaction + render the demo."
 

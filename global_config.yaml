@@ -15,6 +15,39 @@ paths:
   clips_dir: /user/work/sf24225/data/Full_behav/Marco/clips
   hrnet_ckpt: checkpoints/hrnet_w32_ap10k_256x256-18aac840_20211029.pth
   yolo_ckpt: checkpoints/yolo_pseudo.pt  # retrained on pseudo-labels (fixes confidence suppression)
+  action_ckpt: checkpoints/action.ckpt        # produced by train/action_with_image.py
+  interaction_ckpt: checkpoints/interaction.ckpt  # produced by train/interaction_with_image.py
+
+# ── Action classification training (train/action_with_image.py) ───────────────
+# Image-only (no pose). Reads data/annotated/annotated_action.csv; the split is
+# read from the train/val/test folder in each image path (6:2:2 from action_prep).
+action_train:
+  epochs: 50
+  batch_size: 32
+  learning_rate: 0.0001
+  image_size: 224
+  num_workers: 8
+  run_dir: log/action
+
+# ── Interaction classification training (train/interaction_with_image.py) ─────
+# Image-only, BINARY (no_interaction vs interaction). The ViT backbone is
+# initialised from the action checkpoint (paths.action_ckpt) so the interaction
+# model reuses the action latent space. Split read from the CSV 'split' column.
+# NOTE: needs labelled data — annotated_interaction.csv label columns are blank
+# until human annotation, so this step stays disabled in main_task.sh for now.
+interaction_train:
+  epochs: 50
+  batch_size: 32
+  learning_rate: 0.0001
+  image_size: 224
+  num_workers: 8
+  fusion_type: attention      # 'attention' or 'mlp'
+  pooling_type: gap           # flatten | gmp | gap | gap_gmp
+  freeze_backbone: false
+  pretrained_backbone: true   # init ViT from paths.action_ckpt
+  run_dir: log/interaction
+  # binary label rule: label_v1 in this set -> 0 (no interaction), else -> 1
+  no_interaction_names: [no_interaction, none, no, "0"]
 
 # ── YOLO OBB training (main_task.sh) ──────────────────────────────────────────
 yolo_train:
@@ -32,7 +65,7 @@ pose_vis:
 # ── YOLO OBB dataset prep (prep/yolo_prep.py) ─────────────────────────────────
 yolo_prep:
   output_dir: data/object
-  frame_step: 16          # sample every N frames (~1 per second at 16 fps)
+  frame_step: 16
   camera_dirs: [camera128, camera133, camera26, camera27, camera48]
 
 # ── Pseudo-labeling with an independent COCO model (prep/pseudo_label.py) ──────
