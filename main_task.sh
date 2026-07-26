@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
-#SBATCH --job-name=cattle_act_train
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
 #SBATCH --nodes=1
+#SBATCH --gres=gpu:rtx_3090:1
+#SBATCH --partition gpu
+#SBATCH --job-name=gpujob
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=7-00:00:00
@@ -111,14 +111,14 @@ RUN_DIR="$PWD/$CFG_RUN_DIR"
 #     exist_ok=True
 
 # ── 7. Action dataset prep (data/action + annotated_action.csv) ───────────────
-echo "=== Building action dataset ==="
-python prep/action_prep.py
+# echo "=== Building action dataset ==="
+# python prep/action_prep.py
 
 # ── 8. Action classification training (image-only, 7-class, 6:2:2) ────────────
 # Produces paths.action_ckpt (timm ViT-B/16), whose latent space the interaction
 # model reuses.
-echo "=== Training action classifier ==="
-python -m train.action_with_image
+# echo "=== Training action classifier ==="
+# python -m train.action_with_image
 
 # ── 9. Interaction dataset prep — generates pair candidates to annotate ───────
 # uses the OBB detector (paths.yolo_ckpt) + config yolo_conf/iou_low/iou_high.
@@ -140,7 +140,7 @@ python prep/interaction_prep.py
 # echo "=== Rendering demo video ==="
 # python scripts/short_demo.py
 
-echo "=== Done. action_ckpt + interaction candidates ready. ==="
+# echo "=== Done. action_ckpt + interaction candidates ready. ==="
 echo "    Next: annotate label_v1/label_v2 in data/annotated/annotated_interaction.csv,"
 echo "    then uncomment steps 10-11 to train interaction + render the demo."
 

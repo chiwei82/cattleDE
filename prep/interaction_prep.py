@@ -80,6 +80,7 @@ _HRNET_TRANSFORM = T.Compose([
 
 CSV_FIELDNAMES = [
     "image_path", "bbox1_xyxy", "bbox2_xyxy", "merged_bbox_xyxy",
+    "bbox_confs",  # YOLO confidence of bbox1 then bbox2, e.g. "0.9123 0.8456"
     "pose_path_1", "pose_path_2",
     "label_v1", "label_v2",
     "source_video", "frame_number", "split",
@@ -214,26 +215,30 @@ def safe_crop_bgr(frame: np.ndarray, bbox: Tuple) -> np.ndarray:
 
 # ── YOLO result parsing (handles both standard and OBB models) ────────────────
 
-def _extract_boxes(results) -> List[Tuple[int, int, int, int]]:
+def _extract_boxes(results) -> List[Tuple[int, int, int, int, float]]:
     """
-    Returns axis-aligned (x1, y1, x2, y2) boxes from a YOLO result object.
-    Works for both standard detection models (results.boxes) and OBB models
-    (results.obb) by taking the bounding rectangle of the 4 OBB corners.
+    Returns axis-aligned (x1, y1, x2, y2, conf) tuples from a YOLO result object,
+    where conf is the detection confidence. Works for both standard detection
+    models (results.boxes) and OBB models (results.obb) by taking the bounding
+    rectangle of the 4 OBB corners. The extra conf element is appended last, so
+    callers that index [0:4] keep working unchanged.
     """
     boxes = []
     if results.boxes is not None and len(results.boxes):
         for box in results.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+            conf = float(box.conf[0].cpu().numpy())
             if x2 > x1 and y2 > y1:
-                boxes.append((x1, y1, x2, y2))
+                boxes.append((x1, y1, x2, y2, conf))
     elif results.obb is not None and len(results.obb):
         # xyxyxyxy: (N, 4, 2) — four corner points per box
         corners = results.obb.xyxyxyxy.cpu().numpy()  # (N, 4, 2)
-        for pts in corners:
+        confs = results.obb.conf.cpu().numpy()        # (N,)
+        for pts, conf in zip(corners, confs):
             x1 = int(pts[:, 0].min()); y1 = int(pts[:, 1].min())
             x2 = int(pts[:, 0].max()); y2 = int(pts[:, 1].max())
             if x2 > x1 and y2 > y1:
-                boxes.append((x1, y1, x2, y2))
+                boxes.append((x1, y1, x2, y2, float(conf)))
     return boxes
 
 
@@ -368,6 +373,7 @@ def process_video(
                     "bbox1_xyxy":       fmt_bbox(bbox1),
                     "bbox2_xyxy":       fmt_bbox(bbox2),
                     "merged_bbox_xyxy": fmt_bbox(merged),
+                    "bbox_confs":       f"{bbox1[4]:.4f} {bbox2[4]:.4f}",
                     "pose_path_1":      pose_rel1,
                     "pose_path_2":      pose_rel2,
                     "label_v1":         "",
