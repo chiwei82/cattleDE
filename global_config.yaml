@@ -46,8 +46,10 @@ interaction_train:
   freeze_backbone: false
   pretrained_backbone: true   # init ViT from paths.action_ckpt
   run_dir: log/interaction
-  # binary label rule: label_v1 in this set -> 0 (no interaction), else -> 1
+  # binary label rule on label_v1:
+  #   in no_interaction_names -> 0 ; in exclude_names (or blank) -> dropped ; else -> 1
   no_interaction_names: [no_interaction, none, no, "0"]
+  exclude_names: ["not well-cropped"]   # bad crops — excluded from training
 
 # ── YOLO OBB training (main_task.sh) ──────────────────────────────────────────
 yolo_train:

@@ -1,3 +1,4 @@
+import argparse
 import os
 import shutil
 import sys
@@ -457,8 +458,10 @@ class CattleInteractionDataModule(pl.LightningDataModule):
     def _binary_label(self, row):
         """Map a CSV row to a binary label: 0 = no interaction, 1 = interaction.
         Prefers an explicit has_interaction/label column, else derives from
-        label_v1 using cfg['no_interaction_names']. Returns None if unlabelled."""
+        label_v1: values in no_interaction_names -> 0, values in exclude_names
+        (e.g. 'not well-cropped') or blank -> None (dropped), else -> 1."""
         no_names = {str(x).strip().lower() for x in self.cfg["no_interaction_names"]}
+        exclude = {str(x).strip().lower() for x in self.cfg.get("exclude_names", [])}
         for col in ("has_interaction", "label"):
             v = row.get(col, "")
             if v not in (None, ""):
@@ -467,8 +470,8 @@ class CattleInteractionDataModule(pl.LightningDataModule):
                 except ValueError:
                     pass
         v1 = (row.get("label_v1") or "").strip().lower()
-        if not v1:
-            return None
+        if not v1 or v1 in exclude:
+            return None            # unlabelled or excluded -> dropped from training
         return 0 if v1 in no_names else 1
 
     def _load_entries(self):
@@ -547,12 +550,18 @@ class CattleInteractionDataModule(pl.LightningDataModule):
 
 def main() -> None:
     """Binary, image-only interaction training (config-driven, no hydra)."""
+    ap = argparse.ArgumentParser(description="Train the binary interaction model.")
+    ap.add_argument("--csv", default="annotated_interaction.csv",
+                    help="CSV filename under paths.annotated_dir "
+                         "(e.g. annotated_interaction_test.csv).")
+    args = ap.parse_args()
+
     pl.seed_everything(_CFG["random_seed"], workers=True)
 
     icfg = dict(_CFG["interaction_train"])
     icfg["repo_root"] = _REPO_ROOT
     icfg["interaction_csv"] = os.path.join(
-        _REPO_ROOT, _CFG["paths"]["annotated_dir"], "annotated_interaction.csv")
+        _REPO_ROOT, _CFG["paths"]["annotated_dir"], args.csv)
 
     data_module = CattleInteractionDataModule(icfg)
     data_module.setup(stage="fit")
