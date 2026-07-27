@@ -122,9 +122,9 @@ RUN_DIR="$PWD/$CFG_RUN_DIR"
 
 # ── 9. Interaction dataset prep — generates pair candidates to annotate ───────
 # uses the OBB detector (paths.yolo_ckpt) + config yolo_conf/iou_low/iou_high.
-echo "=== Building interaction dataset (pair candidates) ==="
-rm -rf data/interaction data/annotated/annotated_interaction.csv
-python prep/interaction_prep.py
+# echo "=== Building interaction dataset (pair candidates) ==="
+# rm -rf data/interaction data/annotated/annotated_interaction.csv
+# python prep/interaction_prep.py
 
 # ── 10. Interaction training (BINARY, image-only) — DISABLED until labelled ───
 # annotated_interaction.csv has blank label_v1/label_v2 (human annotation). Once
@@ -132,6 +132,7 @@ python prep/interaction_prep.py
 # interaction model, which inits its ViT backbone from paths.action_ckpt.
 # echo "=== Training interaction classifier (binary) ==="
 # python -m train.interaction_with_image
+python -m train.interaction_with_image --csv annotated_interaction_test.csv
 
 # ── 11. Demo video (detection -> per-cow action -> binary interaction) ────────
 # Needs BOTH checkpoints: paths.action_ckpt (from step 8) and
@@ -141,6 +142,6 @@ python prep/interaction_prep.py
 # python scripts/short_demo.py
 
 # echo "=== Done. action_ckpt + interaction candidates ready. ==="
-echo "    Next: annotate label_v1/label_v2 in data/annotated/annotated_interaction.csv,"
-echo "    then uncomment steps 10-11 to train interaction + render the demo."
+# echo "    Next: annotate label_v1/label_v2 in data/annotated/annotated_interaction.csv,"
+# echo "    then uncomment steps 10-11 to train interaction + render the demo."
 
