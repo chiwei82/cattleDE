@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import yaml
+import argparse
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 from torch.utils.data import DataLoader
@@ -59,8 +60,8 @@ class LitVisionTransformer(pl.LightningModule):
         self.train_accuracy = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_accuracy = Accuracy(task="multiclass", num_classes=num_classes)
         self.test_accuracy = Accuracy(task="multiclass", num_classes=num_classes)
-        self.val_f1score = F1Score(task="multiclass", num_classes=num_classes, average="macro")
-        self.test_f1score = F1Score(task="multiclass", num_classes=num_classes, average="macro")
+        self.val_f1score = F1Score(task="multiclass", num_classes=num_classes, average="weighted")
+        self.test_f1score = F1Score(task="multiclass", num_classes=num_classes, average="weighted")
 
     def forward(self, x):
         return self.model(x)
@@ -206,6 +207,10 @@ class CattleActionDataModule(pl.LightningDataModule):
 
 
 def main():
+    ap = argparse.ArgumentParser(description="Train / evaluate the action classifier.")
+    ap.add_argument("--eval_only", default=None, help="Path to a checkpoint; run val+test only, no training.")
+    args = ap.parse_args()
+
     pl.seed_everything(_CFG["random_seed"], workers=True)
 
     acfg = dict(_CFG["action_train"])
@@ -219,6 +224,15 @@ def main():
         num_classes=len(ACTION_MAP_LABEL), learning_rate=acfg["learning_rate"])
 
     run_dir = os.path.join(_REPO_ROOT, acfg["run_dir"])
+
+    if args.eval_only:
+        model = LitVisionTransformer.load_from_checkpoint(args.eval_only)
+        trainer = pl.Trainer(accelerator="auto", devices=1,
+                            logger=CSVLogger(run_dir, name="csv_eval"))
+        trainer.validate(model, datamodule=data_module)
+        trainer.test(model, datamodule=data_module)
+        return
+
     if data_module._val_empty:
         # No val to monitor: keep the last epoch's checkpoint.
         ckpt_cb = ModelCheckpoint(
