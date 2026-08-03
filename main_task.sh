@@ -114,34 +114,34 @@ RUN_DIR="$PWD/$CFG_RUN_DIR"
 # echo "=== Building action dataset ==="
 # python prep/action_prep.py
 
-# ── 8. Action classification training (image-only, 7-class, 6:2:2) ────────────
-# Produces paths.action_ckpt (timm ViT-B/16), whose latent space the interaction
-# model reuses.
-# echo "=== Training action classifier ==="
-# python -m train.action_with_image
+# ── 8. Action metric-learning training (triplet + zero-mean reg, image-only) ──
+# Produces paths.action_ckpt (timm ViT-B/16 encoder); its latent space is reused
+# as the interaction model's ViT backbone.
+echo "=== Training action encoder (metric learning) ==="
+python -m train.action_with_image
 
-# ── 9. Interaction dataset prep — generates pair candidates to annotate ───────
-# uses the OBB detector (paths.yolo_ckpt) + config yolo_conf/iou_low/iou_high.
-# echo "=== Building interaction dataset (pair candidates) ==="
-# rm -rf data/interaction data/annotated/annotated_interaction.csv
-# python prep/interaction_prep.py
+# ── 9. Merge Label Studio labels -> annotated_interaction_test.csv ────────────
+# data/ann.json (Label Studio export) must be present. Writes a NEW _test CSV
+# (label_v1/label_v2) without touching the original blank CSV.
+# echo "=== Merging interaction labels ==="
+# python data/merge_label_studio_export.py
 
-# ── 10. Interaction training (BINARY, image-only) — DISABLED until labelled ───
-# annotated_interaction.csv has blank label_v1/label_v2 (human annotation). Once
-# you fill the labels (or add a has_interaction column), uncomment to train the
-# interaction model, which inits its ViT backbone from paths.action_ckpt.
-# echo "=== Training interaction classifier (binary) ==="
-# python -m train.interaction_with_image
+# ── 10. Interaction training (BINARY output; LDAM + InfoNCE; image-only) ──────
+# Reads annotated_interaction_test.csv; inits ViT from paths.action_ckpt.
+echo "=== Training interaction classifier (binary) ==="
 python -m train.interaction_with_image --csv annotated_interaction_test.csv
 
-# ── 11. Demo video (detection -> per-cow action -> binary interaction) ────────
-# Needs BOTH checkpoints: paths.action_ckpt (from step 8) and
-# paths.interaction_ckpt (from step 10). Enable after interaction is trained.
-# The input video path is hard-coded inside scripts/short_demo.py.
-# echo "=== Rendering demo video ==="
-# python scripts/short_demo.py
+echo "=== Done. action.ckpt + interaction.ckpt trained. ==="
 
-# echo "=== Done. action_ckpt + interaction candidates ready. ==="
-# echo "    Next: annotate label_v1/label_v2 in data/annotated/annotated_interaction.csv,"
-# echo "    then uncomment steps 10-11 to train interaction + render the demo."
+# ── NOTE: interaction dataset prep (the crops) is intentionally NOT re-run here.
+# The crops already exist and ann.json labels reference them by image_path;
+# re-running would delete + regenerate them with a blank CSV and invalidate the
+# labels. Only run it to (re)generate a fresh candidate set to annotate:
+#   rm -rf data/interaction data/annotated/annotated_interaction.csv
+#   python prep/interaction_prep.py
+#
+# ── Demo video — DISABLED: action is now a metric-learning ENCODER, so
+# scripts/short_demo.py's per-cow action inference (which expects a classifier)
+# is broken until it is switched to a k-NN gallery.
+#   python scripts/short_demo.py
 

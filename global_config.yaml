@@ -18,16 +18,32 @@ paths:
   action_ckpt: checkpoints/action.ckpt        # produced by train/action_with_image.py
   interaction_ckpt: checkpoints/interaction.ckpt  # produced by train/interaction_with_image.py
 
-# ── Action classification training (train/action_with_image.py) ───────────────
-# Image-only (no pose). Reads data/annotated/annotated_action.csv; the split is
-# read from the train/val/test folder in each image path (6:2:2 from action_prep).
+# ── Action metric-learning training (train/action_with_image.py) ─────────────
+# Image-only (no pose). Trains a ViT-B/16 encoder with a triplet loss + a
+# zero-mean latent regularization to build a discriminative action embedding,
+# which the interaction model reuses as its ViT backbone. Reads
+# data/annotated/annotated_action.csv; split from the train/val/test folder in
+# each image path. Settings follow reproduction/CattleAct/metric.
 action_train:
   epochs: 50
-  batch_size: 32
-  learning_rate: 0.0001
+  learning_rate: 0.00001      # 1e-5
   image_size: 224
   num_workers: 8
   run_dir: log/action
+  embedding_size: 256         # ViT head output dim (the embedding)
+  margin: 0.5                 # triplet loss margin
+  reg_loss_weight: 0.1        # weight of the zero-mean latent regularization
+  sigma_s_squared: 10.0       # latent variance in the regularization term
+  classes_per_batch: 3        # BalancedBatchSampler: classes per batch
+  samples_per_class: 4        # samples per class  (batch size = 3 * 4 = 12)
+  # Train augmentation (image-only), values from reproduction/CattleAct/metric.
+  # Skeleton masking is replaced by RandomErasing (no pose in this pipeline).
+  randaug_num_ops: 3
+  randaug_magnitude: 7
+  cutout_prob: 0.5            # per-erasing probability
+  cutout_n_holes: 3          # number of RandomErasing passes
+  cutout_scale: [0.02, 0.1]  # erased area fraction range
+  cutout_ratio: [0.5, 3.0]   # erased region aspect-ratio range
 
 # ── Interaction classification training (train/interaction_with_image.py) ─────
 # Image-only, BINARY (no_interaction vs interaction). The ViT backbone is
@@ -50,6 +66,16 @@ interaction_train:
   #   in no_interaction_names -> 0 ; in exclude_names (or blank) -> dropped ; else -> 1
   no_interaction_names: [no_interaction, none, no, "0"]
   exclude_names: ["not well-cropped"]   # bad crops — excluded from training
+  # Loss (output stays BINARY). main_loss shapes the classifier; pre_fusion_loss
+  # (InfoNCE) aligns the interaction/context feature with its constituent cattle
+  # (action) features before fusion. Values follow reproduction/CattleAct.
+  main_loss: ldam                # cross_entropy | focal | ldam
+  ldam_max_m: 0.5
+  ldam_s: 30.0
+  pre_fusion_loss: infonce       # none | triplet | infonce
+  pre_fusion_temperature: 0.07   # InfoNCE temperature
+  pre_fusion_margin: 0.2         # (used only when pre_fusion_loss = triplet)
+  pre_fusion_weight: 0.1         # weight of the pre-fusion loss
 
 # ── YOLO OBB training (main_task.sh) ──────────────────────────────────────────
 yolo_train:

@@ -570,6 +570,32 @@ def main() -> None:
     vit_ckpt = (os.path.join(_REPO_ROOT, _CFG["paths"]["action_ckpt"])
                 if icfg["pretrained_backbone"] else None)
 
+    # Build the loss configs (output stays binary; these only shape the objective).
+    ml = icfg.get("main_loss", "ldam")
+    if ml == "ldam":
+        main_loss_cfg = OmegaConf.create(
+            {"name": "ldam", "max_m": icfg["ldam_max_m"], "s": icfg["ldam_s"]})
+    elif ml == "focal":
+        main_loss_cfg = OmegaConf.create(
+            {"name": "focal", "gamma": icfg.get("focal_gamma", 2.0)})
+    else:
+        main_loss_cfg = OmegaConf.create({"name": "cross_entropy"})
+
+    pfl = icfg.get("pre_fusion_loss", "infonce")
+    if pfl == "infonce":
+        pre_fusion_loss_cfg = OmegaConf.create(
+            {"name": "infonce", "temperature": icfg["pre_fusion_temperature"]})
+        pre_fusion_weight = icfg["pre_fusion_weight"]
+    elif pfl == "triplet":
+        pre_fusion_loss_cfg = OmegaConf.create(
+            {"name": "triplet", "margin": icfg["pre_fusion_margin"]})
+        pre_fusion_weight = icfg["pre_fusion_weight"]
+    else:
+        pre_fusion_loss_cfg = OmegaConf.create({"name": "none"})
+        pre_fusion_weight = 0.0
+    print(f"[interaction] main_loss={ml}, pre_fusion_loss={pfl}, "
+          f"pre_fusion_weight={pre_fusion_weight}")
+
     model = LitHybridStreamFusion(
         num_classes=2,                              # binary: no_interaction / interaction
         learning_rate=icfg["learning_rate"],
@@ -577,10 +603,10 @@ def main() -> None:
         freeze_vit=icfg["freeze_backbone"],
         fusion_type=icfg["fusion_type"],
         cls_num_list=data_module.cls_num_list,
-        main_loss_cfg=OmegaConf.create({"name": "cross_entropy"}),
-        pre_fusion_loss_cfg=OmegaConf.create({"name": "none"}),
+        main_loss_cfg=main_loss_cfg,
+        pre_fusion_loss_cfg=pre_fusion_loss_cfg,
         pooling_type=icfg["pooling_type"],
-        pre_fusion_loss_weight=0.0,
+        pre_fusion_loss_weight=pre_fusion_weight,
     )
 
     run_dir = os.path.join(_REPO_ROOT, icfg["run_dir"])
