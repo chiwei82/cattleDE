@@ -15,7 +15,9 @@ Run from the repo root:
   python -m train.action_with_image
 """
 
+import argparse
 import os
+import re
 import shutil
 import sys
 from collections import defaultdict
@@ -45,6 +47,12 @@ with open(os.path.join(_REPO_ROOT, "global_config.yaml")) as _f:
 
 # 7-class action labels (must match prep/action_prep.py action_prep.labels order)
 ACTION_MAP_LABEL = {name: i for i, name in enumerate(_CFG["action_prep"]["labels"])}
+
+
+def _clip_id(image_path):
+    """Clip identity = crop filename without the _fXXXX frame suffix, so all
+    sampled frames of the same clip share one id."""
+    return re.sub(r"_f\d+\.jpg$", "", os.path.basename(image_path))
 
 
 class LitVisionTransformer(pl.LightningModule):
@@ -118,41 +126,69 @@ class LitVisionTransformer(pl.LightningModule):
         return embeddings[a_idx], embeddings[p_idx], embeddings[ng_idx]
 
     def validation_step(self, batch, batch_idx):
-        imgs, _, labels, _ = batch
+        imgs, _, labels, supp = batch
         emb = F.normalize(self.forward(imgs), p=2, dim=1)
         self.validation_step_outputs.append(
-            {"embeddings": emb.cpu(), "labels": labels.view(-1).cpu()})
+            {"embeddings": emb.cpu(), "labels": labels.view(-1).cpu(),
+             "clips": [_clip_id(p) for p in supp["image_path"]]})
 
-    def _knn_eval(self, outputs, knn_metric, f1_metric, prefix):
+    def _knn_eval(self, outputs, prefix):
+        """1-NN in the embedding space. Reports the regular within-split score AND
+        the score with same-clip neighbours excluded (so near-duplicate frames of
+        the same clip can't answer for each other), plus how many samples still
+        have a different-clip neighbour to be evaluated against."""
         if not outputs:
             return
+        from torchmetrics.functional import accuracy as tm_acc, f1_score as tm_f1
         emb = torch.cat([o["embeddings"] for o in outputs], dim=0)
         labels = torch.cat([o["labels"] for o in outputs], dim=0)
-        if emb.size(0) < 2:
+        clips = np.array([c for o in outputs for c in o["clips"]])
+        n = emb.size(0)
+        if n < 2:
             return
+        nc = len(self.map_label)
         dist = torch.cdist(emb, emb, p=2)
-        dist.fill_diagonal_(float("inf"))
-        preds = labels[torch.argmin(dist, dim=1)]
-        preds, labels = preds.to(self.device), labels.to(self.device)
-        knn_metric.update(preds, labels)
-        f1_metric.update(preds, labels)
-        self.log(f"{prefix}_knn_acc", knn_metric.compute(), on_epoch=True, prog_bar=True)
-        self.log(f"{prefix}_f1score", f1_metric.compute(), on_epoch=True, prog_bar=True)
+        same_clip = torch.from_numpy(clips[:, None] == clips[None, :])
+
+        # regular: nearest neighbour among all other samples (includes same clip)
+        d_reg = dist.clone(); d_reg.fill_diagonal_(float("inf"))
+        preds_reg = labels[torch.argmin(d_reg, dim=1)]
+        acc_reg = tm_acc(preds_reg, labels, task="multiclass", num_classes=nc)
+        f1_reg = tm_f1(preds_reg, labels, task="multiclass", num_classes=nc, average="weighted")
+
+        # exclude same-clip (and self): nearest DIFFERENT-clip neighbour
+        d_ex = dist.clone(); d_ex[same_clip] = float("inf")
+        valid = torch.isfinite(d_ex).any(dim=1)
+        n_eval = int(valid.sum())
+        if n_eval > 0:
+            preds_ex = labels[torch.argmin(d_ex, dim=1)]
+            acc_ex = tm_acc(preds_ex[valid], labels[valid], task="multiclass", num_classes=nc)
+            f1_ex = tm_f1(preds_ex[valid], labels[valid], task="multiclass", num_classes=nc, average="weighted")
+        else:
+            acc_ex = f1_ex = torch.tensor(0.0)
+
+        self.log(f"{prefix}_knn_acc", acc_reg, on_epoch=True, prog_bar=True)
+        self.log(f"{prefix}_f1score", f1_reg, on_epoch=True, prog_bar=True)
+        self.log(f"{prefix}_knn_acc_excl", acc_ex, on_epoch=True, prog_bar=True)
+        self.log(f"{prefix}_f1score_excl", f1_ex, on_epoch=True)
+        self.log(f"{prefix}_n_eval_excl", float(n_eval), on_epoch=True)
+        print(f"[{prefix}] regular k-NN acc={float(acc_reg):.4f} | "
+              f"excl-same-clip acc={float(acc_ex):.4f} f1={float(f1_ex):.4f} "
+              f"(evaluated {n_eval}/{n} samples)")
 
     def on_validation_epoch_end(self):
-        self._knn_eval(self.validation_step_outputs,
-                       self.val_knn_accuracy, self.val_f1score, "val")
+        self._knn_eval(self.validation_step_outputs, "val")
         self.validation_step_outputs.clear()
 
     def test_step(self, batch, batch_idx):
-        imgs, _, labels, _ = batch
+        imgs, _, labels, supp = batch
         emb = F.normalize(self.forward(imgs), p=2, dim=1)
         self.test_step_outputs.append(
-            {"embeddings": emb.cpu(), "labels": labels.view(-1).cpu()})
+            {"embeddings": emb.cpu(), "labels": labels.view(-1).cpu(),
+             "clips": [_clip_id(p) for p in supp["image_path"]]})
 
     def on_test_epoch_end(self):
-        self._knn_eval(self.test_step_outputs,
-                       self.test_knn_accuracy, self.test_f1score, "test")
+        self._knn_eval(self.test_step_outputs, "test")
         self.test_step_outputs.clear()
 
     def configure_optimizers(self):
@@ -307,6 +343,12 @@ class CattleActionDataModule(pl.LightningDataModule):
 
 
 def main():
+    ap = argparse.ArgumentParser(description="Action metric-learning training.")
+    ap.add_argument("--eval_ckpt", default=None,
+                    help="If set, skip training and only evaluate this checkpoint "
+                         "(runs val + test with the same-clip-excluded k-NN).")
+    args = ap.parse_args()
+
     pl.seed_everything(_CFG["random_seed"], workers=True)
 
     acfg = dict(_CFG["action_train"])
@@ -316,6 +358,17 @@ def main():
 
     data_module = CattleActionDataModule(acfg)
     data_module.setup()  # know val/test emptiness before building callbacks
+
+    if args.eval_ckpt:
+        ckpt = os.path.join(_REPO_ROOT, args.eval_ckpt) \
+            if not os.path.isabs(args.eval_ckpt) else args.eval_ckpt
+        model = LitVisionTransformer.load_from_checkpoint(ckpt)
+        trainer = pl.Trainer(accelerator="auto", devices=1, logger=False)
+        print(f"[action] eval-only on {ckpt}")
+        trainer.validate(model, datamodule=data_module)
+        if not data_module._test_empty:
+            trainer.test(model, datamodule=data_module)
+        return
 
     model = LitVisionTransformer(
         embedding_size=acfg["embedding_size"],
