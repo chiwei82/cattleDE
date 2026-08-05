@@ -226,7 +226,13 @@ def main():
         canvas, nh, nw, _ = letterbox(rgb, cfg["model"]["image_size"], 114)
         blended = overlay(canvas, res["heat"])
         px, py = res["peak_canvas_xy"]
-        cv2.drawMarker(blended, (px, py), (255, 255, 255), cv2.MARKER_CROSS, 14, 2)
+        # Hollow ring rather than a filled cross: the peak is the pixel the
+        # reader most needs to see, so the marker must circle it, not cover it.
+        # Black under white keeps it legible over both hot and cold colours.
+        cv2.circle(blended, (px, py), 9, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+        cv2.circle(blended, (px, py), 9, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+        # Drop the letterbox padding bars; they carry no image evidence.
+        blended = blended[:nh, :nw]
 
         name = f"{rank:03d}_{record['source_video'].replace('.mp4', '')}_" \
                f"{os.path.basename(record['rel_image'])}"
