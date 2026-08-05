@@ -56,8 +56,16 @@ model:
   # external checkpoint; null disables it and falls back to ImageNet weights.
   action_ckpt: checkpoints/action.ckpt
   freeze_blocks: 8          # number of leading transformer blocks kept frozen
-  tau_start: 1.0            # LSE temperature at epoch 0   (behaves like mean)
-  tau_end: 10.0             # LSE temperature at the last epoch (behaves like max)
+  # MIL pooling over the candidate region.
+  #   topk  average the highest `topk_frac` of R. The score depends on many
+  #         pixels at once, so the model must commit to a REGION. Preferred.
+  #   lse   log-sum-exp with the tau schedule below. At tau_end = 10 this
+  #         degenerates into a max: only the argmax pixel receives gradient and
+  #         the heatmap collapses to a single point. Kept for comparison only.
+  pooling: topk             # topk | lse
+  topk_frac: 0.05           # fraction of |R| averaged; 5% of ~17.6k px ~= 880 px
+  tau_start: 1.0            # (lse only) temperature at epoch 0   — mean-like
+  tau_end: 3.0              # (lse only) temperature at the last epoch
 
 # ── Losses ────────────────────────────────────────────────────────────────────
 loss:

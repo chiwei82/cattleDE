@@ -22,6 +22,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def masked_topk_mean(z, region, frac):
+    """Mean of the highest-scoring `frac` of the candidate region.
+
+    LSE pooling with a large tau degenerates into a max: its gradient weight is
+    softmax(tau * z), so effectively only the single argmax pixel ever learns,
+    and the model has no reason to light up an area. Averaging the top k = frac *
+    |R| pixels instead makes the score depend on k pixels at once, so raising it
+    requires committing to a REGION of roughly that size. k scales with |R|, so
+    the target area stays proportional across differently sized crops.
+
+    Returns pooled logits of shape (B,).
+    """
+    b = z.shape[0]
+    z_flat = z.reshape(b, -1)
+    r_flat = region.reshape(b, -1)
+
+    n = r_flat.sum(dim=1)
+    k = torch.clamp(torch.ceil(n * frac), min=1.0).long()      # per-sample k <= n
+    masked = z_flat.masked_fill(r_flat < 0.5, float("-inf"))
+
+    k_max = int(k.max().item())
+    values, _ = masked.topk(k_max, dim=1)
+    # Zero out the columns beyond each sample's own k before averaging.
+    keep = torch.arange(k_max, device=z.device)[None, :] < k[:, None]
+    values = values.masked_fill(~keep, 0.0)
+    return values.sum(dim=1) / k.to(values.dtype)
+
+
 def masked_lse(z, region, tau):
     """Region-restricted, area-normalised log-sum-exp pooling.
 
@@ -140,6 +168,10 @@ class ContactMIL(nn.Module):
         dim = self.features.dim
         self.image_size = image_size
         self.tau = float(mcfg["tau_start"])
+        self.pooling = str(mcfg.get("pooling", "topk")).lower()
+        self.topk_frac = float(mcfg.get("topk_frac", 0.05))
+        if self.pooling not in ("topk", "lse"):
+            raise ValueError("model.pooling must be 'topk' or 'lse'")
 
         # Two bilinear upsampling stages take the patch grid to 4x resolution;
         # the final interpolation to input size is done in forward(). Contact
@@ -168,6 +200,8 @@ class ContactMIL(nn.Module):
         z = F.interpolate(z, size=image.shape[-2:], mode="bilinear", align_corners=False)
         # -1e4 rather than -inf keeps autocast and the TV term finite.
         z = z.masked_fill(region < 0.5, -1e4)
+        if self.pooling == "topk":
+            return z, masked_topk_mean(z, region, self.topk_frac)
         return z, masked_lse(z, region, self.tau)
 
     def parameter_groups(self, lr_backbone, lr_head):

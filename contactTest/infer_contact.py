@@ -52,12 +52,18 @@ def load_checkpoint(path, device):
     return model, cfg
 
 
-def overlay(canvas_rgb, heat, alpha=0.45):
-    """Blend a jet colour map of the heatmap over the letterboxed crop."""
+def overlay(canvas_rgb, heat, alpha=0.55):
+    """Blend a colour map of the heatmap over the letterboxed crop.
+
+    Alpha is proportional to the heat rather than gated by a threshold. A fixed
+    threshold hides everything when the model produces a very peaked heatmap —
+    the response is real but occupies too few pixels to clear the cut-off — and
+    a proportional blend lets weak structure fade in instead of vanishing.
+    """
     heat_u8 = np.clip(heat * 255.0, 0, 255).astype(np.uint8)
-    colour = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)
+    colour = cv2.applyColorMap(heat_u8, cv2.COLORMAP_INFERNO)
     colour = cv2.cvtColor(colour, cv2.COLOR_BGR2RGB)
-    weight = (heat[..., None] > 0.05) * alpha
+    weight = np.clip(heat[..., None], 0.0, 1.0) * alpha
     return np.clip(canvas_rgb * (1 - weight) + colour * weight, 0, 255).astype(np.uint8)
 
 
@@ -88,6 +94,8 @@ def run_inference(model, dataset, records, device, batch_size, num_workers):
             record = records[idx]
             h = heat[i]
             py, px = np.unravel_index(int(h.argmax()), h.shape)
+            region_np = batch["region"][i, 0].numpy()
+            lit = float((h > 0.05).sum())
             scale = float(batch["scale"][i])
             fx, fy = to_frame_coords(record, py, px, scale)
             results.append({
@@ -100,8 +108,15 @@ def run_inference(model, dataset, records, device, batch_size, num_workers):
                 "score": float(scores[i]),
                 "peak_canvas_xy": (int(px), int(py)),
                 "peak_frame_xy": (fx, fy),
+                # Magnitude diagnostics: a peak near the -4.0 init floor
+                # (sigmoid(-4) = 0.018) with almost no lit pixels means the
+                # heatmap has collapsed to a point estimate rather than a region.
+                "peak_heat": float(h.max()),
+                "mean_heat_in_region": float(h.sum() / max(region_np.sum(), 1.0)),
+                "lit_px": lit,
+                "region_px": float(region_np.sum()),
                 "heat": h,
-                "region": batch["region"][i, 0].numpy(),
+                "region": region_np,
             })
     return results
 
@@ -169,6 +184,11 @@ def main():
     ap.add_argument("--positives-only", action="store_true",
                     help="visualise only pairs labelled as interaction")
     ap.add_argument("--deletion-test", action="store_true")
+    ap.add_argument("--raw", action="store_true",
+                    help="draw absolute heat values. By default each heatmap is "
+                         "divided by its own maximum, so the spatial pattern is "
+                         "visible even when the absolute response is tiny; the "
+                         "true magnitudes are always reported in predictions.csv")
     ap.add_argument("--top-frac", type=float, default=0.2)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--num-workers", type=int, default=4)
@@ -218,13 +238,35 @@ def main():
     results.sort(key=lambda r: -r["score"])
     results = results[:args.limit]
 
+    # Magnitude report. If the peak sits near the sigmoid(-4) = 0.018 floor the
+    # model never committed to any location; if the peak is high but only a
+    # handful of pixels are lit, it collapsed to a point instead of a region.
+    peaks = np.array([r["peak_heat"] for r in results])
+    lit = np.array([r["lit_px"] for r in results])
+    frac = np.array([r["lit_px"] / max(r["region_px"], 1.0) for r in results])
+    print(f"[infer] peak heat   median {np.median(peaks):.3f}  "
+          f"min {peaks.min():.3f}  max {peaks.max():.3f}")
+    print(f"[infer] lit pixels  median {np.median(lit):.0f} px  "
+          f"({np.median(frac):.2%} of the candidate region)")
+    if np.median(peaks) < 0.05:
+        print("[infer] WARNING: peaks are at the initialisation floor — the model "
+              "did not commit to any location. Lower model.tau_end and retrain.")
+    elif np.median(lit) < 100:
+        print("[infer] WARNING: the response is a point, not a region. Lower "
+              "model.tau_end and loss.lambda_sparsity, then retrain.")
+
     index_rows = []
     for rank, res in enumerate(results):
         record = records[res["index"]]
         bgr = cv2.imread(record["image_path"])
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         canvas, nh, nw, _ = letterbox(rgb, cfg["model"]["image_size"], 114)
-        blended = overlay(canvas, res["heat"])
+        heat = res["heat"]
+        if not args.raw:
+            # Per-image contrast stretch, so the SHAPE of the response is
+            # visible regardless of its absolute magnitude.
+            heat = heat / max(heat.max(), 1e-6)
+        blended = overlay(canvas, heat)
         px, py = res["peak_canvas_xy"]
         # Hollow ring rather than a filled cross: the peak is the pixel the
         # reader most needs to see, so the marker must circle it, not cover it.
@@ -243,6 +285,10 @@ def main():
             "label": res["label"],
             "label_v2": res["label_v2"],
             "score": f"{res['score']:.4f}",
+            "peak_heat": f"{res['peak_heat']:.4f}",
+            "mean_heat_in_region": f"{res['mean_heat_in_region']:.4f}",
+            "lit_px": int(res["lit_px"]),
+            "region_px": int(res["region_px"]),
             "peak_frame_x": res["peak_frame_xy"][0],
             "peak_frame_y": res["peak_frame_xy"][1],
             "source_video": res["source_video"],
