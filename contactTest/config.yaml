@@ -1,0 +1,84 @@
+# Configuration for the weakly-supervised contact-localisation experiment.
+#
+# This file is SELF-CONTAINED: contactTest never reads or writes global_config.yaml.
+# Every input path is relative to the repository root (cattleDE/); every output
+# path is relative to contactTest/ so that nothing outside this folder is touched.
+
+random_seed: 42
+
+# ── Inputs (read-only, resolved against the repository root) ──────────────────
+data:
+  # Annotation CSV produced by data/merge_label_studio_export.py.
+  csv: data/annotated/annotated_interaction_test.csv
+  # Crop images are referenced by the CSV 'image_path' column, which is already
+  # repo-root-relative (data/interaction/{split}/crops/{video}/frame_*.jpg).
+  # The crop is exactly the merged_bbox region of the source frame, un-resized;
+  # it is clipped at the frame border, so rel-boxes are clamped to the real size.
+
+  # Optional per-pair instance masks, e.g. produced later by SAM. When a file
+  # exists at <mask_dir>/<same relative path>.npz holding arrays 'mi' and 'mj'
+  # (uint8, same HxW as the crop), the contact-candidate region is built from
+  # dilated MASK intersection instead of dilated BOX intersection. Leave null to
+  # always use boxes. Boxes are the coarser prior but need no extra dependency.
+  mask_dir: null
+
+# ── Label mapping ─────────────────────────────────────────────────────────────
+# Mirrors the rule already used by train/interaction_with_image.py so that this
+# experiment trains on exactly the same rows as the stage-2 classifier.
+labels:
+  no_interaction_names: [no_interaction, none, no, "0"]
+  exclude_names: ["not well-cropped"]   # bad crops -> dropped
+  # label_v2 values to drop from the POSITIVE class. 'interest' denotes attention
+  # towards another animal, which need not involve physical contact — keeping it
+  # injects positives with no contact to localise. Empty list = keep parity with
+  # the existing binary classifier. See README.md before changing this.
+  exclude_positive_v2: []
+
+# ── Contact-candidate region R_ij ─────────────────────────────────────────────
+region:
+  # Dilation radius in pixels, applied AFTER letterboxing (i.e. in model input
+  # space, not source-frame space).
+  dilate_px: 15
+  # If the dilated intersection ends up smaller than this many pixels, fall back
+  # to the dilated union so the MIL pooling always has a non-empty bag.
+  min_area_px: 64
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  image_size: 224           # must be a multiple of the backbone patch size
+  # 'timm' keeps the dependency set identical to the rest of the repo and can be
+  # initialised from the existing action encoder. 'dinov2' needs torch.hub access
+  # (downloads weights) but gives noticeably sharper spatial features.
+  backbone: timm            # timm | dinov2
+  timm_name: vit_base_patch16_224
+  dinov2_name: dinov2_vitl14
+  # Warm-start the timm ViT from the stage-1 action encoder. Read-only use of an
+  # external checkpoint; null disables it and falls back to ImageNet weights.
+  action_ckpt: checkpoints/action.ckpt
+  freeze_blocks: 8          # number of leading transformer blocks kept frozen
+  tau_start: 1.0            # LSE temperature at epoch 0   (behaves like mean)
+  tau_end: 10.0             # LSE temperature at the last epoch (behaves like max)
+
+# ── Losses ────────────────────────────────────────────────────────────────────
+loss:
+  lambda_sparsity: 0.01     # L1 on the heatmap, area-normalised
+  lambda_tv: 0.3            # total variation, encourages one connected blob
+  auto_pos_weight: true     # BCE pos_weight = n_neg / n_pos from the train split
+
+# ── Training ──────────────────────────────────────────────────────────────────
+train:
+  epochs: 20
+  batch_size: 16
+  lr_backbone: 0.000005     # 5e-6
+  lr_head: 0.0001           # 1e-4
+  weight_decay: 0.05
+  num_workers: 8
+  amp: true
+  hflip_prob: 0.5
+
+# ── Outputs (relative to contactTest/, never written outside it) ──────────────
+output:
+  run_dir: log/contact
+  ckpt_name: contact_mil.pt
+  vis_dir: log/contact/vis
+  diag_dir: log/diagnostics
