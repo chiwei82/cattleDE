@@ -36,6 +36,7 @@ import sys
 
 import cv2
 import yaml
+from tqdm import tqdm
 from ultralytics import YOLO
 
 # ── Config (see global_config.yaml at the repository root) ────────────────────
@@ -93,10 +94,10 @@ def process_split(split, model):
     os.makedirs(out_labels, exist_ok=True)
 
     names = sorted(f for f in os.listdir(images_dir) if f.endswith(".jpg"))
-    print(f"\n[{split}] {len(names)} images")
+    print(f"\n[{split}] {len(names)} images", flush=True)
 
     n_orig = n_added = n_imgs_touched = 0
-    for name in names:
+    for name in tqdm(names, desc=f"[{split}]", unit="img", mininterval=1.0):
         img_path = os.path.join(images_dir, name)
         img = cv2.imread(img_path)
         if img is None:
