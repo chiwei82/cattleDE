@@ -29,6 +29,7 @@ Usage (from the repo root, on a machine with the venv):
   python prep/pseudo_label.py
 """
 
+import argparse
 import os
 import shutil
 import sys
@@ -145,6 +146,23 @@ def process_split(split, model):
 
 
 def main():
+    ap = argparse.ArgumentParser(
+        description="Build a COCO pseudo-labeled dataset (original + COCO boxes).")
+    ap.add_argument("--conf", type=float, default=None,
+                    help="Override COCO detection confidence (config default: "
+                         f"{PCFG['conf']}).")
+    ap.add_argument("--suffix", default=None,
+                    help="Override output dir suffix (config default: "
+                         f"'{PCFG['pseudo_suffix']}'). E.g. _highConf.")
+    args = ap.parse_args()
+
+    global PSEUDO_DIR
+    if args.conf is not None:
+        PCFG["conf"] = args.conf            # process_split reads PCFG["conf"]
+    if args.suffix is not None:
+        PSEUDO_DIR = _resolve(_CFG["yolo_prep"]["output_dir"] + args.suffix)
+    print(f"COCO conf = {PCFG['conf']}  |  output = {PSEUDO_DIR}")
+
     if "train" not in SPLITS or "val" not in SPLITS:
         print("[ERROR] pseudo_label.splits must include both 'train' and 'val' "
               "(ultralytics requires both keys to train).")
