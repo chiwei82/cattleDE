@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:rtx_3090:1
+#SBATCH --gres=gpu:1
 #SBATCH --partition gpu
 #SBATCH --job-name=gpujob
 #SBATCH --ntasks-per-node=1
