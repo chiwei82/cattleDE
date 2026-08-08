@@ -155,19 +155,24 @@ def main():
     ap.add_argument("--suffix", default=None,
                     help="Override output dir suffix (config default: "
                          f"'{PCFG['pseudo_suffix']}'). E.g. _highConf.")
+    ap.add_argument("--splits", nargs="+", default=None,
+                    help="Only build these splits (default: config splits). "
+                         "E.g. --splits test  builds an eval-only test set.")
     args = ap.parse_args()
 
-    global PSEUDO_DIR
+    global PSEUDO_DIR, SPLITS
     if args.conf is not None:
         PCFG["conf"] = args.conf            # process_split reads PCFG["conf"]
     if args.suffix is not None:
         PSEUDO_DIR = _resolve(_CFG["yolo_prep"]["output_dir"] + args.suffix)
-    print(f"COCO conf = {PCFG['conf']}  |  output = {PSEUDO_DIR}")
+    if args.splits is not None:
+        SPLITS = args.splits
+    print(f"COCO conf = {PCFG['conf']}  |  splits = {SPLITS}  |  output = {PSEUDO_DIR}")
 
     if "train" not in SPLITS or "val" not in SPLITS:
-        print("[ERROR] pseudo_label.splits must include both 'train' and 'val' "
-              "(ultralytics requires both keys to train).")
-        sys.exit(1)
+        print("[WARN] building a subset of splits — the resulting dataset is "
+              "eval-only (not trainable). The yaml's train/val keys will point "
+              "at a built split as placeholders (val mode only loads --split).")
 
     if os.path.isdir(PSEUDO_DIR):
         shutil.rmtree(PSEUDO_DIR)           # clean rebuild
@@ -184,12 +189,19 @@ def main():
             tot_orig += n_orig
             tot_added += n_added
 
-    # One dataset yaml covering every built split.
+    if not built:
+        print("[ERROR] no split built (images missing?). Run prep/yolo_prep.py.")
+        sys.exit(1)
+
+    # ultralytics requires train AND val keys in every data yaml, so always write
+    # all three; any split not actually built points at a built one as a harmless
+    # placeholder (val mode only loads the --split you pass).
     yaml_path = os.path.join(PSEUDO_DIR, "object_pseudo.yaml")
     with open(yaml_path, "w") as yf:
         yf.write(f"path: {os.path.abspath(PSEUDO_DIR)}\n")
-        for split in built:
-            yf.write(f"{split}: {split}/images\n")
+        for split in ("train", "val", "test"):
+            src = split if split in built else built[0]
+            yf.write(f"{split}: {src}/images\n")
         yf.write("\nnc: 1\n")
         yf.write("names: ['object']\n")
 
