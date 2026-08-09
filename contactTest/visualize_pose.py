@@ -113,9 +113,14 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="train", choices=["train", "val", "test"])
-    ap.add_argument("--limit", type=int, default=40)
+    ap.add_argument("--limit", type=int, default=40,
+                    help="cap on POSITIVE pairs processed (negatives are drawn "
+                         "separately, see --neg-per-pos)")
     ap.add_argument("--include-negatives", action="store_true",
-                    help="also render non-interacting pairs, as a control")
+                    help="also process non-interacting pairs, which is what "
+                         "enables the head-prior AUC test")
+    ap.add_argument("--neg-per-pos", type=float, default=3.0,
+                    help="negatives sampled per positive when --include-negatives")
     ap.add_argument("--min-conf", type=float, default=None,
                     help="overrides pose.min_conf from the config")
     ap.add_argument("--no-images", action="store_true",
@@ -128,13 +133,27 @@ def main():
     min_conf = args.min_conf if args.min_conf is not None else float(cfg["pose"]["min_conf"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    records = split_records(load_records(cfg))[args.split]
-    if not args.include_negatives:
-        records = [r for r in records if r["label"] == 1]
+    # Positives are the scarce class, so keep as many as the limit allows and
+    # draw negatives at random. Truncating the split in CSV order instead would
+    # sample a single video and a single stretch of footage, which is exactly
+    # the bias this test must avoid.
+    all_records = split_records(load_records(cfg))[args.split]
+    positives = [r for r in all_records if r["label"] == 1][:args.limit]
+    records = list(positives)
+    if args.include_negatives:
+        negatives = [r for r in all_records if r["label"] == 0]
+        n_neg = min(len(negatives), int(round(args.neg_per_pos * len(positives))))
+        rng = np.random.default_rng(int(cfg["random_seed"]))
+        picked = rng.choice(len(negatives), size=n_neg, replace=False)
+        records += [negatives[i] for i in sorted(picked)]
     if not records:
         raise SystemExit(f"no matching rows in split '{args.split}'")
-    records = records[:args.limit]
-    print(f"[pose] {len(records)} pairs from '{args.split}' on {device}")
+
+    n_pos = sum(1 for r in records if r["label"] == 1)
+    videos = len({r["source_video"] for r in records})
+    print(f"[pose] {len(records)} pairs from '{args.split}' "
+          f"({n_pos} positive, {len(records) - n_pos} negative, "
+          f"{videos} video(s)) on {device}")
 
     model = load_pose_model(cfg, device)
     transform = build_transform(cfg)
