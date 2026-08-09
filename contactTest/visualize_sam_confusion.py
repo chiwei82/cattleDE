@@ -130,22 +130,32 @@ def claim_logits(sam, bgr, boxes, pad=0):
     automatically confined to the intersection of the two boxes.
     """
     h, w = bgr.shape[:2]
-    out = []
+    out, areas = [], []
     for (x1, y1, x2, y2) in boxes:
-        x1p, y1p = max(0, x1 - pad), max(0, y1 - pad)
-        x2p, y2p = min(w, x2 + pad), min(h, y2 + pad)
+        bw, bh = x2 - x1, y2 - y1
+        # A margin is required, not optional. A box prompt localises by
+        # contrasting inside against outside, so prompting with the sub-image's
+        # own extent gives SAM no positional information at all and it returns
+        # whatever fills the frame — routinely the background. Cutting a little
+        # wider and prompting with the real box keeps the prompt well posed
+        # while still hiding most of the second animal.
+        m = max(pad, int(round(0.12 * min(bw, bh))), 8)
+        x1p, y1p = max(0, x1 - m), max(0, y1 - m)
+        x2p, y2p = min(w, x2 + m), min(h, y2 + m)
         sub = bgr[y1p:y2p, x1p:x2p]
         if sub.size == 0:
             out.append(np.full((h, w), -30.0, np.float32))
+            areas.append(0.0)
             continue
-        # Prompt with the sub-image's own extent: "the object fills this view".
-        sh, sw = sub.shape[:2]
-        logits = sam(sub, [[0, 0, sw, sh]])[0]
+
+        prompt = [x1 - x1p, y1 - y1p, x2 - x1p, y2 - y1p]
+        logits = sam(sub, [prompt])[0]
         # -30 outside the crop: sigmoid(-30) ~ 0, i.e. "this crop makes no claim".
         full = np.full((h, w), -30.0, np.float32)
         full[y1p:y2p, x1p:x2p] = logits
         out.append(full)
-    return out
+        areas.append(float((logits > 0).sum()) / max(logits.size, 1))
+    return out, areas
 
 
 def mutual_claim(logit_i, logit_j):
@@ -253,6 +263,9 @@ def main():
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="train", choices=["train", "val", "test"])
     ap.add_argument("--limit", type=int, default=24, help="pairs to process")
+    ap.add_argument("--balance", action="store_true",
+                    help="draw half interaction / half no_interaction. Affects "
+                         "which images are shown, never how they are measured")
     ap.add_argument("--model-type", default="vit_b")
     ap.add_argument("--weights", default=None, help="overrides data.sam_weights")
     ap.add_argument("--crop-pad", type=int, default=0,
@@ -265,20 +278,33 @@ def main():
     cfg = load_config(args.config)
     weights = args.weights or cfg["data"].get("sam_weights", "sam_b.pt")
 
-    # A plain random sample. The interaction label does not select the images
-    # and does not weight them: SAM's uncertainty is a property of the picture,
-    # so the sample should look like the data, not like a balanced test set.
-    # require_label=False: every crop in the CSV, including the ones nobody has
-    # annotated and the ones a human called badly cropped. SAM's behaviour on
-    # those is exactly as relevant as on any other frame.
+    # The annotation selects WHICH images to look at, and nothing else. Balanced
+    # sampling makes the contact sheet easy to read by eye; it does not enter the
+    # maps, the statistics or the verdict, all of which stay label-blind.
+    # require_label=False keeps the unannotated and "not well-cropped" rows
+    # available, so --balance off really does sample the whole split.
     rows = split_records(load_records(cfg, require_label=False))[args.split]
     if not rows:
         raise SystemExit(f"no rows in split '{args.split}'")
     rng = np.random.default_rng(int(cfg["random_seed"]))
-    n = min(len(rows), args.limit)
-    records = [rows[i] for i in sorted(rng.choice(len(rows), n, replace=False))]
-    print(f"[sam] {len(records)} pairs sampled at random from '{args.split}' "
-          f"({len(rows)} available)")
+
+    def draw(pool, k):
+        k = min(len(pool), k)
+        return [pool[i] for i in rng.choice(len(pool), k, replace=False)] if k else []
+
+    if args.balance:
+        pos = [r for r in rows if r["label"] == 1]
+        neg = [r for r in rows if r["label"] == 0]
+        half = args.limit // 2
+        records = draw(pos, half) + draw(neg, args.limit - half)
+        print(f"[sam] {len(records)} pairs from '{args.split}': "
+              f"{sum(1 for r in records if r['label'] == 1)} interaction / "
+              f"{sum(1 for r in records if r['label'] == 0)} no_interaction "
+              f"(balanced for viewing only)")
+    else:
+        records = draw(rows, args.limit)
+        print(f"[sam] {len(records)} pairs sampled at random from '{args.split}' "
+              f"({len(rows)} available)")
 
     try:
         sam = SamLogits(weights, args.model_type)
@@ -315,7 +341,8 @@ def main():
 
         # Second mechanism: each box segmented in isolation, then pasted back.
         try:
-            ci_l, cj_l = claim_logits(sam, bgr, boxes, pad=args.crop_pad)
+            (ci_l, cj_l), claim_areas = claim_logits(sam, bgr, boxes,
+                                                     pad=args.crop_pad)
         except Exception as err:                   # noqa: BLE001
             print(f"[sam] crop mode failed on {record['rel_image']}: {err}")
             continue
@@ -333,14 +360,20 @@ def main():
             record["label"]]
         if record["label"] == 1 and record["label_v2"]:
             annotation = record["label_v2"]
+        # A crop-mode mask covering nearly the whole view means the prompt
+        # collapsed and SAM returned the background rather than the animal.
         stats.update(rel_image=record["rel_image"], annotation=annotation,
-                     source_video=record["source_video"])
+                     source_video=record["source_video"],
+                     claim_area_i=round(claim_areas[0], 3),
+                     claim_area_j=round(claim_areas[1], 3),
+                     claim_degenerate=int(max(claim_areas) > 0.85))
         report.append(stats)
 
         if not args.no_images:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             row = panel(rgb, boxes, whole, cropped, band)
-            name = f"{i:03d}_{os.path.basename(record['rel_image'])}"
+            name = (f"{i:03d}_{annotation.replace(' ', '-')}_"
+                    f"{os.path.basename(record['rel_image'])}")
             cv2.imwrite(os.path.join(out_dir, name), cv2.cvtColor(row, cv2.COLOR_RGB2BGR))
         if (i + 1) % 10 == 0:
             print(f"[sam] processed {i + 1}/{len(records)}")
@@ -348,6 +381,14 @@ def main():
     if not report:
         raise SystemExit("nothing processed")
 
+    deg = np.mean([r["claim_degenerate"] for r in report])
+    ai = np.array([r["claim_area_i"] for r in report] +
+                  [r["claim_area_j"] for r in report], float)
+    print(f"\n[sam] 裁切模式的 mask 佔子圖面積：中位數 {np.median(ai):.0%}  "
+          f"(一頭牛在自己框裡大約 40-80%)")
+    if deg > 0.05:
+        print(f"[sam] WARNING: {deg:.0%} 的樣本 mask 佔滿子圖 >85% — SAM 抓到背景"
+              f"而不是牛。加大 --crop-pad 或檢查框是否正確")
     print("\n[sam] 面板順序：")
     print("      原圖+框 | 【整張】兩個 mask | 【整張】strict confusion"
           " | 【裁切】兩個 claim | 【裁切】mutual claim")
