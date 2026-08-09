@@ -208,6 +208,67 @@ class ContactPairDataset(Dataset):
         k = 2 * self.dilate_px + 1
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
 
+        # Pose. When enabled the MIL bag becomes the keypoints instead of the
+        # ~17.6k pixels of R, which is the point: 34 slots cannot hold a
+        # memorised copy of 2064 crops, and a joint means the same anatomy in
+        # every video whereas a pixel coordinate does not.
+        pcfg = cfg.get("pose", {})
+        self.use_pose = bool(pcfg.get("use_in_model", False))
+        self.pose_cache = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            pcfg.get("cache_dir", "log/pose_cache"))
+        self.kp_min_conf = float(pcfg.get("min_conf", 0.3))
+        self.kp_radius = int(pcfg.get("radius_px", 18))
+        self.kp_proximity = float(pcfg.get("proximity_px", 60))
+        self.num_joints = int(pcfg.get("num_joints", 17))
+
+    def _load_keypoints(self, record, crop_h, crop_w):
+        """Cached keypoints in crop pixels, or None when absent."""
+        path = os.path.join(self.pose_cache,
+                            os.path.splitext(record["rel_image"])[0] + ".npz")
+        if not os.path.exists(path):
+            return None
+        data = np.load(path)
+        keypoints = data["keypoints"].astype(np.float32)      # (2, J, 3)
+        cached_h, cached_w = [int(v) for v in data["crop_hw"]]
+        if (cached_h, cached_w) != (crop_h, crop_w) and cached_h > 0 and cached_w > 0:
+            keypoints[..., 0] *= crop_w / cached_w
+            keypoints[..., 1] *= crop_h / cached_h
+        return keypoints
+
+    def _gate_keypoints(self, keypoints, boxes):
+        """Mark the joints eligible to enter the MIL bag.
+
+        A joint qualifies when the pose model is confident about it AND it lies
+        near the OTHER animal — a joint on the far flank cannot be a contact
+        site, so admitting it would only widen the search for no reason.
+        """
+        valid = keypoints[..., 2] >= self.kp_min_conf
+        for i in range(keypoints.shape[0]):
+            ox1, oy1, ox2, oy2 = boxes[1 - i]
+            px = keypoints[i, :, 0]
+            py = keypoints[i, :, 1]
+            dx = np.maximum(np.maximum(ox1 - px, px - ox2), 0.0)
+            dy = np.maximum(np.maximum(oy1 - py, py - oy2), 0.0)
+            valid[i] &= np.hypot(dx, dy) <= self.kp_proximity
+        return valid
+
+    def _pose_region(self, keypoints, valid, size):
+        """Union of disks around the eligible joints, or None if there are none."""
+        if not valid.any():
+            return None
+        region = np.zeros((size, size), np.uint8)
+        for i in range(keypoints.shape[0]):
+            for j in range(keypoints.shape[1]):
+                if not valid[i, j]:
+                    continue
+                cx, cy = keypoints[i, j, 0], keypoints[i, j, 1]
+                if not (0 <= cx < size and 0 <= cy < size):
+                    continue
+                cv2.circle(region, (int(round(cx)), int(round(cy))),
+                           self.kp_radius, 1, -1)
+        return region.astype(np.float32)
+
     def __len__(self):
         return len(self.records)
 
@@ -234,11 +295,22 @@ class ContactPairDataset(Dataset):
         img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
         support_i, support_j = self._supports(record, img)
+        crop_h, crop_w = img.shape[:2]
+        keypoints = self._load_keypoints(record, crop_h, crop_w) if self.use_pose else None
+        boxes = relative_boxes(record, crop_h, crop_w)
 
         if self.train and np.random.rand() < self.hflip_prob:
             img = np.ascontiguousarray(img[:, ::-1])
             support_i = np.ascontiguousarray(support_i[:, ::-1])
             support_j = np.ascontiguousarray(support_j[:, ::-1])
+            # Boxes and keypoints must be mirrored alongside the image, or the
+            # proximity gate would compare flipped joints with unflipped boxes.
+            boxes = [(crop_w - 1 - x2, y1, crop_w - 1 - x1, y2)
+                     for (x1, y1, x2, y2) in boxes]
+            if keypoints is not None:
+                from .pose import flip_keypoints
+
+                keypoints = flip_keypoints(keypoints, crop_w)
 
         canvas, nh, nw, scale = letterbox(img, self.size, PAD_VALUE)
         support_i, _, _, _ = letterbox(support_i, self.size, 0)
@@ -256,6 +328,29 @@ class ContactPairDataset(Dataset):
             # Fall back to the union so the pooling always has something to pool.
             region = (((di > 0) | (dj > 0)) & (valid > 0)).astype(np.float32)
 
+        # Keypoints follow the same letterbox transform as the image: scaled by
+        # `scale`, no offset, because letterbox pastes at the canvas origin.
+        kp_xy = np.zeros((2, self.num_joints, 2), np.float32)
+        kp_valid = np.zeros((2, self.num_joints), bool)
+        if keypoints is not None:
+            keypoints = keypoints.copy()
+            keypoints[..., :2] *= scale
+            boxes_canvas = [tuple(v * scale for v in b) for b in boxes]
+            kp_valid = self._gate_keypoints(keypoints, boxes_canvas)
+            kp_valid &= ((keypoints[..., 0] >= 0) & (keypoints[..., 0] < self.size) &
+                         (keypoints[..., 1] >= 0) & (keypoints[..., 1] < self.size))
+            kp_xy = keypoints[..., :2].astype(np.float32)
+
+            pose_region = self._pose_region(keypoints, kp_valid, self.size)
+            if pose_region is not None:
+                # Intersect with the box region so the keypoint disks stay inside
+                # the physically plausible area and off the letterbox padding.
+                combined = pose_region * region
+                if combined.sum() >= self.min_area:
+                    region = combined
+                else:
+                    region = pose_region * (valid > 0)
+
         x = (canvas.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
 
         return {
@@ -263,6 +358,8 @@ class ContactPairDataset(Dataset):
             "region": torch.from_numpy(region)[None],
             "label": torch.tensor(float(record["label"])),
             "index": torch.tensor(idx),
+            "kp_xy": torch.from_numpy(kp_xy.reshape(-1, 2)),        # (2J, 2)
+            "kp_valid": torch.from_numpy(kp_valid.reshape(-1)),     # (2J,)
             # Kept for mapping predictions back to the source frame.
             "scale": torch.tensor(np.float32(scale)),
             "valid_hw": torch.tensor([nh, nw], dtype=torch.long),

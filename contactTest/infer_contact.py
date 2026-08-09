@@ -86,7 +86,8 @@ def run_inference(model, dataset, records, device, batch_size, num_workers):
     for batch in loader:
         image = batch["image"].to(device, non_blocking=True)
         region = batch["region"].to(device, non_blocking=True)
-        z, pooled = model(image, region)
+        z, pooled, _ = model(image, region) if model.pooling != "keypoint" else \
+            model(image, region, batch["kp_xy"].to(device), batch["kp_valid"].to(device))
         heat = (torch.sigmoid(z.float()) * region).cpu().numpy()[:, 0]
         scores = torch.sigmoid(pooled.float()).cpu().numpy()
         for i in range(len(scores)):
@@ -133,7 +134,9 @@ def deletion_test(model, dataset, records, device, top_frac=0.2, max_pairs=200, 
         image = sample["image"][None].to(device)
         region = sample["region"][None].to(device)
 
-        z, pooled = model(image, region)
+        kp = ((sample["kp_xy"][None].to(device), sample["kp_valid"][None].to(device))
+              if model.pooling == "keypoint" else ())
+        z, pooled, _ = model(image, region, *kp)
         base = float(torch.sigmoid(pooled.float())[0])
         heat = (torch.sigmoid(z.float()) * region).cpu().numpy()[0, 0]
         region_np = sample["region"].numpy()[0]
@@ -160,7 +163,7 @@ def deletion_test(model, dataset, records, device, top_frac=0.2, max_pairs=200, 
             mask = mask.reshape(region_np.shape).to(device)
             # Zero in normalised space == the ImageNet mean colour.
             occluded[0, :, mask] = 0.0
-            _, pooled_occ = model(occluded, region)
+            _, pooled_occ, _ = model(occluded, region, *kp)
             scores[name] = float(torch.sigmoid(pooled_occ.float())[0])
 
         rows.append({

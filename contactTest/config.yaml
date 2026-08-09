@@ -52,6 +52,14 @@ pose:
   num_joints: 17
   input_size: 256
   hmap_size: 64
+  # Feed cached keypoints to the model. Requires precompute_pose.py to have run;
+  # pair with model.pooling = keypoint. Leaving this false reproduces the
+  # pixel-space baseline, so the two are a clean ablation of each other.
+  use_in_model: false
+  cache_dir: log/pose_cache
+  radius_px: 18       # disk radius around a joint, in canvas pixels
+  proximity_px: 60    # a joint joins the bag only if this close to the other cow
+  pool_topk: 3        # joints averaged to form the pair score
   # Keypoints below this heatmap confidence are treated as missing. HRNet was
   # trained on ground-level animal photos, so an overhead pen camera is out of
   # distribution — check the per-joint confidences the visualiser reports before

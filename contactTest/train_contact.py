@@ -42,14 +42,27 @@ def out_path(cfg, key, *parts):
     return path
 
 
+def model_forward(model, batch, device):
+    """Call the model, passing keypoints only when keypoint pooling is active.
+
+    Returns (z, pooled_logit, joint_scores); joint_scores is None unless the
+    model pools over keypoints.
+    """
+    image = batch["image"].to(device, non_blocking=True)
+    region = batch["region"].to(device, non_blocking=True)
+    if getattr(model, "pooling", "") == "keypoint":
+        return model(image, region,
+                     batch["kp_xy"].to(device, non_blocking=True),
+                     batch["kp_valid"].to(device, non_blocking=True))
+    return model(image, region)
+
+
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
     labels, scores = [], []
     for batch in loader:
-        image = batch["image"].to(device, non_blocking=True)
-        region = batch["region"].to(device, non_blocking=True)
-        _, pooled = model(image, region)
+        _, pooled, _ = model_forward(model, batch, device)
         scores.extend(torch.sigmoid(pooled.float()).cpu().tolist())
         labels.extend(batch["label"].tolist())
     return roc_auc(labels, scores), labels, scores
@@ -136,12 +149,11 @@ def main():
         seen = 0
 
         for batch in train_loader:
-            image = batch["image"].to(device, non_blocking=True)
             region = batch["region"].to(device, non_blocking=True)
             label = batch["label"].to(device, non_blocking=True)
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                z, pooled = model(image, region)
+                z, pooled, _ = model_forward(model, batch, device)
                 loss, parts = contact_losses(
                     z.float(), region, pooled.float(), label,
                     pos_weight=pos_weight,
