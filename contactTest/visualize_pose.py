@@ -44,7 +44,7 @@ from contactTest.src.data import load_records, relative_boxes, split_records
 from contactTest.src.pose import (HEAD_JOINTS, KEYPOINT_NAMES, SKELETON,
                                   build_transform, closest_head_link,
                                   load_pose_model, pose_for_pair)
-from contactTest.src.utils import load_config
+from contactTest.src.utils import load_config, roc_auc
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
@@ -145,7 +145,7 @@ def main():
     n_joints = int(cfg["pose"]["num_joints"])
     conf_sum = np.zeros(n_joints)
     conf_hit = np.zeros(n_joints)
-    rows, link_dists = [], []
+    rows, link_dists, link_rows = [], [], []
 
     for i, record in enumerate(records):
         crop = cv2.imread(record["image_path"])
@@ -184,8 +184,15 @@ def main():
             row.update({"link_a": link[3], "link_b": link[4],
                         "link_dist_px": f"{link[2]:.1f}"})
             link_dists.append(link[2])
+            # Normalising by the animal's size makes the distance comparable
+            # across crops taken at different ranges from the camera.
+            scale_px = float(np.sqrt(max(
+                (boxes[0][2] - boxes[0][0]) * (boxes[0][3] - boxes[0][1]), 1)))
+            row["link_dist_norm"] = f"{link[2] / scale_px:.4f}"
+            link_rows.append((record["label"], link[2], link[2] / scale_px))
         else:
-            row.update({"link_a": "", "link_b": "", "link_dist_px": ""})
+            row.update({"link_a": "", "link_b": "", "link_dist_px": "",
+                        "link_dist_norm": ""})
         rows.append(row)
 
         if (i + 1) % 20 == 0:
@@ -209,6 +216,36 @@ def main():
         print(f"[pose] head-to-body link: median {np.median(d):.0f} px, "
               f"p10 {np.percentile(d, 10):.0f}, p90 {np.percentile(d, 90):.0f} "
               f"({len(d)}/{len(rows)} pairs had one)")
+
+    # Does the head prior hold at all? If contact really is head-initiated, the
+    # head-to-body distance alone should separate interacting pairs from
+    # non-interacting ones. Run with --include-negatives to get this; without
+    # both classes present the question cannot be asked.
+    prior_auc = prior_auc_norm = None
+    labels = np.array([r[0] for r in link_rows])
+    if link_rows and labels.min() == 0 and labels.max() == 1:
+        raw = np.array([r[1] for r in link_rows])
+        norm = np.array([r[2] for r in link_rows])
+        # Shorter distance should mean contact, hence the negation.
+        prior_auc = roc_auc(labels, -raw)
+        prior_auc_norm = roc_auc(labels, -norm)
+        pos, neg = raw[labels == 1], raw[labels == 0]
+        print(f"\n[pose] HEAD PRIOR TEST  ({int((labels == 1).sum())} pos / "
+              f"{int((labels == 0).sum())} neg with a link)")
+        print(f"       link distance  positives median {np.median(pos):6.0f} px")
+        print(f"       link distance  negatives median {np.median(neg):6.0f} px")
+        print(f"       AUC of -distance as a label predictor : {prior_auc:.4f}")
+        print(f"       same, size-normalised                : {prior_auc_norm:.4f}")
+        best = max(prior_auc, prior_auc_norm)
+        if best >= 0.70:
+            print("       -> the head prior is REAL. Worth encoding as an "
+                  "auxiliary target, with the binary label correcting it.")
+        elif best >= 0.60:
+            print("       -> weak but present. Usable as a soft prior only.")
+        else:
+            print("       -> the prior does NOT hold on these keypoints. Either "
+                  "the head estimate is wrong or contact is not head-localised "
+                  "here; do not train against it.")
 
     if head_rate < 0.5:
         verdict = ("STOP - head joints are unreliable on this camera angle. A "
@@ -237,6 +274,8 @@ def main():
                                        for j in range(n_joints)},
             "head_mean_conf": head_mean, "head_above_thresh": head_rate,
             "link_dist_median_px": float(np.median(link_dists)) if link_dists else None,
+            "head_prior_auc": prior_auc,
+            "head_prior_auc_normalised": prior_auc_norm,
             "verdict": verdict,
         }, f, indent=2)
     print(f"[pose] wrote {out_dir}")
