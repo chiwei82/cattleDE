@@ -202,9 +202,22 @@ def claim_logits(sam, bgr, boxes, pad=0, use_point=True, target_frac=0.0):
 
 
 def mutual_claim(logit_i, logit_j):
-    """Probability that both isolated segmentations claim the same pixel."""
+    """How strongly the WEAKER of the two isolated segmentations claims a pixel.
+
+    The minimum, not the product. A product conflates two different situations:
+    0.5 x 0.5 and 1.0 x 0.25 both give 0.25, yet only the first means "both
+    segmentations half-claim this". The minimum reads directly — min > 0.5 means
+    both claims are above 0.5 — and it is not inflated by one confident mask.
+
+    It also removes a padding artefact. Outside its own box a claim is 0 by
+    construction, so a product is exactly 0 outside the box intersection and
+    non-zero inside it whatever SAM said; even two indifferent logits of 0 give
+    0.25 there, which renders as a tinted rectangle that looks like a finding
+    but is only the shape of the support. The minimum of two indifferent claims
+    is 0.5, which the >0.5 threshold then discards as it should.
+    """
     sig = lambda l: 1.0 / (1.0 + np.exp(-np.clip(l, -30, 30)))
-    return (sig(logit_i) * sig(logit_j)).astype(np.float32)
+    return np.minimum(sig(logit_i), sig(logit_j)).astype(np.float32)
 
 
 def colourise(gray01, rgb):
