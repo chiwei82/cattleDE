@@ -40,6 +40,19 @@ CROPPED PROMPTS — read SAM's confidence
     confined to the intersection of the two boxes. Where the whole-image reading
     fails because SAM was confident but wrong, this one still fires.
 
+PROMPTING
+    Every prompt is a box PLUS a positive point at its centre. SAM was trained
+    on class-agnostic masks and has no concept of "cow": given only a box it
+    looks for whatever coherent region best fits that rectangle, and a uniform
+    patch of floor is a more coherent region than a high-contrast Holstein. A
+    slightly loose box is therefore often answered with the ground. The positive
+    point removes that failure by construction — the returned mask has to
+    contain that pixel, and the floor does not. `--no-point` reverts to boxes
+    alone; `--target-frac 0.6` additionally asks for SAM's three multimask
+    candidates and keeps the one whose area best matches that share of the box,
+    which settles the whole-vs-part ambiguity without needing to know how large
+    the animal is in absolute terms.
+
 The report describes the maps as regions — non-empty, coherent or speckled, how
 large, and where they sit. Whether a region coincides with contact is a separate
 question this script deliberately does not ask.
@@ -75,15 +88,44 @@ class SamLogits:
         self.predictor = SamPredictor(sam)
         print(f"[sam] segment-anything {model_type} on {device}")
 
-    def __call__(self, bgr, boxes):
-        """Returns a list of full-resolution logit maps, one per box."""
+    def __call__(self, bgr, boxes, use_point=True, target_frac=0.0):
+        """Returns a list of full-resolution logit maps, one per box.
+
+        A box alone only says "the object spans roughly this rectangle", and SAM
+        has no notion of "cow" — it was trained on class-agnostic masks and
+        simply looks for a coherent region that fits the box. A uniform patch of
+        floor is a more coherent region than a high-contrast Holstein, so a
+        slightly loose box can easily be answered with the ground. Adding a
+        positive point pins the answer down: the mask MUST contain that pixel,
+        and the floor does not.
+
+        target_frac > 0 asks for the three multimask candidates and keeps the one
+        whose area is closest to target_frac of the box, which resolves SAM's
+        whole-vs-part-vs-subpart ambiguity without needing to know the animal's
+        absolute size — only its expected share of its own box.
+        """
         self.predictor.set_image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         out = []
         for b in boxes:
-            logits, _, _ = self.predictor.predict(
-                box=np.asarray(b, dtype=np.float32)[None],
-                multimask_output=False, return_logits=True)
-            out.append(logits[0].astype(np.float32))
+            x1, y1, x2, y2 = map(float, b)
+            kwargs = {"box": np.array([x1, y1, x2, y2], np.float32)[None],
+                      "return_logits": True}
+            if use_point:
+                kwargs["point_coords"] = np.array([[(x1 + x2) / 2, (y1 + y2) / 2]],
+                                                  np.float32)
+                kwargs["point_labels"] = np.array([1], np.int32)   # 1 = foreground
+
+            if target_frac > 0:
+                logits, scores, _ = self.predictor.predict(multimask_output=True,
+                                                           **kwargs)
+                want = target_frac * max((x2 - x1) * (y2 - y1), 1.0)
+                areas = np.array([(l > 0).sum() for l in logits], np.float64)
+                pick = int(np.argmin(np.abs(areas - want)))
+                out.append(logits[pick].astype(np.float32))
+            else:
+                logits, _, _ = self.predictor.predict(multimask_output=False,
+                                                      **kwargs)
+                out.append(logits[0].astype(np.float32))
         return out
 
 
@@ -111,7 +153,7 @@ def confusion_maps(logit_i, logit_j):
     return ui * uj, np.maximum(ui, uj)
 
 
-def claim_logits(sam, bgr, boxes, pad=0):
+def claim_logits(sam, bgr, boxes, pad=0, use_point=True, target_frac=0.0):
     """Segment each box's crop in ISOLATION, then paste the result back.
 
     The opposite mechanism to the whole-image prompts above, and it exploits a
@@ -149,7 +191,8 @@ def claim_logits(sam, bgr, boxes, pad=0):
             continue
 
         prompt = [x1 - x1p, y1 - y1p, x2 - x1p, y2 - y1p]
-        logits = sam(sub, [prompt])[0]
+        logits = sam(sub, [prompt], use_point=use_point,
+                     target_frac=target_frac)[0]
         # -30 outside the crop: sigmoid(-30) ~ 0, i.e. "this crop makes no claim".
         full = np.full((h, w), -30.0, np.float32)
         full[y1p:y2p, x1p:x2p] = logits
@@ -268,6 +311,14 @@ def main():
                          "which images are shown, never how they are measured")
     ap.add_argument("--model-type", default="vit_b")
     ap.add_argument("--weights", default=None, help="overrides data.sam_weights")
+    ap.add_argument("--no-point", action="store_true",
+                    help="box prompt only. A box says where the object roughly "
+                         "is; a positive point says the mask must contain that "
+                         "pixel, which is what stops SAM answering with floor")
+    ap.add_argument("--target-frac", type=float, default=0.0,
+                    help="if > 0, take SAM's three multimask candidates and keep "
+                         "the one whose area is closest to this fraction of the "
+                         "box. ~0.6 suits cattle in an axis-aligned box")
     ap.add_argument("--crop-pad", type=int, default=0,
                     help="pixels of context added around each box in crop mode; "
                          "0 keeps SAM blind to the other animal, which is the "
@@ -328,7 +379,8 @@ def main():
         h, w = bgr.shape[:2]
         boxes = relative_boxes(record, h, w)
         try:
-            li, lj = sam(bgr, boxes)
+            li, lj = sam(bgr, boxes, use_point=not args.no_point,
+                         target_frac=args.target_frac)
         except Exception as err:                   # noqa: BLE001
             print(f"[sam] failed on {record['rel_image']}: {err}")
             continue
@@ -341,8 +393,9 @@ def main():
 
         # Second mechanism: each box segmented in isolation, then pasted back.
         try:
-            (ci_l, cj_l), claim_areas = claim_logits(sam, bgr, boxes,
-                                                     pad=args.crop_pad)
+            (ci_l, cj_l), claim_areas = claim_logits(
+                sam, bgr, boxes, pad=args.crop_pad,
+                use_point=not args.no_point, target_frac=args.target_frac)
         except Exception as err:                   # noqa: BLE001
             print(f"[sam] crop mode failed on {record['rel_image']}: {err}")
             continue
