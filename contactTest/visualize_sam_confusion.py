@@ -88,7 +88,7 @@ class SamLogits:
         self.predictor = SamPredictor(sam)
         print(f"[sam] segment-anything {model_type} on {device}")
 
-    def __call__(self, bgr, boxes, use_point=True, target_frac=0.0):
+    def __call__(self, bgr, boxes, use_point=True, target_frac=0.0, use_box=True):
         """Returns a list of full-resolution logit maps, one per box.
 
         A box alone only says "the object spans roughly this rectangle", and SAM
@@ -108,9 +108,11 @@ class SamLogits:
         out = []
         for b in boxes:
             x1, y1, x2, y2 = map(float, b)
-            kwargs = {"box": np.array([x1, y1, x2, y2], np.float32)[None],
-                      "return_logits": True}
-            if use_point:
+            kwargs = {"return_logits": True}
+            if use_box:
+                kwargs["box"] = np.array([x1, y1, x2, y2], np.float32)[None]
+            if use_point or not use_box:
+                # A point is mandatory without a box: some prompt must be given.
                 kwargs["point_coords"] = np.array([[(x1 + x2) / 2, (y1 + y2) / 2]],
                                                   np.float32)
                 kwargs["point_labels"] = np.array([1], np.int32)   # 1 = foreground
@@ -153,7 +155,8 @@ def confusion_maps(logit_i, logit_j):
     return ui * uj, np.maximum(ui, uj)
 
 
-def claim_logits(sam, bgr, boxes, pad=0, use_point=True, target_frac=0.0):
+def claim_logits(sam, bgr, boxes, pad=0, use_point=True, target_frac=0.0,
+                 exact=False):
     """Segment each box's crop in ISOLATION, then paste the result back.
 
     The opposite mechanism to the whole-image prompts above, and it exploits a
@@ -172,36 +175,44 @@ def claim_logits(sam, bgr, boxes, pad=0, use_point=True, target_frac=0.0):
     automatically confined to the intersection of the two boxes.
     """
     h, w = bgr.shape[:2]
-    out, areas = [], []
+    out, valid, areas = [], [], []
     for (x1, y1, x2, y2) in boxes:
         bw, bh = x2 - x1, y2 - y1
-        # A margin is required, not optional. A box prompt localises by
-        # contrasting inside against outside, so prompting with the sub-image's
-        # own extent gives SAM no positional information at all and it returns
-        # whatever fills the frame — routinely the background. Cutting a little
-        # wider and prompting with the real box keeps the prompt well posed
-        # while still hiding most of the second animal.
-        m = max(pad, int(round(0.12 * min(bw, bh))), 8)
+        # exact (the default) cuts precisely to bbox1/bbox2 and prompts with the
+        # centre point ALONE. Nothing outside the box is seen or used, which is
+        # the whole point of this reading. The box prompt has to be dropped, not
+        # merely resized: a box prompt localises by contrasting inside against
+        # outside, so a box equal to the sub-image carries no information and SAM
+        # answers with whatever fills the frame — usually the floor. "The object
+        # containing this pixel" stays well posed however tight the crop is.
+        m = 0 if exact else max(pad, int(round(0.12 * min(bw, bh))), 8)
         x1p, y1p = max(0, x1 - m), max(0, y1 - m)
         x2p, y2p = min(w, x2 + m), min(h, y2 + m)
         sub = bgr[y1p:y2p, x1p:x2p]
         if sub.size == 0:
-            out.append(np.full((h, w), -30.0, np.float32))
+            out.append(np.zeros((h, w), np.float32))
+            valid.append(np.zeros((h, w), bool))
             areas.append(0.0)
             continue
 
         prompt = [x1 - x1p, y1 - y1p, x2 - x1p, y2 - y1p]
-        logits = sam(sub, [prompt], use_point=use_point,
-                     target_frac=target_frac)[0]
-        # -30 outside the crop: sigmoid(-30) ~ 0, i.e. "this crop makes no claim".
-        full = np.full((h, w), -30.0, np.float32)
+        logits = sam(sub, [prompt], use_point=use_point or exact,
+                     target_frac=target_frac, use_box=not exact)[0]
+
+        # Where this crop looked is tracked explicitly rather than smuggled into
+        # the logit as a sentinel value: outside its own sub-image a crop has no
+        # opinion, which is a different thing from a confident "not mine".
+        full = np.zeros((h, w), np.float32)
+        seen = np.zeros((h, w), bool)
         full[y1p:y2p, x1p:x2p] = logits
+        seen[y1p:y2p, x1p:x2p] = True
         out.append(full)
+        valid.append(seen)
         areas.append(float((logits > 0).sum()) / max(logits.size, 1))
-    return out, areas
+    return out, valid, areas
 
 
-def mutual_claim(logit_i, logit_j):
+def mutual_claim(logit_i, logit_j, seen_i=None, seen_j=None):
     """How strongly the WEAKER of the two isolated segmentations claims a pixel.
 
     The minimum, not the product. A product conflates two different situations:
@@ -217,7 +228,11 @@ def mutual_claim(logit_i, logit_j):
     is 0.5, which the >0.5 threshold then discards as it should.
     """
     sig = lambda l: 1.0 / (1.0 + np.exp(-np.clip(l, -30, 30)))
-    return np.minimum(sig(logit_i), sig(logit_j)).astype(np.float32)
+    out = np.minimum(sig(logit_i), sig(logit_j))
+    if seen_i is not None and seen_j is not None:
+        # Only pixels BOTH crops actually looked at can carry a mutual claim.
+        out = out * (seen_i & seen_j)
+    return out.astype(np.float32)
 
 
 def colourise(gray01, rgb):
@@ -347,9 +362,11 @@ def main():
                          "the one whose area is closest to this fraction of the "
                          "box. ~0.6 suits cattle in an axis-aligned box")
     ap.add_argument("--crop-pad", type=int, default=0,
-                    help="pixels of context added around each box in crop mode; "
-                         "0 keeps SAM blind to the other animal, which is the "
-                         "point of that mechanism")
+                    help="crop mode context. 0 (default) cuts precisely to "
+                         "bbox1/bbox2 and prompts with the centre point ALONE — "
+                         "nothing outside the box is seen or used. A positive "
+                         "value pads the crop and restores the box prompt, which "
+                         "needs an outside to contrast against")
     ap.add_argument("--no-images", action="store_true")
     args = ap.parse_args()
 
@@ -420,15 +437,16 @@ def main():
 
         # Second mechanism: each box segmented in isolation, then pasted back.
         try:
-            (ci_l, cj_l), claim_areas = claim_logits(
+            (ci_l, cj_l), (si, sj), claim_areas = claim_logits(
                 sam, bgr, boxes, pad=args.crop_pad,
-                use_point=not args.no_point, target_frac=args.target_frac)
+                use_point=not args.no_point, target_frac=args.target_frac,
+                exact=args.crop_pad <= 0)
         except Exception as err:                   # noqa: BLE001
             print(f"[sam] crop mode failed on {record['rel_image']}: {err}")
             continue
         sig = lambda l: 1.0 / (1.0 + np.exp(-np.clip(l, -30, 30)))
-        cropped = {"ci": sig(ci_l), "cj": sig(cj_l),
-                   "mutual": mutual_claim(ci_l, cj_l)}
+        cropped = {"ci": sig(ci_l) * si, "cj": sig(cj_l) * sj,
+                   "mutual": mutual_claim(ci_l, cj_l, si, sj)}
 
         stats = region_stats({"strict": strict, "loose": loose,
                               "overlap": whole["overlap"],
