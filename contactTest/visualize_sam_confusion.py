@@ -1,35 +1,38 @@
-"""Visualise and measure where SAM cannot decide which animal owns a pixel.
+"""Locate, per image, the region where SAM cannot decide which animal owns it.
 
 Usage (from the repository root):
 
-    python -m contactTest.visualize_sam_confusion --limit 12
-    python -m contactTest.visualize_sam_confusion --split val --limit 30 --no-images
+    python -m contactTest.visualize_sam_confusion --limit 24
+    python -m contactTest.visualize_sam_confusion --split val --limit 60 --no-images
 
 Writes to contactTest/log/sam_confusion/<split>/ only.
 
-The idea being tested: when two animals are genuinely touching, a segmenter has
-no evidence for where one ends and the other begins, so its decision boundary
-there is uncertain. That uncertainty is a signal for contact, and unlike the
-pose route it needs no anatomical model.
+This is an UNSUPERVISED image measurement, not a predictor. SAM knows nothing
+about interaction; prompted with a box it answers "which pixels belong to this
+object", and it becomes uncertain wherever the evidence for the boundary is
+weak. That uncertainty is a property of the picture alone, so the interaction
+label takes no part in computing it and no part in judging it — the label rides
+along only as a caption on the panels.
 
 SAM's mask decoder emits a per-pixel logit; thresholding at 0 gives the binary
-mask. A logit near 0 means "unsure". Taken alone that fires on every boundary
-including animal-against-floor, so this script prompts SAM once per animal and
-multiplies the two uncertainties:
+mask, and a logit near 0 means "unsure". One animal's uncertainty alone marks
+every edge it has, including against the floor, so the map is formed from both
+prompts at once:
 
-    u_x(p)       = 4 * sigmoid(logit_x(p)) * (1 - sigmoid(logit_x(p)))
-    confusion(p) = u_i(p) * u_j(p)
+    u_x(p) = 4 * sigmoid(logit_x(p)) * (1 - sigmoid(logit_x(p)))
 
-At an animal/floor edge only one of the two is unsure — the other confidently
-says "not mine" — so the product stays low. It is high only where BOTH
-segmentations are undecided, which is where the two bodies meet.
+    strict(p) = u_i(p) * u_j(p)      both segmentations undecided here
+    loose(p)  = max(u_i(p), u_j(p))  either one undecided here
 
-Also reported is the plain mask overlap (both masks claiming the same pixel),
-which is the same idea with the logits thrown away.
+`strict` keeps only pixels neither prompt can claim — mutual ambiguity, which is
+what an interface between two bodies looks like to a segmenter. `loose` keeps
+single-object edges too (floor, occlusion, railing); it is the reading to use
+when a false alarm on the floor is acceptable and coverage matters more.
 
-Per-pixel logits need the reference segment-anything package (return_logits).
-Ultralytics returns binary masks only, so under it the confusion map is
-unavailable and just the overlap is reported.
+What the report answers: whether SAM yields a usable confusion region on these
+images at all — is it non-empty, is it one coherent blob rather than scattered
+speckle, how large is it, and where does it sit. Whether such a region coincides
+with contact is a separate question this script deliberately does not ask.
 """
 
 import argparse
@@ -44,7 +47,7 @@ import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from contactTest.src.data import load_records, relative_boxes, split_records
-from contactTest.src.utils import load_config, roc_auc
+from contactTest.src.utils import load_config
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 C_I, C_J = (214, 120, 42), (52, 104, 235)          # RGB, cow i / cow j
@@ -91,8 +94,8 @@ def confusion_maps(logit_i, logit_j):
 
     loose  = max(u_i, u_j)
         Fires wherever EITHER is undecided, so it also lights up floor edges and
-        occlusions. Use when recall matters more than precision: the question is
-        whether anything fires at a real contact at all.
+        occlusions. Use when a false alarm on the floor is acceptable and
+        coverage of the real interface matters more.
     """
     ui, uj = uncertainty(logit_i), uncertainty(logit_j)
     return ui * uj, np.maximum(ui, uj)
@@ -158,20 +161,31 @@ def contact_band(mi, mj, dilate=15):
     return (cv2.dilate(mi, k) > 0) & (cv2.dilate(mj, k) > 0)
 
 
-def band_stats(strict, loose, overlap, band):
-    """Summarise both readings inside the contact band."""
-    n = int(band.sum())
-    out = {"band_px": n,
-           "overlap_px": int(overlap.sum()),
-           "overlap_frac_of_band": float(overlap.sum() / n) if n else 0.0}
-    for name, m in (("strict", strict), ("loose", loose)):
-        if m is None or not n:
-            out.update({f"{name}_mean": 0.0, f"{name}_max": 0.0, f"{name}_area": 0.0})
+def region_stats(maps, band, thresh=0.5):
+    """Describe each confusion map as a REGION, without reference to any label.
+
+    Recorded per reading: whether it produced anything at all, how big it is,
+    how fragmented (a coherent interface is one or two connected components,
+    speckle is many), its peak, and how much of it falls in the band where the
+    two dilated masks meet — the only place an interface between the animals
+    can physically be.
+    """
+    n_band = int(band.sum())
+    out = {"band_px": n_band}
+    for name, m in maps.items():
+        if m is None:
+            out.update({f"{name}_nonempty": 0, f"{name}_area_px": 0,
+                        f"{name}_components": 0, f"{name}_max": 0.0,
+                        f"{name}_frac_in_band": 0.0})
             continue
-        v = m[band]
-        out[f"{name}_mean"] = float(v.mean())
-        out[f"{name}_max"] = float(v.max())
-        out[f"{name}_area"] = float((v > 0.5).sum() / n)
+        binary = (m > thresh).astype(np.uint8)
+        area = int(binary.sum())
+        n_comp, _ = cv2.connectedComponents(binary)
+        out[f"{name}_nonempty"] = int(area > 0)
+        out[f"{name}_area_px"] = area
+        out[f"{name}_components"] = max(n_comp - 1, 0)      # label 0 is background
+        out[f"{name}_max"] = float(m.max())
+        out[f"{name}_frac_in_band"] = float((binary & band).sum() / area) if area else 0.0
     return out
 
 
@@ -232,7 +246,8 @@ def main():
         strict, loose = confusion_maps(li, lj) if have_logits else (None, None)
         band = contact_band(mi, mj)
 
-        stats = band_stats(strict, loose, overlap, band)
+        stats = region_stats({"strict": strict, "loose": loose,
+                              "overlap": overlap.astype(np.float32)}, band)
         stats.update(rel_image=record["rel_image"], label=record["label"],
                      label_v2=record["label_v2"],
                      source_video=record["source_video"])
@@ -251,49 +266,50 @@ def main():
     if not report:
         raise SystemExit("nothing processed")
 
-    labels = np.array([r["label"] for r in report])
     print("\n[sam] 面板順序：原圖+框 | 兩個 mask | overlap(白) | "
           "strict confusion | loose confusion")
-    print("[sam] 綠框 = 統計用的接觸帶，白圈 = 帶內最高點\n")
+    print("[sam] 綠框 = 兩個膨脹 mask 的交會帶，白圈 = 帶內最高點\n")
 
-    # Recall first: on positives, does anything fire in the band at all?
-    pos_rows = [r for r in report if r["label"] == 1]
-    if pos_rows:
-        print("在正樣本的接觸帶內，有東西亮起來的比例：")
-        print(f"{'':<10}{'>0.3':>9}{'>0.5':>9}{'>0.7':>9}{'>0.9':>9}")
-        for name in ("strict", "loose", "overlap_frac_of_band"):
-            key = name if name.endswith("band") else f"{name}_max"
-            v = np.array([r[key] for r in pos_rows], dtype=float)
-            hits = "".join(f"{np.mean(v > t):>9.0%}" for t in (.3, .5, .7, .9))
-            print(f"{name.replace('_frac_of_band',''):<10}{hits}")
-        print()
-
-    print(f"{'metric':<26}{'positives':>12}{'negatives':>12}{'AUC':>8}")
+    # Everything below describes the maps themselves. The interaction label is
+    # NOT used: SAM's uncertainty is a property of the image, so asking whether
+    # it separates interacting from non-interacting pairs would impose on SAM a
+    # semantics it does not have.
     summary = {}
-    for key in ("overlap_frac_of_band", "strict_mean", "strict_max", "strict_area",
-                "loose_mean", "loose_max", "loose_area"):
-        v = np.array([r[key] for r in report], dtype=float)
-        if labels.min() == labels.max():
-            continue
-        auc = roc_auc(labels, v)
-        summary[key] = {"pos_median": float(np.median(v[labels == 1])),
-                        "neg_median": float(np.median(v[labels == 0])),
-                        "auc": auc}
-        print(f"{key:<26}{np.median(v[labels == 1]):>12.4f}"
-              f"{np.median(v[labels == 0]):>12.4f}{auc:>8.3f}")
+    print(f"{'reading':<10}{'非空比例':>12}{'區域大小':>13}{'連通塊數':>12}{'峰值':>10}")
+    for name in ("strict", "loose", "overlap"):
+        nonempty = np.array([r[f"{name}_nonempty"] for r in report], float)
+        area = np.array([r[f"{name}_area_px"] for r in report], float)
+        comps = np.array([r[f"{name}_components"] for r in report], float)
+        peak = np.array([r[f"{name}_max"] for r in report], float)
+        inband = np.array([r[f"{name}_frac_in_band"] for r in report], float)
+        summary[name] = {"nonempty_frac": float(nonempty.mean()),
+                         "area_px_median": float(np.median(area)),
+                         "components_median": float(np.median(comps)),
+                         "peak_median": float(np.median(peak)),
+                         "frac_in_band_median": float(np.median(inband))}
+        print(f"{name:<10}{nonempty.mean():>11.0%}{np.median(area):>10.0f} px"
+              f"{np.median(comps):>12.1f}{np.median(peak):>10.3f}")
+    print("\n（中位數；區域 = 該讀法 > 0.5 的像素）")
 
-    best = max((s["auc"] for s in summary.values()), default=float("nan"))
-    if best >= 0.75:
-        verdict = ("STRONG - segmentation ambiguity separates contact from proximity "
-                   "well; worth feeding to the model as an input plane.")
-    elif best >= 0.65:
-        verdict = ("USABLE - comparable to the pose prior but needs no anatomical "
-                   "model; worth an input plane and an ablation.")
-    elif best >= 0.55:
-        verdict = "WEAK - present but thin; do not build on it alone."
+    print(f"\n{'reading':<10}{'區域落在交會帶內的比例':>24}")
+    for name in ("strict", "loose", "overlap"):
+        print(f"{name:<10}{summary[name]['frac_in_band_median']:>22.0%}")
+
+    s_ok, s_clean = summary["strict"]["nonempty_frac"], summary["strict"]["components_median"]
+    if s_ok >= 0.7 and s_clean <= 3:
+        verdict = ("USABLE - SAM yields a non-empty, coherent mutual-ambiguity "
+                   "region on most images; cache it as an input plane.")
+    elif s_ok >= 0.7:
+        verdict = ("NOISY - regions exist but are fragmented; smooth them or keep "
+                   "the largest component before use.")
+    elif summary["loose"]["nonempty_frac"] >= 0.7:
+        verdict = ("STRICT TOO TIGHT - mutual ambiguity is rare, so SAM is "
+                   "confident about the boundary between the two animals. Use the "
+                   "loose reading, or prompt with points to force a split.")
     else:
-        verdict = ("NONE - SAM is equally undecided whether or not the animals "
-                   "touch, so this carries no contact information.")
+        verdict = ("NO SIGNAL - SAM is confident almost everywhere, most likely "
+                   "because it returned one animal, or both as a single object, "
+                   "rather than an uncertain boundary. Check the mask panel.")
     print(f"\n[sam] verdict: {verdict}")
 
     with open(os.path.join(out_dir, "confusion_report.csv"), "w", newline="") as f:
@@ -302,8 +318,7 @@ def main():
         wtr.writerows(report)
     with open(os.path.join(out_dir, "confusion_summary.json"), "w") as f:
         json.dump({"split": args.split, "n": len(report),
-                   "n_pos": int(labels.sum()), "metrics": summary,
-                   "verdict": verdict}, f, indent=2)
+                   "readings": summary, "verdict": verdict}, f, indent=2)
     print(f"[sam] wrote {out_dir}")
 
 
