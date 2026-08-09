@@ -43,6 +43,21 @@ region:
   # to the dilated union so the MIL pooling always has a non-empty bag.
   min_area_px: 64
 
+# ── Pose (HRNet-W32 / AP-10K, 17 quadruped keypoints) ─────────────────────────
+# Values mirror the hrnet block of global_config.yaml. They are duplicated here
+# rather than imported so contactTest stays self-contained; the checkpoint itself
+# is only ever read, never written.
+pose:
+  hrnet_ckpt: checkpoints/hrnet_w32_ap10k_256x256-18aac840_20211029.pth
+  num_joints: 17
+  input_size: 256
+  hmap_size: 64
+  # Keypoints below this heatmap confidence are treated as missing. HRNet was
+  # trained on ground-level animal photos, so an overhead pen camera is out of
+  # distribution — check the per-joint confidences the visualiser reports before
+  # relying on any of this.
+  min_conf: 0.3
+
 # ── Model ─────────────────────────────────────────────────────────────────────
 model:
   image_size: 224           # must be a multiple of the backbone patch size
