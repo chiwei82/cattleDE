@@ -17,6 +17,12 @@ this dataset, so the contact band came out empty. SAM separates touching
 instances of the same class because it keys on learned objectness rather than
 colour, which is exactly the property needed here.
 
+Prompts are a box PLUS a positive point at its centre, matching panel 2 of
+visualize_sam_confusion exactly — SAM has no concept of "cow" and a box alone is
+routinely answered with a coherent patch of floor, while the point forces the
+mask to contain that pixel. Use --no-point only to reproduce the box-only
+behaviour for comparison.
+
 Ultralytics is already a dependency of the repository, so its SAM wrapper is
 tried first; the reference segment-anything package is the fallback.
 """
@@ -44,9 +50,12 @@ class _UltralyticsSAM:
 
         self.model = SAM(weights)
 
-    def __call__(self, bgr, boxes):
-        results = self.model(bgr, bboxes=[list(map(float, b)) for b in boxes],
-                             verbose=False)
+    def __call__(self, bgr, boxes, use_point=True):
+        kw = {"bboxes": [list(map(float, b)) for b in boxes]}
+        if use_point:
+            kw["points"] = [[(b[0] + b[2]) / 2, (b[1] + b[3]) / 2] for b in boxes]
+            kw["labels"] = [1] * len(boxes)
+        results = self.model(bgr, verbose=False, **kw)
         masks = getattr(results[0], "masks", None)
         if masks is None or masks.data is None or len(masks.data) < len(boxes):
             return None
@@ -71,13 +80,19 @@ class _ReferenceSAM:
         sam = sam_model_registry[model_type](checkpoint=weights).to(device)
         self.predictor = SamPredictor(sam)
 
-    def __call__(self, bgr, boxes):
+    def __call__(self, bgr, boxes, use_point=True):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         self.predictor.set_image(rgb)
         out = []
         for b in boxes:
-            masks, scores, _ = self.predictor.predict(
-                box=np.array(b, dtype=np.float32)[None], multimask_output=False)
+            x1, y1, x2, y2 = map(float, b)
+            kw = {"box": np.array([x1, y1, x2, y2], np.float32)[None],
+                  "multimask_output": False}
+            if use_point:
+                kw["point_coords"] = np.array([[(x1 + x2) / 2, (y1 + y2) / 2]],
+                                              np.float32)
+                kw["point_labels"] = np.array([1], np.int32)
+            masks, _, _ = self.predictor.predict(**kw)
             out.append(masks[0].astype(np.uint8))
         return out
 
@@ -105,6 +120,11 @@ def main():
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default=None, choices=["train", "val", "test"])
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--no-point", action="store_true",
+                    help="box prompt only. The default adds a positive point at "
+                         "the box centre, which is what stops SAM answering with "
+                         "the floor; visualize_sam_confusion uses the same rule, "
+                         "so the cached masks match what its panel 2 showed")
     ap.add_argument("--limit", type=int, default=None,
                     help="process only the first N pairs, for a quick quality check")
     args = ap.parse_args()
@@ -139,7 +159,7 @@ def main():
         boxes = relative_boxes(record, h, w)
 
         try:
-            masks = seg(bgr, boxes)
+            masks = seg(bgr, boxes, use_point=not args.no_point)
         except Exception as err:                   # noqa: BLE001
             print(f"[mask] failed on {record['rel_image']}: {err}")
             masks = None

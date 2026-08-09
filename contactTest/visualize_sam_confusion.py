@@ -219,12 +219,25 @@ def _heat(img_rgb, m):
     return (img_rgb * (1 - w) + heat * w).astype(np.uint8)
 
 
-def _mask_tile(img_rgb, mi, mj):
+def _mask_tile(img_rgb, mi, mj, points=None):
+    """Masks overlaid, with the prompt points drawn on top.
+
+    The point is what forces the mask to contain a given pixel, so when a mask
+    comes back looking wrong the first thing to check is where its point landed.
+    Showing it removes the guesswork.
+    """
     out = img_rgb.astype(np.float32).copy()
     for m, c in ((mi, C_I), (mj, C_J)):
         sel = m > 0
         out[sel] = out[sel] * 0.45 + np.asarray(c, np.float32) * 0.55
-    return out.astype(np.uint8)
+    out = out.astype(np.uint8)
+    for p, c in zip(points or [], (C_I, C_J)):
+        px, py = int(round(p[0])), int(round(p[1]))
+        cv2.drawMarker(out, (px, py), (0, 0, 0), cv2.MARKER_CROSS, 15, 4,
+                       line_type=cv2.LINE_AA)
+        cv2.drawMarker(out, (px, py), c, cv2.MARKER_CROSS, 13, 2,
+                       line_type=cv2.LINE_AA)
+    return out
 
 
 def _map_tile(img_rgb, m, band=None):
@@ -256,9 +269,10 @@ def panel(img_rgb, boxes, whole, cropped, band):
     for b, c in zip(boxes, (C_I, C_J)):
         cv2.rectangle(tiles[0], (b[0], b[1]), (b[2], b[3]), c, 2)
 
-    tiles.append(_mask_tile(img_rgb, whole["mi"], whole["mj"]))
+    pts = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes]
+    tiles.append(_mask_tile(img_rgb, whole["mi"], whole["mj"], pts))
     tiles.append(_map_tile(img_rgb, whole["strict"], band))
-    tiles.append(_mask_tile(img_rgb, cropped["ci"] > 0.5, cropped["cj"] > 0.5))
+    tiles.append(_mask_tile(img_rgb, cropped["ci"] > 0.5, cropped["cj"] > 0.5, pts))
     tiles.append(_map_tile(img_rgb, cropped["mutual"], None))
 
     gap = np.full((h, 6, 3), 250, np.uint8)
@@ -413,13 +427,39 @@ def main():
             record["label"]]
         if record["label"] == 1 and record["label_v2"]:
             annotation = record["label_v2"]
-        # A crop-mode mask covering nearly the whole view means the prompt
-        # collapsed and SAM returned the background rather than the animal.
+        # Two crop-mode failure modes worth separating:
+        #   claim_degenerate - the mask fills the view, so SAM answered with the
+        #                      background instead of the animal
+        #   claim_same_object - the two claims are nearly identical, so both
+        #                      crops segmented the SAME animal. That happens when
+        #                      a box centre falls on the other animal (~8% of
+        #                      boxes here), and it makes `mutual` meaningless:
+        #                      it becomes one whole body, not the shared region.
+        bi, bj = cropped["ci"] > 0.5, cropped["cj"] > 0.5
+        inter = float((bi & bj).sum())
+        union = float((bi | bj).sum())
+        claim_iou = inter / union if union else 0.0
+
+        # There is no defensible a priori range for "how much of its box a cow
+        # fills" — it depends on the animal's pose, the box's tightness and its
+        # aspect ratio. So agreement with the WHOLE-image mask is used instead:
+        # that one is the reference here because it has been checked by eye and
+        # found correct. A crop mask that disagrees with it has gone wrong,
+        # whatever its area happens to be.
+        def _iou(a, b):
+            u = float((a | b).sum())
+            return float((a & b).sum()) / u if u else 0.0
+        agree_i = _iou(bi, whole["mi"] > 0)
+        agree_j = _iou(bj, whole["mj"] > 0)
         stats.update(rel_image=record["rel_image"], annotation=annotation,
                      source_video=record["source_video"],
                      claim_area_i=round(claim_areas[0], 3),
                      claim_area_j=round(claim_areas[1], 3),
-                     claim_degenerate=int(max(claim_areas) > 0.85))
+                     agree_with_whole_i=round(agree_i, 3),
+                     agree_with_whole_j=round(agree_j, 3),
+                     crop_disagrees=int(min(agree_i, agree_j) < 0.5),
+                     claim_iou=round(claim_iou, 3),
+                     claim_same_object=int(claim_iou > 0.8))
         report.append(stats)
 
         if not args.no_images:
@@ -434,14 +474,25 @@ def main():
     if not report:
         raise SystemExit("nothing processed")
 
-    deg = np.mean([r["claim_degenerate"] for r in report])
     ai = np.array([r["claim_area_i"] for r in report] +
                   [r["claim_area_j"] for r in report], float)
-    print(f"\n[sam] 裁切模式的 mask 佔子圖面積：中位數 {np.median(ai):.0%}  "
-          f"(一頭牛在自己框裡大約 40-80%)")
-    if deg > 0.05:
-        print(f"[sam] WARNING: {deg:.0%} 的樣本 mask 佔滿子圖 >85% — SAM 抓到背景"
-              f"而不是牛。加大 --crop-pad 或檢查框是否正確")
+    ag = np.array([r["agree_with_whole_i"] for r in report] +
+                  [r["agree_with_whole_j"] for r in report], float)
+    bad = np.mean([r["crop_disagrees"] for r in report])
+    print(f"\n[sam] 裁切模式 mask 佔子圖面積：中位數 {np.median(ai):.0%}"
+          f"   (僅供參考——牛佔框多少沒有可保證的範圍)")
+    print(f"[sam] 裁切 mask 與整張 mask 的 IoU：中位數 {np.median(ag):.2f}"
+          f"   ← 這才是判準，因為整張模式已經人工確認正確")
+    if bad > 0.1:
+        print(f"[sam] WARNING: {bad:.0%} 的樣本裡，至少一個裁切 mask 與整張 mask "
+              f"的 IoU < 0.5 — 裁切模式在那些圖上圈到了不同的東西")
+    same = np.mean([r["claim_same_object"] for r in report])
+    iou = np.median([r["claim_iou"] for r in report])
+    print(f"[sam] 兩個 claim 的 IoU 中位數 {iou:.2f}"
+          f"（重疊帶應該只佔一小部分，所以偏低才正常）")
+    if same > 0.05:
+        print(f"[sam] WARNING: {same:.0%} 的樣本兩個 claim 幾乎相同 — 兩次裁切"
+              f"分割到同一頭牛，mutual 對這些樣本無意義")
     print("\n[sam] 面板順序：")
     print("      原圖+框 | 【整張】兩個 mask | 【整張】strict confusion"
           " | 【裁切】兩個 claim | 【裁切】mutual claim")
