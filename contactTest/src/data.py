@@ -42,6 +42,7 @@ except ImportError:  # pragma: no cover - exercised only on numpy-only machines
 
 # Repository root = two levels up from contactTest/src/.
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+CONTACT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -110,8 +111,10 @@ def load_records(cfg, splits=None):
     exclude_names = {str(x).strip().lower() for x in lab.get("exclude_names", [])}
     exclude_v2 = {str(x).strip().lower() for x in lab.get("exclude_positive_v2", [])}
 
+    # Resolved under contactTest/, like the pose cache, so nothing is written
+    # outside this folder.
     mask_dir = cfg["data"].get("mask_dir")
-    mask_root = os.path.join(REPO_ROOT, mask_dir) if mask_dir else None
+    mask_root = os.path.join(CONTACT_ROOT, mask_dir) if mask_dir else None
 
     records, missing = [], 0
     with open(csv_path, newline="") as f:
@@ -222,6 +225,21 @@ class ContactPairDataset(Dataset):
         self.kp_proximity = float(pcfg.get("proximity_px", 60))
         self.num_joints = int(pcfg.get("num_joints", 17))
 
+        # Extra input planes derived from the instance masks. RGB alone never
+        # tells the network which pixels belong to which animal, so it has to
+        # infer the instance boundary from 240 positives; these planes hand it
+        # over directly. The proximity plane in particular is the quantity that
+        # separates contact from mere closeness.
+        self.mask_channels = bool(cfg["data"].get("mask_channels", False))
+        self.gap_scale = float(cfg["data"].get("gap_scale_px", 15.0))
+
+        prior = pcfg.get("prior", {}) or {}
+        self.prior_enabled = bool(prior.get("enabled", False)) and self.use_pose
+        self.prior_sigma_scale = float(prior.get("sigma_scale", 0.5))
+        self.prior_sigma_min = float(prior.get("sigma_min_px", 12))
+        self.prior_sigma_max = float(prior.get("sigma_max_px", 45))
+        self.prior_conf_weighting = bool(prior.get("conf_weighting", True))
+
     def _load_keypoints(self, record, crop_h, crop_w):
         """Cached keypoints in crop pixels, or None when absent."""
         path = os.path.join(self.pose_cache,
@@ -252,6 +270,67 @@ class ContactPairDataset(Dataset):
             dy = np.maximum(np.maximum(oy1 - py, py - oy2), 0.0)
             valid[i] &= np.hypot(dx, dy) <= self.kp_proximity
         return valid
+
+    def _proximity(self, support_i, support_j):
+        """How close the two animals' surfaces are at each pixel, in [0, 1].
+
+            gap(u)       = dist(u, surface of i) + dist(u, surface of j)
+            proximity(u) = exp(-gap(u) / gap_scale)
+
+        The sum of the two distance transforms is the local separation between
+        the animals: it is 0 where they touch or overlap and grows with the
+        width of the gap between them. Exponentiating bounds it and puts the
+        peak exactly on the contact band.
+
+        This is a strong feature but NOT the answer, which is why it is an input
+        and not a label: in an overhead projection one animal standing behind
+        another reads as zero gap without touching at all, so telling occlusion
+        from contact is still something the network has to learn.
+        """
+        di = cv2.distanceTransform((support_i == 0).astype(np.uint8), cv2.DIST_L2, 3)
+        dj = cv2.distanceTransform((support_j == 0).astype(np.uint8), cv2.DIST_L2, 3)
+        return np.exp(-(di + dj) / max(self.gap_scale, 1e-3)).astype(np.float32)
+
+    def _prior_target(self, keypoints, size):
+        """A soft target blob at the estimated contact site, plus its weight.
+
+        Contact in this dataset is head-initiated (380 of 384 positives), so the
+        shortest head-to-body link is a usable guess at where contact happens.
+        The blob is Gaussian and its spread scales with the link length, which
+        makes the target encode its own uncertainty: a short, confident link
+        produces a tight blob, a long one a broad and therefore weak hint.
+
+        The weight scales with the pose confidence at both endpoints, so an
+        unreliable keypoint contributes proportionally little. That matters here
+        because only a third to a half of head joints clear the threshold.
+
+        Returns (blob HxW float32, weight in [0,1]) or (None, 0.0).
+        """
+        from .pose import closest_head_link, HEAD_JOINTS
+
+        link = closest_head_link(keypoints, self.kp_min_conf)
+        if link is None:
+            return None, 0.0
+        pa, pb, dist, _, _ = link
+
+        cx, cy = (pa + pb) / 2.0
+        if not (0 <= cx < size and 0 <= cy < size):
+            return None, 0.0
+
+        sigma = float(np.clip(dist * self.prior_sigma_scale,
+                              self.prior_sigma_min, self.prior_sigma_max))
+        yy, xx = np.mgrid[0:size, 0:size]
+        blob = np.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * sigma ** 2)))
+
+        weight = 1.0
+        if self.prior_conf_weighting:
+            # Geometric mean of the two endpoint confidences, referenced to
+            # twice the acceptance threshold so a marginal joint counts little.
+            conf = keypoints[..., 2]
+            best = float(np.sqrt(max(conf[:, HEAD_JOINTS].max(), 1e-6) *
+                                 max(conf.max(), 1e-6)))
+            weight = float(np.clip(best / (2.0 * self.kp_min_conf), 0.0, 1.0))
+        return blob.astype(np.float32), weight
 
     def _pose_region(self, keypoints, valid, size):
         """Union of disks around the eligible joints, or None if there are none."""
@@ -332,6 +411,8 @@ class ContactPairDataset(Dataset):
         # `scale`, no offset, because letterbox pastes at the canvas origin.
         kp_xy = np.zeros((2, self.num_joints, 2), np.float32)
         kp_valid = np.zeros((2, self.num_joints), bool)
+        prior_blob = np.zeros((self.size, self.size), np.float32)
+        prior_weight = 0.0
         if keypoints is not None:
             keypoints = keypoints.copy()
             keypoints[..., :2] *= scale
@@ -340,6 +421,14 @@ class ContactPairDataset(Dataset):
             kp_valid &= ((keypoints[..., 0] >= 0) & (keypoints[..., 0] < self.size) &
                          (keypoints[..., 1] >= 0) & (keypoints[..., 1] < self.size))
             kp_xy = keypoints[..., :2].astype(np.float32)
+
+            # The prior is only a training hint for POSITIVES: a negative pair
+            # has no contact site to point at, and the binary label already
+            # supplies everything the negative can teach.
+            if self.prior_enabled and record["label"] == 1:
+                blob, w = self._prior_target(keypoints, self.size)
+                if blob is not None:
+                    prior_blob, prior_weight = blob, w
 
             pose_region = self._pose_region(keypoints, kp_valid, self.size)
             if pose_region is not None:
@@ -352,14 +441,25 @@ class ContactPairDataset(Dataset):
                     region = pose_region * (valid > 0)
 
         x = (canvas.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
+        image = torch.from_numpy(x).permute(2, 0, 1).contiguous()
+
+        if self.mask_channels:
+            # Appended AFTER the flip, so the planes always agree with the image
+            # they describe.
+            extra = np.stack([support_i.astype(np.float32),
+                              support_j.astype(np.float32),
+                              self._proximity(support_i, support_j)], axis=0)
+            image = torch.cat([image, torch.from_numpy(extra)], dim=0)
 
         return {
-            "image": torch.from_numpy(x).permute(2, 0, 1).contiguous(),
+            "image": image,
             "region": torch.from_numpy(region)[None],
             "label": torch.tensor(float(record["label"])),
             "index": torch.tensor(idx),
             "kp_xy": torch.from_numpy(kp_xy.reshape(-1, 2)),        # (2J, 2)
             "kp_valid": torch.from_numpy(kp_valid.reshape(-1)),     # (2J,)
+            "prior": torch.from_numpy(prior_blob)[None],            # (1, H, W)
+            "prior_weight": torch.tensor(np.float32(prior_weight)),
             # Kept for mapping predictions back to the source frame.
             "scale": torch.tensor(np.float32(scale)),
             "valid_hw": torch.tensor([nh, nw], dtype=torch.long),

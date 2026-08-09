@@ -127,6 +127,12 @@ def main():
         optimizer, max_lr=[tcfg["lr_backbone"], tcfg["lr_head"]],
         total_steps=epochs * max(1, len(train_loader)), pct_start=0.2)
 
+    prior_cfg = (cfg.get("pose", {}) or {}).get("prior", {}) or {}
+    lambda_prior = float(prior_cfg.get("weight", 0.0)) if prior_cfg.get("enabled") else 0.0
+    if lambda_prior > 0:
+        print(f"[train] pose prior ON, lambda {lambda_prior} — a soft hint towards "
+              "the head-to-body contact site on POSITIVES only")
+
     use_amp = bool(tcfg.get("amp", True)) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -138,14 +144,16 @@ def main():
 
     log_file = open(log_path, "w", newline="")
     log_writer = csv.writer(log_file)
-    log_writer.writerow(["epoch", "tau", "loss", "mil", "sparsity", "tv", "val_auc"])
+    log_writer.writerow(["epoch", "tau", "loss", "mil", "sparsity", "tv",
+                         "prior", "prior_frac", "val_auc"])
 
     best_auc = -1.0
     for epoch in range(epochs):
         tau = anneal_tau(epoch, epochs, cfg["model"]["tau_start"], cfg["model"]["tau_end"])
         model.set_tau(tau)
         model.train()
-        running = {"loss": 0.0, "mil": 0.0, "sparsity": 0.0, "tv": 0.0}
+        running = {"loss": 0.0, "mil": 0.0, "sparsity": 0.0, "tv": 0.0,
+                   "prior": 0.0, "prior_frac": 0.0}
         seen = 0
 
         for batch in train_loader:
@@ -158,7 +166,12 @@ def main():
                     z.float(), region, pooled.float(), label,
                     pos_weight=pos_weight,
                     lambda_sparsity=cfg["loss"]["lambda_sparsity"],
-                    lambda_tv=cfg["loss"]["lambda_tv"])
+                    lambda_tv=cfg["loss"]["lambda_tv"],
+                    prior=batch["prior"].to(device, non_blocking=True)
+                    if lambda_prior > 0 else None,
+                    prior_weight=batch["prior_weight"].to(device, non_blocking=True)
+                    if lambda_prior > 0 else None,
+                    lambda_prior=lambda_prior)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -178,9 +191,13 @@ def main():
 
         print(f"[train] epoch {epoch + 1:02d}/{epochs}  tau {tau:5.2f}  "
               f"loss {running['loss']:.4f}  mil {running['mil']:.4f}  "
-              f"sp {running['sparsity']:.4f}  tv {running['tv']:.4f}  val_auc {val_auc:.4f}")
+              f"sp {running['sparsity']:.4f}  tv {running['tv']:.4f}"
+              + (f"  prior {running['prior']:.4f} ({running['prior_frac']:.0%})"
+                 if lambda_prior > 0 else "")
+              + f"  val_auc {val_auc:.4f}")
         log_writer.writerow([epoch + 1, f"{tau:.3f}"] +
-                            [f"{running[k]:.6f}" for k in ("loss", "mil", "sparsity", "tv")] +
+                            [f"{running[k]:.6f}" for k in
+                             ("loss", "mil", "sparsity", "tv", "prior", "prior_frac")] +
                             [f"{val_auc:.6f}"])
         log_file.flush()
 

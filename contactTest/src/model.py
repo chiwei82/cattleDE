@@ -120,6 +120,42 @@ def masked_lse(z, region, tau):
     return (torch.logsumexp(scaled, dim=1) - torch.log(count)) / tau
 
 
+def _widen_patch_embed(vit, in_chans):
+    """Extend the patch embedding to accept extra input planes.
+
+    The pretrained RGB weights are kept and the new channels start at zero, so
+    at initialisation the network behaves exactly as it did on RGB alone and
+    has to learn to use the mask/proximity planes rather than being disturbed
+    by them.
+    """
+    old = vit.patch_embed.proj
+    new = nn.Conv2d(in_chans, old.out_channels, kernel_size=old.kernel_size,
+                    stride=old.stride, padding=old.padding,
+                    bias=old.bias is not None)
+    with torch.no_grad():
+        new.weight.zero_()
+        new.weight[:, :old.in_channels] = old.weight
+        if old.bias is not None:
+            new.bias.copy_(old.bias)
+    vit.patch_embed.proj = new
+    vit.patch_embed.in_chans = in_chans
+    print(f"[model] patch embedding widened 3 -> {in_chans} channels "
+          "(new planes zero-initialised)")
+
+
+def _unfreeze_widened_embed(vit, in_chans):
+    """Keep the patch embedding trainable whenever it has been widened.
+
+    The extra planes start at zero weight, so freezing the embedding — which the
+    encoder-freezing path otherwise does — would leave them at zero for the whole
+    run and the mask/proximity inputs would have no effect at all. This is the
+    one part of a frozen encoder that still has to learn.
+    """
+    if in_chans != 3:
+        vit.patch_embed.proj.requires_grad_(True)
+        print("[model] patch embedding kept trainable so the added planes can learn")
+
+
 class _TimmViTFeatures(nn.Module):
     """timm ViT wrapper exposing patch tokens as a spatial feature map.
 
@@ -128,11 +164,13 @@ class _TimmViTFeatures(nn.Module):
     action encoder.
     """
 
-    def __init__(self, name, image_size, freeze_blocks):
+    def __init__(self, name, image_size, freeze_blocks, in_chans=3):
         super().__init__()
         import timm
 
         self.vit = timm.create_model(name, pretrained=True, num_classes=0)
+        if in_chans != 3:
+            _widen_patch_embed(self.vit, in_chans)
         self.patch = self.vit.patch_embed.patch_size[0]
         self.grid = image_size // self.patch
         self.dim = self.vit.embed_dim
@@ -141,6 +179,7 @@ class _TimmViTFeatures(nn.Module):
         self.vit.patch_embed.requires_grad_(False)
         for block in self.vit.blocks[:freeze_blocks]:
             block.requires_grad_(False)
+        _unfreeze_widened_embed(self.vit, in_chans)
 
     def load_action_encoder(self, ckpt_path):
         """Warm-start from checkpoints/action.ckpt (read-only).
@@ -159,7 +198,7 @@ class _TimmViTFeatures(nn.Module):
                     key = key[len(prefix):]
                     break
             if key in own and own[key].shape == value.shape:
-                copied[key] = value
+                copied[key] = value          # shape check skips a widened proj
         self.vit.load_state_dict(copied, strict=False)
         print(f"[model] warm-started {len(copied)}/{len(own)} ViT tensors from {ckpt_path}")
 
@@ -172,9 +211,11 @@ class _TimmViTFeatures(nn.Module):
 class _DINOv2Features(nn.Module):
     """DINOv2 wrapper; sharper spatial features but requires torch.hub download."""
 
-    def __init__(self, name, image_size, freeze_blocks):
+    def __init__(self, name, image_size, freeze_blocks, in_chans=3):
         super().__init__()
         self.vit = torch.hub.load("facebookresearch/dinov2", name)
+        if in_chans != 3:
+            _widen_patch_embed(self.vit, in_chans)
         self.patch = 14
         self.grid = image_size // self.patch
         self.dim = self.vit.embed_dim
@@ -182,6 +223,7 @@ class _DINOv2Features(nn.Module):
         self.vit.patch_embed.requires_grad_(False)
         for block in self.vit.blocks[:freeze_blocks]:
             block.requires_grad_(False)
+        _unfreeze_widened_embed(self.vit, in_chans)
 
     def forward(self, x):
         tokens = self.vit.forward_features(x)["x_norm_patchtokens"]
@@ -199,8 +241,12 @@ class ContactMIL(nn.Module):
         freeze_blocks = int(mcfg["freeze_blocks"])
         backbone = str(mcfg["backbone"]).lower()
 
+        # 3 RGB planes, plus mask_i / mask_j / proximity when those are enabled.
+        in_chans = 6 if cfg["data"].get("mask_channels", False) else 3
+
         if backbone == "timm":
-            self.features = _TimmViTFeatures(mcfg["timm_name"], image_size, freeze_blocks)
+            self.features = _TimmViTFeatures(mcfg["timm_name"], image_size,
+                                             freeze_blocks, in_chans)
             ckpt = mcfg.get("action_ckpt")
             if ckpt:
                 from .data import REPO_ROOT
@@ -212,7 +258,8 @@ class ContactMIL(nn.Module):
                     print(f"[model] action checkpoint not found at {ckpt_path} — "
                           "using ImageNet initialisation")
         elif backbone == "dinov2":
-            self.features = _DINOv2Features(mcfg["dinov2_name"], image_size, freeze_blocks)
+            self.features = _DINOv2Features(mcfg["dinov2_name"], image_size,
+                                            freeze_blocks, in_chans)
         else:
             raise ValueError("model.backbone must be 'timm' or 'dinov2'")
 
