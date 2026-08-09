@@ -97,11 +97,17 @@ def binary_label(row, no_names, exclude_names, exclude_positive_v2):
     return 1
 
 
-def load_records(cfg, splits=None):
+def load_records(cfg, splits=None, require_label=True):
     """Read the annotation CSV into a list of per-pair records.
 
     Paths are resolved against the repository root; the CSV itself is never
     modified. Rows whose crop file is missing are skipped with a warning.
+
+    require_label=True (the default) keeps only rows carrying a usable
+    interaction annotation - what training and the label-based diagnostics need.
+    Set it to False for measurements that must not depend on the annotation at
+    all; those rows come back with label = -1, and the caller must not treat -1
+    as a class.
     """
     import csv
 
@@ -116,12 +122,20 @@ def load_records(cfg, splits=None):
     mask_dir = cfg["data"].get("mask_dir")
     mask_root = os.path.join(CONTACT_ROOT, mask_dir) if mask_dir else None
 
-    records, missing = [], 0
+    records, missing, unlabelled = [], 0, 0
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             label = binary_label(row, no_names, exclude_names, exclude_v2)
             if label is None:
-                continue
+                # Unannotated, or a crop a human marked unusable. Training must
+                # skip these, but a label-free measurement must not: dropping
+                # them would silently restrict the sample to the rows somebody
+                # chose to annotate and judged well cropped, which is a
+                # human-selection effect, not a property of the imagery.
+                if require_label:
+                    continue
+                label = -1
+                unlabelled += 1
             split = str(row.get("split") or "").strip()
             if splits is not None and split not in splits:
                 continue
@@ -153,7 +167,10 @@ def load_records(cfg, splits=None):
             })
 
     if missing:
-        print(f"[data] WARNING: {missing} labelled rows skipped — crop file not found")
+        print(f"[data] WARNING: {missing} rows skipped — crop file not found")
+    if unlabelled:
+        print(f"[data] {unlabelled} rows carry no usable annotation (label = -1); "
+              "included because require_label=False")
     return records
 
 
