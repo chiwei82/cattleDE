@@ -99,7 +99,7 @@ class SamLogits:
         print(f"[sam] segment-anything {model_type} on {device}")
 
     def __call__(self, bgr, boxes, use_point=True, use_box=True, select="single",
-                 n_points=1, point_spread=0.25, extra_points=None):
+                 n_points=1, point_spread=0.25):
         """Returns a list of full-resolution logit maps, one per box.
 
         A box alone only says "the object spans roughly this rectangle", and SAM
@@ -127,7 +127,7 @@ class SamLogits:
         self.predictor.set_image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         self.last_pick = []
         out = []
-        for bi, b in enumerate(boxes):
+        for b in boxes:
             x1, y1, x2, y2 = map(float, b)
             kwargs = {"return_logits": True}
             if use_box:
@@ -135,14 +135,6 @@ class SamLogits:
             if use_point or not use_box:
                 # A point is mandatory without a box: some prompt must be given.
                 pts = _point_pattern(x1, y1, x2, y2, n_points, point_spread)
-                # Keypoints, when supplied, are appended as further foreground
-                # points: HRNet has located parts of THIS animal, and every one
-                # of them is a pixel the mask is then required to contain. They
-                # are the same kind of prompt as the geometric ones, only sited
-                # by anatomy instead of by the box.
-                if extra_points is not None and len(extra_points[bi]):
-                    pts = np.concatenate([pts, np.asarray(extra_points[bi],
-                                                          np.float32)], axis=0)
                 kwargs["point_coords"] = pts
                 # 1 = foreground. Every extra point is another pixel the mask is
                 # required to contain, which is the documented way to grow a
@@ -174,37 +166,6 @@ class SamLogits:
                 self.last_pick.append({"fill": float((logits[0] > 0).mean()),
                                        "sam_iou": float(scores[0]), "n_cands": 1})
         return out
-
-
-def load_keypoint_prompts(record, cfg, min_conf, crop_shape):
-    """Confident HRNet keypoints for each animal, in pair-crop pixels.
-
-    Only joints at or above `min_conf` are returned. A keypoint prompt is a hard
-    claim — SAM must include that pixel — so a mislocated joint drags the mask
-    onto whatever it landed on. The threshold is the only guard against that,
-    which is why it is set high and why the count that survives is reported.
-
-    Returns [(N_i, 2), (N_j, 2)], empty arrays when the cache has no entry.
-    """
-    cache = os.path.join(CONTACT_ROOT, cfg["pose"].get("cache_dir", "log/pose_cache"))
-    path = os.path.join(cache, os.path.splitext(record["rel_image"])[0] + ".npz")
-    if not os.path.exists(path):
-        return None
-    data = np.load(path)
-    kp = data["keypoints"].astype(np.float32)          # (2, J, 3) = x, y, conf
-    ch, cw = [int(v) for v in data["crop_hw"]]
-    h, w = crop_shape
-    if (ch, cw) != (h, w) and ch > 0 and cw > 0:
-        kp[..., 0] *= w / cw
-        kp[..., 1] *= h / ch
-    out = []
-    for i in range(kp.shape[0]):
-        keep = kp[i, :, 2] >= min_conf
-        pts = kp[i, keep, :2]
-        inside = ((pts[:, 0] >= 0) & (pts[:, 0] < w) &
-                  (pts[:, 1] >= 0) & (pts[:, 1] < h))
-        out.append(pts[inside])
-    return out
 
 
 def _point_pattern(x1, y1, x2, y2, n, spread):
@@ -252,8 +213,7 @@ def confusion_maps(logit_i, logit_j):
 
 
 def claim_logits(sam, bgr, boxes, pad=0, use_point=True, exact=False,
-                 select="single", n_points=1, point_spread=0.25, use_box=True,
-                 extra_points=None):
+                 select="single", n_points=1, point_spread=0.25, use_box=True):
     """Segment each box's crop in ISOLATION, then paste the result back.
 
     The opposite mechanism to the whole-image prompts above, and it exploits a
@@ -293,20 +253,11 @@ def claim_logits(sam, bgr, boxes, pad=0, use_point=True, exact=False,
             continue
 
         prompt = [x1 - x1p, y1 - y1p, x2 - x1p, y2 - y1p]
-        # Keypoints follow the crop: shifted into sub-image coordinates, and
-        # dropped when they fall outside the view this prompt can see.
-        sub_pts = np.zeros((0, 2), np.float32)
-        if extra_points is not None and len(extra_points[len(out)]):
-            kp = np.asarray(extra_points[len(out)], np.float32) - [x1p, y1p]
-            inside = ((kp[:, 0] >= 0) & (kp[:, 0] < x2p - x1p) &
-                      (kp[:, 1] >= 0) & (kp[:, 1] < y2p - y1p))
-            sub_pts = kp[inside]
         # Identical prompt to the whole-image reading: this animal's own box,
         # translated into the sub-image, plus the same centre point. Keeping the
         # box means the two readings differ only in what SAM can see.
         logits = sam(sub, [prompt], use_point=use_point, use_box=use_box,
-                     select=select, n_points=n_points, point_spread=point_spread,
-                     extra_points=[sub_pts])[0]
+                     select=select, n_points=n_points, point_spread=point_spread)[0]
         picks.append(sam.last_pick[-1] if sam.last_pick else
                      {"fill": 0.0, "sam_iou": 0.0, "n_cands": 0})
 
@@ -468,11 +419,6 @@ def main():
                     help="box prompt only. A box says where the object roughly "
                          "is; a positive point says the mask must contain that "
                          "pixel, which is what stops SAM answering with floor")
-    ap.add_argument("--pose-conf", type=float, default=0.0,
-                    help="if > 0, HRNet keypoints at or above this confidence are "
-                         "added as further foreground points, telling SAM those "
-                         "pixels belong to that animal. Needs precompute_pose.py "
-                         "to have been run. 0 (default) disables it")
     ap.add_argument("--points", type=int, default=1, choices=[1, 5, 9],
                     help="positive points per prompt: 1 = centre, 5 = centre + a "
                          "cross, 9 = + the diagonals. Each extra point is a pixel "
@@ -550,10 +496,6 @@ def main():
     out_dir = os.path.join(CONTACT_ROOT, "log", "sam_confusion", args.split)
     os.makedirs(out_dir, exist_ok=True)
     report = []
-    kp_counts, kp_missing = [], 0
-    if args.pose_conf > 0:
-        print(f"[sam] HRNet keypoints at conf >= {args.pose_conf} will be added "
-              "as foreground points")
 
     for i, record in enumerate(records):
         bgr = cv2.imread(record["image_path"])
@@ -561,19 +503,10 @@ def main():
             continue
         h, w = bgr.shape[:2]
         boxes = relative_boxes(record, h, w)
-
-        kp_pts = None
-        if args.pose_conf > 0:
-            kp_pts = load_keypoint_prompts(record, cfg, args.pose_conf, (h, w))
-            if kp_pts is None:
-                kp_missing += 1
-                kp_pts = [np.zeros((0, 2), np.float32)] * 2
-            kp_counts.extend(len(p) for p in kp_pts)
-
         try:
             li, lj = sam(bgr, boxes, use_point=not args.no_point,
                          select=args.mask_select, n_points=args.points,
-                         point_spread=args.point_spread, extra_points=kp_pts)
+                         point_spread=args.point_spread)
         except Exception as err:                   # noqa: BLE001
             print(f"[sam] failed on {record['rel_image']}: {err}")
             continue
@@ -598,7 +531,7 @@ def main():
                 use_point=not args.no_point,
                 exact=args.crop_pad <= 0, select=args.mask_select,
                 n_points=args.points, point_spread=args.point_spread,
-                use_box=not args.crop_no_box, extra_points=kp_pts)
+                use_box=not args.crop_no_box)
         except Exception as err:                   # noqa: BLE001
             print(f"[sam] crop mode failed on {record['rel_image']}: {err}")
             continue
@@ -668,18 +601,6 @@ def main():
 
     if not report:
         raise SystemExit("nothing processed")
-
-    if args.pose_conf > 0:
-        kc = np.array(kp_counts, float)
-        print(f"\n[sam] keypoints accepted per animal at conf >= {args.pose_conf}: "
-              f"median {np.median(kc):.0f} of 17  "
-              f"(none for {np.mean(kc == 0):.0%} of animals)")
-        if kp_missing:
-            print(f"[sam] {kp_missing} pairs had no cached pose - run "
-                  "precompute_pose.py to cover them")
-        if np.median(kc) == 0:
-            print("[sam] the threshold admitted almost nothing, so this run is "
-                  "effectively the same as --pose-conf 0")
 
     wf = np.array([r["whole_fill_i"] for r in report] +
                   [r["whole_fill_j"] for r in report], float)
