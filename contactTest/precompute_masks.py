@@ -97,16 +97,35 @@ class _ReferenceSAM:
         return out
 
 
-def build_segmenter(cfg):
+def build_segmenter(cfg, backend="auto", model_type="vit_b"):
+    """Pick a SAM backend.
+
+    The two are not interchangeable: they wrap different checkpoints and
+    post-processing, so the masks differ. That matters because the green band in
+    panel 3 of visualize_sam_confusion comes from the reference package, and
+    scoring it against masks cached from ultralytics would score a different
+    band. Use backend="reference" to keep the two identical.
+    """
     weights = cfg["data"].get("sam_weights", "sam_b.pt")
-    try:
+    if backend == "reference":
+        seg = _ReferenceSAM(weights, model_type)
+        print(f"[mask] using segment-anything ({weights}, {model_type})")
+        return seg
+    if backend == "ultralytics":
         seg = _UltralyticsSAM(weights)
         print(f"[mask] using ultralytics SAM ({weights})")
         return seg
+    try:
+        seg = _UltralyticsSAM(weights)
+        print(f"[mask] using ultralytics SAM ({weights})")
+        print("[mask] NOTE: visualize_sam_confusion uses segment-anything, so "
+              "these masks are not the ones its panels were drawn from. Pass "
+              "--backend reference to make them match.")
+        return seg
     except Exception as err:                       # noqa: BLE001 - report and fall back
         print(f"[mask] ultralytics SAM unavailable ({err}); trying segment-anything")
-    seg = _ReferenceSAM(weights)
-    print(f"[mask] using segment-anything ({weights})")
+    seg = _ReferenceSAM(weights, model_type)
+    print(f"[mask] using segment-anything ({weights}, {model_type})")
     return seg
 
 
@@ -120,6 +139,13 @@ def main():
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default=None, choices=["train", "val", "test"])
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--backend", default="auto",
+                    choices=["auto", "reference", "ultralytics"],
+                    help="which SAM wrapper to use. 'reference' matches "
+                         "visualize_sam_confusion exactly, so the cached masks "
+                         "are the ones its panels were drawn from")
+    ap.add_argument("--model-type", default="vit_b",
+                    help="checkpoint variant for the reference backend")
     ap.add_argument("--no-point", action="store_true",
                     help="box prompt only. The default adds a positive point at "
                          "the box centre, which is what stops SAM answering with "
@@ -141,7 +167,7 @@ def main():
         raise SystemExit("no labelled rows to process")
     print(f"[mask] segmenting {len(records)} pairs -> {cache_root}")
 
-    seg = build_segmenter(cfg)
+    seg = build_segmenter(cfg, args.backend, args.model_type)
     done = skipped = failed = 0
     areas = []
 
