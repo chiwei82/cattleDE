@@ -86,6 +86,7 @@ class SamLogits:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         sam = sam_model_registry[model_type](checkpoint=weights).to(device)
         self.predictor = SamPredictor(sam)
+        self.fill_cap = 0.92     # a candidate above this is the frame, not an object
         print(f"[sam] segment-anything {model_type} on {device}")
 
     def __call__(self, bgr, boxes, use_point=True, target_frac=0.0, use_box=True):
@@ -117,12 +118,29 @@ class SamLogits:
                                                   np.float32)
                 kwargs["point_labels"] = np.array([1], np.int32)   # 1 = foreground
 
-            if target_frac > 0:
-                logits, scores, _ = self.predictor.predict(multimask_output=True,
-                                                           **kwargs)
-                want = target_frac * max((x2 - x1) * (y2 - y1), 1.0)
+            # A lone point is genuinely ambiguous — "the object containing this
+            # pixel" can mean the coat patch, the torso or the whole animal, and
+            # SAM exposes exactly those three granularities through
+            # multimask_output. Asking for a single mask makes it guess, and on a
+            # Holstein it routinely guesses the patch. A box is unambiguous
+            # enough for a single output; a point is not.
+            ambiguous = not use_box
+            if target_frac > 0 or ambiguous:
+                logits, _, _ = self.predictor.predict(multimask_output=True,
+                                                      **kwargs)
                 areas = np.array([(l > 0).sum() for l in logits], np.float64)
-                pick = int(np.argmin(np.abs(areas - want)))
+                total = float(logits[0].size)
+                if target_frac > 0:
+                    want = target_frac * max((x2 - x1) * (y2 - y1), 1.0)
+                    pick = int(np.argmin(np.abs(areas - want)))
+                else:
+                    # No assumption about what share of its box an animal fills:
+                    # take the largest candidate that is not simply the whole
+                    # frame. That rejects the coat patch without pretending to
+                    # know the animal's size.
+                    ok = np.flatnonzero(areas <= self.fill_cap * total)
+                    pick = int(ok[np.argmax(areas[ok])]) if len(ok) \
+                        else int(np.argmin(areas))
                 out.append(logits[pick].astype(np.float32))
             else:
                 logits, _, _ = self.predictor.predict(multimask_output=False,
