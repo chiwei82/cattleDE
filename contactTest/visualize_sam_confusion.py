@@ -98,7 +98,8 @@ class SamLogits:
         self.last_pick = []
         print(f"[sam] segment-anything {model_type} on {device}")
 
-    def __call__(self, bgr, boxes, use_point=True, use_box=True, select="single"):
+    def __call__(self, bgr, boxes, use_point=True, use_box=True, select="single",
+                 n_points=1, point_spread=0.25):
         """Returns a list of full-resolution logit maps, one per box.
 
         A box alone only says "the object spans roughly this rectangle", and SAM
@@ -133,9 +134,14 @@ class SamLogits:
                 kwargs["box"] = np.array([x1, y1, x2, y2], np.float32)[None]
             if use_point or not use_box:
                 # A point is mandatory without a box: some prompt must be given.
-                kwargs["point_coords"] = np.array([[(x1 + x2) / 2, (y1 + y2) / 2]],
-                                                  np.float32)
-                kwargs["point_labels"] = np.array([1], np.int32)   # 1 = foreground
+                pts = _point_pattern(x1, y1, x2, y2, n_points, point_spread)
+                kwargs["point_coords"] = pts
+                # 1 = foreground. Every extra point is another pixel the mask is
+                # required to contain, which is the documented way to grow a
+                # mask that came back too tight — on these animals SAM segments
+                # an individual coat patch precisely, so points spread across
+                # neighbouring patches chain them into the whole body.
+                kwargs["point_labels"] = np.ones(len(pts), np.int32)
 
             # One rule for both readings. They are meant to differ in exactly
             # one respect — what SAM can see — so prompt type and mask selection
@@ -160,6 +166,26 @@ class SamLogits:
                 self.last_pick.append({"fill": float((logits[0] > 0).mean()),
                                        "sam_iou": float(scores[0]), "n_cands": 1})
         return out
+
+
+def _point_pattern(x1, y1, x2, y2, n, spread):
+    """`n` positive points centred on the box: 1, 5 (cross) or 9 (cross + X).
+
+    Placement is a design choice, not something derivable — there is no reading
+    of the geometry that says where on an animal a click belongs. It is kept
+    near the centre, at a fraction of the SHORTER side, so the points stay on
+    the body for a diagonal pose rather than sliding off the ends.
+    """
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    if n <= 1:
+        return np.array([[cx, cy]], np.float32)
+    r = spread * min(x2 - x1, y2 - y1) / 2.0
+    cross = [(cx, cy), (cx - r, cy), (cx + r, cy), (cx, cy - r), (cx, cy + r)]
+    if n <= 5:
+        return np.array(cross[:n], np.float32)
+    d = r * 0.7071
+    diag = [(cx - d, cy - d), (cx + d, cy - d), (cx - d, cy + d), (cx + d, cy + d)]
+    return np.array((cross + diag)[:n], np.float32)
 
 
 def uncertainty(logit):
@@ -187,7 +213,7 @@ def confusion_maps(logit_i, logit_j):
 
 
 def claim_logits(sam, bgr, boxes, pad=0, use_point=True, exact=False,
-                 select="single"):
+                 select="single", n_points=1, point_spread=0.25, use_box=True):
     """Segment each box's crop in ISOLATION, then paste the result back.
 
     The opposite mechanism to the whole-image prompts above, and it exploits a
@@ -230,8 +256,8 @@ def claim_logits(sam, bgr, boxes, pad=0, use_point=True, exact=False,
         # Identical prompt to the whole-image reading: this animal's own box,
         # translated into the sub-image, plus the same centre point. Keeping the
         # box means the two readings differ only in what SAM can see.
-        logits = sam(sub, [prompt], use_point=use_point, use_box=True,
-                     select=select)[0]
+        logits = sam(sub, [prompt], use_point=use_point, use_box=use_box,
+                     select=select, n_points=n_points, point_spread=point_spread)[0]
         picks.append(sam.last_pick[-1] if sam.last_pick else
                      {"fill": 0.0, "sam_iou": 0.0, "n_cands": 0})
 
@@ -393,6 +419,21 @@ def main():
                     help="box prompt only. A box says where the object roughly "
                          "is; a positive point says the mask must contain that "
                          "pixel, which is what stops SAM answering with floor")
+    ap.add_argument("--points", type=int, default=1, choices=[1, 5, 9],
+                    help="positive points per prompt: 1 = centre, 5 = centre + a "
+                         "cross, 9 = + the diagonals. Each extra point is a pixel "
+                         "the mask must contain, which is how a mask that came "
+                         "back as a single coat patch is grown into the animal")
+    ap.add_argument("--point-spread", type=float, default=0.25,
+                    help="how far the extra points sit from the centre, as a "
+                         "fraction of the box's SHORTER side. A placement choice, "
+                         "not something the geometry dictates")
+    ap.add_argument("--crop-no-box", action="store_true",
+                    help="drop the box prompt in the cropped reading, leaving the "
+                         "points alone. With an exact crop the box spans the whole "
+                         "sub-image and carries no localising contrast, so this "
+                         "restores the point-only setting that segmented coat "
+                         "patches precisely")
     ap.add_argument("--mask-select", default="single",
                     choices=["single", "sam_iou"],
                     help="how one mask is chosen, applied to BOTH readings. Only "
@@ -464,7 +505,8 @@ def main():
         boxes = relative_boxes(record, h, w)
         try:
             li, lj = sam(bgr, boxes, use_point=not args.no_point,
-                         select=args.mask_select)
+                         select=args.mask_select, n_points=args.points,
+                         point_spread=args.point_spread)
         except Exception as err:                   # noqa: BLE001
             print(f"[sam] failed on {record['rel_image']}: {err}")
             continue
@@ -487,7 +529,9 @@ def main():
             (ci_l, cj_l), (si, sj), claim_areas, picks = claim_logits(
                 sam, bgr, boxes, pad=args.crop_pad,
                 use_point=not args.no_point,
-                exact=args.crop_pad <= 0, select=args.mask_select)
+                exact=args.crop_pad <= 0, select=args.mask_select,
+                n_points=args.points, point_spread=args.point_spread,
+                use_box=not args.crop_no_box)
         except Exception as err:                   # noqa: BLE001
             print(f"[sam] crop mode failed on {record['rel_image']}: {err}")
             continue
@@ -573,6 +617,13 @@ def main():
     print(f"[sam] SAM 自評 IoU:            中位數 {np.median(sious):.2f}  "
           f"p10 {np.percentile(sious, 10):.2f}")
     print(f"[sam] （面積僅供觀察，SAM 不以面積排序候選）")
+    # The crop reading needs its own degeneracy gate: there the sub-image IS the
+    # box, so a mask filling the view has taken the box rather than the animal.
+    # The whole-image gate above cannot see this, because a whole-image mask is
+    # measured against its box inside a much larger view.
+    if np.median(fills) > 0.9:
+        print(f"[sam] WARNING: 裁切模式的 mask 佔子圖 {np.median(fills):.0%} — "
+              f"子圖就是框，所以這代表 mask 圈的是框本身。圖四、圖五的結果不可用。")
     ai = np.array([r["claim_area_i"] for r in report] +
                   [r["claim_area_j"] for r in report], float)
     ag = np.array([r["agree_with_whole_i"] for r in report] +
