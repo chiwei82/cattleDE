@@ -48,10 +48,19 @@ PROMPTING
     slightly loose box is therefore often answered with the ground. The positive
     point removes that failure by construction — the returned mask has to
     contain that pixel, and the floor does not. `--no-point` reverts to boxes
-    alone; `--target-frac 0.6` additionally asks for SAM's three multimask
-    candidates and keeps the one whose area best matches that share of the box,
-    which settles the whole-vs-part ambiguity without needing to know how large
-    the animal is in absolute terms.
+    alone.
+
+    Both readings are prompted identically, so that the only thing separating
+    them is what SAM can see.
+
+    Reducing SAM's output to one mask offers only what the reference
+    implementation recommends. `--mask-select single` (the default) uses
+    multimask_output=False, suggested for unambiguous prompts, which a box plus
+    a point is; `--mask-select sam_iou` takes the three candidates and keeps the
+    one with the highest quality score the model predicts for itself. Selection
+    by mask area was tried and dropped: nothing in SAM ranks candidates by size,
+    so such a rule is an outside assumption about how much of a view an animal
+    fills.
 
 The report describes the maps as regions — non-empty, coherent or speckled, how
 large, and where they sit. Whether a region coincides with contact is a separate
@@ -86,15 +95,10 @@ class SamLogits:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         sam = sam_model_registry[model_type](checkpoint=weights).to(device)
         self.predictor = SamPredictor(sam)
-        # 1.0 = no ceiling. Any value below it is an assumption about how much
-        # of a view an object may occupy, so it is left off until the recorded
-        # fill fractions justify one.
-        self.fill_cap = 1.0
         self.last_pick = []
         print(f"[sam] segment-anything {model_type} on {device}")
 
-    def __call__(self, bgr, boxes, use_point=True, target_frac=0.0,
-                 use_box=True, single_mask=False):
+    def __call__(self, bgr, boxes, use_point=True, use_box=True, select="single"):
         """Returns a list of full-resolution logit maps, one per box.
 
         A box alone only says "the object spans roughly this rectangle", and SAM
@@ -105,10 +109,19 @@ class SamLogits:
         positive point pins the answer down: the mask MUST contain that pixel,
         and the floor does not.
 
-        target_frac > 0 asks for the three multimask candidates and keeps the one
-        whose area is closest to target_frac of the box, which resolves SAM's
-        whole-vs-part-vs-subpart ambiguity without needing to know the animal's
-        absolute size — only its expected share of its own box.
+        `select` offers only what the reference implementation recommends:
+
+          single   multimask_output=False. Suggested for unambiguous prompts —
+                   a box, or several prompts together — which is what a box plus
+                   a point is.
+          sam_iou  multimask_output=True, ranked by the quality score the model
+                   predicts for each candidate. Suggested for ambiguous prompts
+                   such as a lone click, and this is the documented way to
+                   reduce the three candidates to one.
+
+        Area-based selection rules were tried and removed: nothing in SAM ranks
+        its candidates by size, so any such rule is an outside assumption about
+        how much of a view an animal occupies.
         """
         self.predictor.set_image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         self.last_pick = []
@@ -127,36 +140,15 @@ class SamLogits:
             # One rule for both readings. They are meant to differ in exactly
             # one respect — what SAM can see — so prompt type and mask selection
             # are held identical; otherwise a difference between them cannot be
-            # attributed to anything. Both therefore get box + point, and both
-            # take the multimask candidates.
-            #
-            # multimask is used even with a box because the coat-patch failure
-            # showed the single-mask token settling on too fine a granularity on
-            # these animals. Tokens 1-3 are trained as subpart / part / whole of
-            # the prompted object, so the largest is the complete animal.
-            if not single_mask:
+            # attributed to anything.
+            if select == "sam_iou":
                 logits, scores, _ = self.predictor.predict(multimask_output=True,
                                                           **kwargs)
-                areas = np.array([(l > 0).sum() for l in logits], np.float64)
+                # Ranked by the model's own predicted quality — the mechanism
+                # SAM trains an IoU token for.
+                pick = int(np.argmax(scores))
                 total = float(logits[0].size)
-                if target_frac > 0:
-                    want = target_frac * max((x2 - x1) * (y2 - y1), 1.0)
-                    pick = int(np.argmin(np.abs(areas - want)))
-                else:
-                    # Largest of the three granularities, with no cap. SAM's
-                    # multimask outputs are subpart / part / whole OF THE OBJECT
-                    # at the prompt, so the largest is the complete animal —
-                    # which is what the coat-patch failure calls for. A ceiling
-                    # to reject a "whole frame" candidate is deliberately NOT
-                    # imposed: no such candidate has been observed here, and any
-                    # threshold would be a guess. fill_cap stays available for
-                    # when the recorded fill fractions show one is needed.
-                    if self.fill_cap < 1.0:
-                        ok = np.flatnonzero(areas <= self.fill_cap * total)
-                        pick = int(ok[np.argmax(areas[ok])]) if len(ok) \
-                            else int(np.argmin(areas))
-                    else:
-                        pick = int(np.argmax(areas))
+                areas = np.array([(l > 0).sum() for l in logits], np.float64)
                 out.append(logits[pick].astype(np.float32))
                 self.last_pick.append({"fill": float(areas[pick] / total),
                                        "sam_iou": float(scores[pick]),
@@ -194,8 +186,8 @@ def confusion_maps(logit_i, logit_j):
     return ui * uj, np.maximum(ui, uj)
 
 
-def claim_logits(sam, bgr, boxes, pad=0, use_point=True, target_frac=0.0,
-                 exact=False, single_mask=False):
+def claim_logits(sam, bgr, boxes, pad=0, use_point=True, exact=False,
+                 select="single"):
     """Segment each box's crop in ISOLATION, then paste the result back.
 
     The opposite mechanism to the whole-image prompts above, and it exploits a
@@ -238,9 +230,8 @@ def claim_logits(sam, bgr, boxes, pad=0, use_point=True, target_frac=0.0,
         # Identical prompt to the whole-image reading: this animal's own box,
         # translated into the sub-image, plus the same centre point. Keeping the
         # box means the two readings differ only in what SAM can see.
-        logits = sam(sub, [prompt], use_point=use_point,
-                     target_frac=target_frac, use_box=True,
-                     single_mask=single_mask)[0]
+        logits = sam(sub, [prompt], use_point=use_point, use_box=True,
+                     select=select)[0]
         picks.append(sam.last_pick[-1] if sam.last_pick else
                      {"fill": 0.0, "sam_iou": 0.0, "n_cands": 0})
 
@@ -402,15 +393,14 @@ def main():
                     help="box prompt only. A box says where the object roughly "
                          "is; a positive point says the mask must contain that "
                          "pixel, which is what stops SAM answering with floor")
-    ap.add_argument("--single-mask", action="store_true",
-                    help="use SAM's single-mask token instead of the multimask "
-                         "candidates, in BOTH readings. The default takes the "
-                         "largest of the three granularities, because the single "
-                         "token settles on coat patches on these animals")
-    ap.add_argument("--target-frac", type=float, default=0.0,
-                    help="if > 0, take SAM's three multimask candidates and keep "
-                         "the one whose area is closest to this fraction of the "
-                         "box. ~0.6 suits cattle in an axis-aligned box")
+    ap.add_argument("--mask-select", default="single",
+                    choices=["single", "sam_iou"],
+                    help="how one mask is chosen, applied to BOTH readings. Only "
+                         "the reference implementation's own options are offered. "
+                         "'single' (default) = multimask_output=False, suggested "
+                         "for unambiguous prompts, which a box plus a point is. "
+                         "'sam_iou' = the three candidates ranked by the quality "
+                         "score the model predicts for each")
     ap.add_argument("--crop-pad", type=int, default=0,
                     help="crop mode context. 0 (default) cuts precisely to "
                          "bbox1/bbox2 and prompts with the centre point ALONE — "
@@ -474,8 +464,7 @@ def main():
         boxes = relative_boxes(record, h, w)
         try:
             li, lj = sam(bgr, boxes, use_point=not args.no_point,
-                         target_frac=args.target_frac,
-                         single_mask=args.single_mask)
+                         select=args.mask_select)
         except Exception as err:                   # noqa: BLE001
             print(f"[sam] failed on {record['rel_image']}: {err}")
             continue
@@ -490,8 +479,8 @@ def main():
         try:
             (ci_l, cj_l), (si, sj), claim_areas, picks = claim_logits(
                 sam, bgr, boxes, pad=args.crop_pad,
-                use_point=not args.no_point, target_frac=args.target_frac,
-                exact=args.crop_pad <= 0, single_mask=args.single_mask)
+                use_point=not args.no_point,
+                exact=args.crop_pad <= 0, select=args.mask_select)
         except Exception as err:                   # noqa: BLE001
             print(f"[sam] crop mode failed on {record['rel_image']}: {err}")
             continue
@@ -568,11 +557,7 @@ def main():
           f"p90 {np.percentile(fills, 90):.0%}  max {fills.max():.0%}")
     print(f"[sam] SAM 自評 IoU:            中位數 {np.median(sious):.2f}  "
           f"p10 {np.percentile(sious, 10):.2f}")
-    if (fills > 0.92).mean() > 0.05:
-        print(f"[sam] {(fills > 0.92).mean():.0%} 的選擇佔滿子圖 >92% — 退化確實"
-              f"發生了，這時才有理由設 fill_cap")
-    else:
-        print("[sam] 沒有觀察到『整個畫面』型的退化，所以不設面積上限")
+    print(f"[sam] （面積僅供觀察，SAM 不以面積排序候選）")
     ai = np.array([r["claim_area_i"] for r in report] +
                   [r["claim_area_j"] for r in report], float)
     ag = np.array([r["agree_with_whole_i"] for r in report] +
