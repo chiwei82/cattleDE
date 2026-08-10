@@ -207,10 +207,10 @@ def main():
         raise SystemExit("nothing processed")
 
     print(f"\n[contact] {len(report)} pairs, touch_px={args.touch_px}\n")
-    print("面板：mask | " + " | ".join(order))
-    print("綠色 = 該定義判定的接觸候選像素\n")
-    print(f"{'reading':<10}{'非空':>7}{'區域大小':>11}{'佔畫面':>9}"
-          f"{'連通塊':>8}{'落在牛身上':>12}")
+    print("panels: masks | " + " | ".join(order))
+    print("green = the contact candidates that reading selects\n")
+    print(f"{'reading':<10}{'nonempty':>10}{'area':>11}{'of crop':>9}"
+          f"{'blobs':>7}{'on animal':>11}")
     summary = {}
     for name in order:
         ne = np.mean([r[f"{name}_nonempty"] for r in report])
@@ -221,10 +221,11 @@ def main():
         summary[name] = {"nonempty": float(ne), "px_median": float(px),
                          "frac_median": float(frac), "components_median": float(comp),
                          "on_animal_median": float(onan)}
-        print(f"{name:<10}{ne:>6.0%}{px:>10.0f}px{frac:>9.1%}{comp:>8.1f}{onan:>11.0%}")
+        print(f"{name:<10}{ne:>9.0%}{px:>9.0f}px{frac:>9.1%}{comp:>7.1f}{onan:>10.0%}")
 
-    print("\n『落在牛身上』= 該區域有多少比例壓在任一隻牛的 mask 上。")
-    print("接觸發生在體表，所以這個比例越高，圈到的越可能是皮膚而不是牛之間的空氣。")
+    print("\n'on animal' = the share of the region that lies on either mask.")
+    print("Contact happens on a body surface, so the higher this is, the more of")
+    print("what was selected is skin rather than the air between the animals.")
 
     with open(os.path.join(out_dir, "contact_report.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(report[0].keys()))
