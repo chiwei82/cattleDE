@@ -470,6 +470,13 @@ def main():
             continue
 
         mi, mj = (li > 0).astype(np.uint8), (lj > 0).astype(np.uint8)
+        # How much of its own box each whole-image mask covers. An instance mask
+        # should leave some of the box unclaimed — an axis-aligned box around an
+        # animal always contains floor. A mask at ~1.0 has taken the box itself.
+        whole_fill = []
+        for m, (bx1, by1, bx2, by2) in zip((mi, mj), boxes):
+            box_area = max((bx2 - bx1) * (by2 - by1), 1)
+            whole_fill.append(float(m[by1:by2, bx1:bx2].sum()) / box_area)
         strict, loose = confusion_maps(li, lj)
         band = contact_band(mi, mj)
         whole = {"mi": mi, "mj": mj, "strict": strict, "loose": loose,
@@ -531,6 +538,8 @@ def main():
                      crop_disagrees=int(min(agree_i, agree_j) < 0.5),
                      claim_iou=round(claim_iou, 3),
                      claim_same_object=int(claim_iou > 0.8),
+                     whole_fill_i=round(whole_fill[0], 3),
+                     whole_fill_j=round(whole_fill[1], 3),
                      pick_fill_i=round(picks[0]["fill"], 3),
                      pick_fill_j=round(picks[1]["fill"], 3),
                      sam_iou_i=round(picks[0]["sam_iou"], 3),
@@ -549,6 +558,12 @@ def main():
     if not report:
         raise SystemExit("nothing processed")
 
+    wf = np.array([r["whole_fill_i"] for r in report] +
+                  [r["whole_fill_j"] for r in report], float)
+    print(f"\n[sam] 【整張】mask 佔自己框的比例: 中位數 {np.median(wf):.0%}  "
+          f"p90 {np.percentile(wf, 90):.0%}  >90% 的比例 {np.mean(wf > 0.9):.0%}")
+    print("      軸對齊框裡一定有地板，所以健康的 instance mask 不該填滿它。")
+    print("      接近 100% 代表 mask 圈的是框本身，不是動物。")
     fills = np.array([r["pick_fill_i"] for r in report] +
                      [r["pick_fill_j"] for r in report], float)
     sious = np.array([r["sam_iou_i"] for r in report] +
@@ -608,6 +623,23 @@ def main():
     print(f"\n{'reading':<10}{'區域落在交會帶內的比例':>24}")
     for name in ("strict", "loose", "overlap", "mutual"):
         print(f"{name:<10}{summary[name]['frac_in_band_median']:>22.0%}")
+
+    # Degeneracy is checked first. Every region statistic below rewards a bigger
+    # region — area, few components, coverage of the band — so a mask that has
+    # swallowed its whole box scores well on all of them while being useless.
+    # The size of the masks has to be trusted before their shape means anything.
+    if np.median(wf) > 0.9:
+        verdict = (f"DEGENERATE - whole-image masks fill {np.median(wf):.0%} of "
+                   "their own boxes, i.e. they have taken the box rather than the "
+                   "animal. Every region statistic below is inflated by that and "
+                   "should not be compared across runs until it is fixed.")
+        print(f"\n[sam] verdict: {verdict}")
+        with open(os.path.join(out_dir, "confusion_report.csv"), "w", newline="") as f:
+            wtr = csv.DictWriter(f, fieldnames=list(report[0].keys()))
+            wtr.writeheader()
+            wtr.writerows(report)
+        print(f"[sam] wrote {out_dir}")
+        return
 
     s_ok, s_clean = summary["strict"]["nonempty_frac"], summary["strict"]["components_median"]
     if s_ok >= 0.7 and s_clean <= 3:
