@@ -35,12 +35,22 @@ The two panels built from UNCERTAINTY cannot be carried over unchanged. The SAM
     u_x(p)    = 4 * sigmoid(logit_x) * (1 - sigmoid(logit_x))
     strict(p) = u_i(p) * u_j(p)
 
-which needs a per-pixel score, not a mask. The ultralytics SAM 3 wrapper returns
-binary masks. This script probes for a soft output at runtime and says which it
-got; when only binary masks are available, panels 3 and 5 show the mask OVERLAP
-rather than an uncertainty map, and the tile is labelled so the two are never
-confused. Panel 3's green band is unaffected either way — it is built from the
-masks alone, and it is the thing score_contact actually measures.
+which needs a per-pixel score, not a mask.
+
+Ultralytics' high-level path throws that score away: its postprocess ends in
+
+    masks = masks > self.model.mask_threshold   # to bool
+
+so Results carries booleans and the raw logits are gone. They are still
+reachable one level down — `set_image()` caches the image features and
+`inference()` / `prompt_inference()` return the decoder's output before
+thresholding — so `--prompt-mode boxes` computes the same uncertainty product as
+the SAM 1 figure. That path reaches past the documented interface, so it is
+attempted once and falls back to thresholded masks if anything about it fails;
+the run says which it used, and when only masks are available panels 3 and 5
+show the mask OVERLAP with the tile labelled accordingly, so the two readings
+are never confused. Panel 3's green band is unaffected either way — it is built
+from the masks alone, and it is the thing score_contact actually measures.
 
 PANELS
 
@@ -87,17 +97,77 @@ class Sam3Boxes:
         from ultralytics import SAM
 
         self.model = SAM(weights)
+        self.logit_path = None          # set on the first call: True if usable
         print(f"[sam3] box/point prompts ({weights})")
 
-    def __call__(self, bgr, boxes, prompts=None):
-        kw = {"bboxes": [list(map(float, b)) for b in boxes]}
+    def _prompt_args(self, boxes, prompts):
         if prompts is not None:
-            kw["points"] = [[[float(x), float(y)] for x, y in p] for p, _ in prompts]
-            kw["labels"] = [[int(v) for v in lab] for _, lab in prompts]
-        else:
-            kw["points"] = [[(b[0] + b[2]) / 2, (b[1] + b[3]) / 2] for b in boxes]
-            kw["labels"] = [1] * len(boxes)
-        res = self.model(bgr, verbose=False, **kw)
+            return ([[[float(x), float(y)] for x, y in p] for p, _ in prompts],
+                    [[int(v) for v in lab] for _, lab in prompts])
+        return ([[(b[0] + b[2]) / 2, (b[1] + b[3]) / 2] for b in boxes],
+                [1] * len(boxes))
+
+    def _logits(self, bgr, boxes, prompts):
+        """Raw mask logits, by calling the predictor below the high-level API.
+
+        The high-level `model(...)` path ends in
+
+            masks = masks > self.model.mask_threshold   # to bool
+
+        so the per-pixel score is thresholded away before Results is built, and
+        the uncertainty panels cannot be computed from what comes back.
+        `inference()` / `prompt_inference()` return the decoder's output before
+        that step, and `set_image()` caches the image features, so the logits
+        are reachable without re-encoding.
+
+        Best effort: this reaches past the documented interface, so any failure
+        falls back to the thresholded path rather than aborting the run. Which
+        one was used is reported, because it decides whether panels 3 and 5 mean
+        the same thing as in the SAM 1 figure.
+        """
+        from ultralytics.utils import ops
+
+        p = self.model.predictor
+        p.set_image(bgr)
+        im = getattr(p, "im", None)
+        if im is None:
+            return None
+        pts, labs = self._prompt_args(boxes, prompts)
+        pred, _ = p.inference(
+            im,
+            bboxes=np.asarray([list(map(float, b)) for b in boxes], np.float32),
+            points=np.asarray(pts, np.float32),
+            labels=np.asarray(labs, np.int32),
+            multimask_output=False)
+        # Decoder resolution -> the crop's own grid, the same rescaling the
+        # thresholded path applies before it binarises.
+        out = ops.scale_masks(pred[None].float(), bgr.shape[:2])[0]
+        return [out[k].cpu().numpy().astype(np.float32) for k in range(len(boxes))]
+
+    def __call__(self, bgr, boxes, prompts=None):
+        if self.logit_path is not False:
+            try:
+                got = self._logits(bgr, boxes, prompts)
+                if got is not None and len(got) >= len(boxes):
+                    if self.logit_path is None:
+                        self.logit_path = True
+                        print("[sam3] raw logits reachable via predictor."
+                              "inference(); panels 3 and 5 are the same "
+                              "uncertainty product as the SAM 1 figure")
+                    # Logits, not probabilities: sigmoid before they are read as
+                    # confidences, matching what the SAM 1 script does.
+                    return [1.0 / (1.0 + np.exp(-g)) for g in got], True
+            except Exception as err:                   # noqa: BLE001
+                if self.logit_path is None:
+                    print(f"[sam3] raw logits not reachable ({err}); falling back "
+                          "to thresholded masks, so panels 3 and 5 will show "
+                          "overlap rather than uncertainty")
+                self.logit_path = False
+
+        pts, labs = self._prompt_args(boxes, prompts)
+        res = self.model(bgr, verbose=False,
+                         bboxes=[list(map(float, b)) for b in boxes],
+                         points=pts, labels=labs)
         return _extract(res, bgr.shape[:2], len(boxes))
 
 
