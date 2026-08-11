@@ -74,6 +74,88 @@ class _UltralyticsSAM:
         return out
 
 
+class _SAM3Text:
+    """SAM 3 concept prompting: segment the noun phrase, then match to the boxes.
+
+    This is a different kind of prompt from everything else in this file, and it
+    addresses the failure the others work around rather than the symptom. SAM 1
+    and SAM 2 are class-agnostic: given a box they return whichever coherent
+    region best fits it, and on this footage a uniform patch of pen floor is a
+    more coherent region than a high-contrast Holstein, so a slightly loose box
+    is answered with the ground. Positive points, negative points and depth
+    prompts are all ways of steering that. SAM 3 accepts the concept itself, so
+    the floor is not a candidate answer in the first place.
+
+    Promptable concept segmentation returns EVERY instance of the concept in the
+    image with its own identity, not one mask per prompt. A pair crop can hold a
+    third animal at its edge, so the returned instances are assigned to the two
+    detector boxes by mask/box IoU, greedily and without replacement, and a pair
+    is rejected if either box finds nothing. That assignment is the one piece
+    here with no counterpart in the box-prompted path, and it is where this
+    backend can go wrong: check a sample with compare_masks.py before trusting a
+    whole cache of it.
+    """
+
+    def __init__(self, weights, text="cow", conf=0.25):
+        from ultralytics.models.sam import SAM3SemanticPredictor
+
+        self.text = text
+        self.predictor = SAM3SemanticPredictor(overrides={
+            "conf": conf, "task": "segment", "mode": "predict",
+            "model": weights, "quantize": 16, "save": False, "verbose": False})
+        print(f"[mask] SAM 3 concept prompting, text={text!r}, conf={conf}")
+
+    @staticmethod
+    def _iou_with_box(mask, box):
+        x1, y1, x2, y2 = (int(max(0, box[0])), int(max(0, box[1])),
+                          int(min(mask.shape[1], box[2])),
+                          int(min(mask.shape[0], box[3])))
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        inter = float(mask[y1:y2, x1:x2].sum())
+        union = float(mask.sum()) + (x2 - x1) * (y2 - y1) - inter
+        return inter / max(union, 1.0)
+
+    def __call__(self, bgr, boxes, use_point=True, prompts=None, path=None):
+        # set_image is documented with a path; an array works in the ultralytics
+        # predictors, and the path is preferred when we have one so that any
+        # internal preprocessing matches the documented behaviour exactly.
+        self.predictor.set_image(path if path else bgr)
+        results = self.predictor(text=[self.text])
+        masks = getattr(results[0], "masks", None)
+        if masks is None or masks.data is None or len(masks.data) == 0:
+            return None
+
+        inst = []
+        for m in masks.data:
+            a = m.cpu().numpy().astype(np.uint8)
+            if a.shape != bgr.shape[:2]:
+                a = cv2.resize(a, (bgr.shape[1], bgr.shape[0]),
+                               interpolation=cv2.INTER_NEAREST)
+            inst.append(a)
+
+        # Greedy assignment over the full IoU matrix: take the best box/instance
+        # pair, remove both, repeat. With two boxes this is optimal.
+        scores = [[self._iou_with_box(a, b) for a in inst] for b in boxes]
+        out = [None] * len(boxes)
+        taken = set()
+        for _ in range(len(boxes)):
+            best, bk, bi = 0.0, None, None
+            for k in range(len(boxes)):
+                if out[k] is not None:
+                    continue
+                for i in range(len(inst)):
+                    if i in taken:
+                        continue
+                    if scores[k][i] > best:
+                        best, bk, bi = scores[k][i], k, i
+            if bk is None or best <= 0.0:
+                break
+            out[bk] = inst[bi]
+            taken.add(bi)
+        return None if any(o is None for o in out) else out
+
+
 class _ReferenceSAM:
     """Box-prompted SAM via the reference segment-anything package."""
 
@@ -106,7 +188,8 @@ class _ReferenceSAM:
         return out
 
 
-def build_segmenter(cfg, backend="auto", model_type="vit_b"):
+def build_segmenter(cfg, backend="auto", model_type="vit_b", text="cow",
+                    conf=0.25):
     """Pick a SAM backend.
 
     The two are not interchangeable: they wrap different checkpoints and
@@ -116,6 +199,16 @@ def build_segmenter(cfg, backend="auto", model_type="vit_b"):
     band. Use backend="reference" to keep the two identical.
     """
     weights = cfg["data"].get("sam_weights", "sam_b.pt")
+    if backend == "sam3_text":
+        # sam3.pt is gated: request access at huggingface.co/facebook/sam3 and
+        # place the file where sam_weights points, or pass --weights.
+        return _SAM3Text(weights, text, conf)
+    if backend == "sam3":
+        # SAM 3 driven with the SAM 2 style box/point interface, so depth
+        # prompts still apply and the only variable is the checkpoint.
+        seg = _UltralyticsSAM(weights)
+        print(f"[mask] SAM 3 with box/point prompts ({weights})")
+        return seg
     if backend == "reference":
         seg = _ReferenceSAM(weights, model_type)
         print(f"[mask] using segment-anything ({weights}, {model_type})")
@@ -171,45 +264,55 @@ def depth_prompts(depth, spread, inverse, boxes, rng, n_pos=3, n_neg=6,
     stronger boundary than the animal's own outline.
 
     For each box:
-      positive  points in the near mode inside the box  -> the animal
-      negative  points in the far mode inside the box   -> the floor under it
+      positive  points at the box centre's own depth  -> the animal
+      negative  points lying FURTHER than that        -> the floor under it
       negative  points inside the OTHER box but outside this one -> the other
                 animal, which is what stops one mask swallowing both. This part
                 needs no depth and is applied regardless.
 
-    The near/far split is Otsu on the depth inside the box. Otsu always returns
-    a threshold, including on a box that is entirely animal, where it would
-    split the animal's own back from its legs and plant negative points on the
-    cow. So the two modes are kept only when their medians differ by at least
-    `min_sep` of the crop's depth spread; below that the box is treated as
-    having no visible floor and only the positive and other-animal points are
-    used. Returns the prompts and how many boxes had a usable split, so the
-    caller can report how often depth actually contributed.
+    Both depth classes hang off the box centre, because that is the only pixel
+    the detector guarantees is an animal. An earlier version split the box's
+    depth histogram with Otsu and called the near half cattle; that is wrong for
+    this camera, whose angled ceiling mount puts railings, feed barriers and
+    pipework NEARER the lens than a cow's back, so the near half is as likely to
+    be hardware as animal and the positive points would land on a gate.
+
+    Nothing is asserted about what lies nearer than the centre depth: it is
+    neither prompted for nor against, and SAM is left to decide. Only the far
+    side is claimed, because that is the direction in which this camera can only
+    be seeing ground.
+
+    A box whose far side is empty gets no depth-derived negatives at all — it
+    contains no visible floor, and `min_sep` is what keeps a box that is
+    entirely animal from having negative points planted on the cow. Returns the
+    prompts and how many boxes had visible floor, so the caller can report how
+    often depth actually contributed.
     """
     out, used = [], 0
     h, w = depth.shape
     for k, b in enumerate(boxes):
         x1, y1, x2, y2 = (int(max(0, b[0])), int(max(0, b[1])),
                           int(min(w, b[2])), int(min(h, b[3])))
-        pts = [((x1 + x2) // 2, (y1 + y2) // 2)]
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        pts = [(cx, cy)]
         lab = [1]
         if x2 > x1 + 4 and y2 > y1 + 4:
             sub = depth[y1:y2, x1:x2]
-            u8 = np.clip((sub - sub.min()) / max(sub.ptp(), 1e-6), 0, 1)
-            thr, _ = cv2.threshold((u8 * 255).astype(np.uint8), 0, 255,
-                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            hi = u8 > (thr / 255.0)
-            # Larger inverse depth means nearer; metric depth is the other way.
-            near = hi if inverse else ~hi
-            far = ~near
-            sep = (abs(float(np.median(sub[near])) - float(np.median(sub[far])))
-                   / spread) if near.any() and far.any() else 0.0
-            if sep >= min_sep:
+            r = max(3, int(0.10 * min(x2 - x1, y2 - y1)))
+            disc = depth[max(0, cy - r):min(h, cy + r + 1),
+                         max(0, cx - r):min(w, cx + r + 1)]
+            ref = float(np.median(disc)) if disc.size else float(depth[cy, cx])
+            # Larger means further, whichever way the checkpoint reports depth.
+            f = -sub if inverse else sub
+            f_ref = -ref if inverse else ref
+            near = np.abs(sub - ref) <= (min_sep * spread)   # at cattle depth
+            far = f > (f_ref + min_sep * spread)             # beyond it: ground
+            if far.any():
                 used += 1
-                for (px, py) in _sample(near, n_pos, rng):
-                    pts.append((px + x1, py + y1)); lab.append(1)
                 for (px, py) in _sample(far, n_neg, rng):
                     pts.append((px + x1, py + y1)); lab.append(0)
+            for (px, py) in _sample(near, n_pos, rng):
+                pts.append((px + x1, py + y1)); lab.append(1)
 
         # The other animal, as negative points. Pure geometry, always applied.
         other = boxes[1 - k] if len(boxes) == 2 else None
@@ -257,12 +360,21 @@ def main():
     ap.add_argument("--split", default=None, choices=["train", "val", "test"])
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--backend", default="auto",
-                    choices=["auto", "reference", "ultralytics"],
+                    choices=["auto", "reference", "ultralytics", "sam3",
+                             "sam3_text"],
                     help="which SAM wrapper to use. 'reference' matches "
                          "visualize_sam_confusion exactly, so the cached masks "
                          "are the ones its panels were drawn from")
     ap.add_argument("--model-type", default="vit_b",
                     help="checkpoint variant for the reference backend")
+    ap.add_argument("--weights", default=None,
+                    help="overrides data.sam_weights; use it to point at sam3.pt")
+    ap.add_argument("--text", default="cow",
+                    help="noun phrase for --backend sam3_text. SAM 3 segments "
+                         "the concept itself, so the pen floor is not a "
+                         "candidate answer the way it is for a bare box")
+    ap.add_argument("--conf", type=float, default=0.25,
+                    help="confidence floor for SAM 3 concept segmentation")
     ap.add_argument("--no-point", action="store_true",
                     help="box prompt only. The default adds a positive point at "
                          "the box centre, which is what stops SAM answering with "
@@ -289,6 +401,8 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.weights:
+        cfg["data"]["sam_weights"] = args.weights
     cache_root = os.path.join(
         CONTACT_ROOT,
         args.cache_dir or cfg["data"]["mask_dir"] or "log/mask_cache")
@@ -302,7 +416,8 @@ def main():
         raise SystemExit("no labelled rows to process")
     print(f"[mask] segmenting {len(records)} pairs -> {cache_root}")
 
-    seg = build_segmenter(cfg, args.backend, args.model_type)
+    seg = build_segmenter(cfg, args.backend, args.model_type, args.text,
+                          args.conf)
     print(f"[mask] prompt source: {args.prompt_source}")
     done = skipped = failed = no_depth = 0
     n_split = n_boxes = 0
@@ -328,11 +443,7 @@ def main():
             if dep is None:
                 no_depth += 1
                 continue
-            depth, spread = dep
-            inverse = True
-            data = np.load(record["depth_path"])
-            if "inverse" in data:
-                inverse = bool(int(data["inverse"]))
+            depth, spread, inverse = dep
             if args.prompt_source == "depth_points":
                 prompts, used = depth_prompts(depth, spread, inverse, boxes,
                                               rng, min_sep=args.min_sep)
@@ -342,8 +453,10 @@ def main():
                 image = depth_as_image(depth, inverse)
 
         try:
-            masks = seg(image, boxes, use_point=not args.no_point,
-                        prompts=prompts)
+            kw = {"use_point": not args.no_point, "prompts": prompts}
+            if args.backend == "sam3_text":
+                kw = {"path": record["image_path"]}
+            masks = seg(image, boxes, **kw)
         except Exception as err:                   # noqa: BLE001
             print(f"[mask] failed on {record['rel_image']}: {err}")
             masks = None

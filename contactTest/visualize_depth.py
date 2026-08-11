@@ -30,8 +30,8 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from contactTest.sam_contact_region import load_depth, load_masks
-from contactTest.src.data import load_records, split_records
+from contactTest.sam_contact_region import ground_split, load_depth, load_masks
+from contactTest.src.data import load_records, relative_boxes, split_records
 from contactTest.src.utils import load_config
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -131,7 +131,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     made = no_depth = 0
-    seps = []
+    seps, gaps = [], []
     for i, record in enumerate(records):
         bgr = cv2.imread(record["image_path"])
         if bgr is None:
@@ -140,10 +140,8 @@ def main():
         if dep is None:
             no_depth += 1
             continue
-        depth, spread = dep
-        data = np.load(record["depth_path"])
-        p2 = float(data["p2"])
-        inverse = bool(int(data["inverse"])) if "inverse" in data else True
+        depth, spread, inverse = dep
+        p2 = float(np.load(record["depth_path"])["p2"])
 
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         dcol = colourise(depth, spread, p2, inverse, args.raw)
@@ -156,29 +154,48 @@ def main():
             dcol = cv2.resize(dcol, size, interpolation=cv2.INTER_NEAREST)
         h, w = rgb.shape[:2]
 
-        # How far the animals' body depth sits from the rest of the crop. This
-        # is the whole basis of the 'body' gate, so it is worth seeing per crop
-        # rather than assuming it holds.
-        sep = None
+        # How far the animals' body depth sits from the ground. This is the whole
+        # basis of the 'body' gate, so it is worth seeing per crop rather than
+        # assuming it holds.
+        #
+        # Anchored on the two things this camera makes reliable: the box
+        # centres are animal, and anything further than them is ground. Not on
+        # the SAM masks, which would be circular, and not on the near mode of
+        # the histogram, which an angled ceiling mount fills with railings and
+        # feed barriers sitting closer to the lens than a cow's back.
+        sep = far_share = sep_mask = None
+        split = ground_split(depth, inverse,
+                             relative_boxes(record, *bgr.shape[:2]), spread)
+        if split is not None:
+            sep = split[2] / spread
+            far_share = split[3]
+            seps.append(sep)
+
+        # The mask-based figure is still shown when masks exist, because the gap
+        # between the two is a direct read-out of how far the segmentation is
+        # off: they agree when the masks are clean and diverge when they are not.
         masks = load_masks(record, bgr.shape[:2])
-        if masks is not None and (masks[0].any() or masks[1].any()):
+        if masks is not None:
             on = (masks[0] > 0) | (masks[1] > 0)
             if on.any() and (~on).any():
-                sep = abs(float(np.median(depth[on]))
-                          - float(np.median(depth[~on]))) / spread
-                seps.append(sep)
+                sep_mask = abs(float(np.median(depth[on]))
+                               - float(np.median(depth[~on]))) / spread
+                gaps.append(abs(sep_mask - sep) if sep is not None else 0.0)
 
         panel = np.hstack([rgb, np.full((h, 6, 3), 250, np.uint8), dcol,
                            colour_bar(h, 34)])
         lines = [(f"{os.path.basename(record['rel_image'])}   crop | DAv2"
                   + ("  [raw]" if args.raw else "  [p2-p98]"), (60, 60, 60))]
-        lines.append(
-            (f"body vs rest: {sep:.2f} of spread"
-             + ("  <- too close to separate" if sep < 0.05
-                else "  -> floor is separable"),
-             (170, 40, 30) if sep < 0.05 else (25, 110, 40))
-            if sep is not None else
-            ("no cached mask: separation unknown", (140, 140, 140)))
+        if sep is None:
+            lines.append(("depth is flat: no near/far split", (140, 140, 140)))
+        else:
+            note = ("  no visible ground" if far_share < 0.05
+                    else ("  too close" if sep < 0.05 else "  separable"))
+            extra = f"   mask-based {sep_mask:.2f}" if sep_mask is not None else ""
+            lines.append(
+                (f"body vs ground {sep:.2f}  ground {far_share:.0%} of crop{note}"
+                 + extra,
+                 (170, 40, 30) if (sep < 0.05 or far_share < 0.05) else (25, 110, 40)))
         panel = np.vstack([banner(panel.shape[1], lines), panel])
 
         cv2.imwrite(os.path.join(out_dir, f"{i:03d}_"
@@ -192,13 +209,24 @@ def main():
               "precompute_depth.py to cover them")
     if seps:
         s = np.array(seps)
-        print(f"[depth-vis] body-vs-rest separation over {len(s)} crops: "
+        print(f"[depth-vis] body-vs-ground separation over {len(s)} crops: "
               f"median {np.median(s):.2f}, 10th pct {np.percentile(s, 10):.2f} "
               "of the depth spread")
+        print("[depth-vis] cattle depth read at the detector box centres, ground "
+              "taken as whatever lies further; no masks and no near-mode")
+        print("[depth-vis] assumption, so this inherits neither SAM's errors nor "
+              "the railings this camera sees nearer than the cattle")
         print("[depth-vis] a 'body' tolerance has to sit below that separation to "
               "remove the floor")
         print(f"[depth-vis] it is under 0.05 on {np.mean(s < 0.05):.0%} of crops, "
               "where depth cannot tell the cattle from the ground at all")
+    if gaps:
+        g = np.array(gaps)
+        print(f"[depth-vis] mask-based figure differs from it by {np.median(g):.2f} "
+              f"at the median, {np.percentile(g, 90):.2f} at the 90th")
+        print("[depth-vis] that gap is a read-out of the segmentation: near zero "
+              "means the masks agree with the depth histogram about what is an")
+        print("[depth-vis] animal, and large means they do not")
     print("[depth-vis] bright = near, dark = far")
 
 

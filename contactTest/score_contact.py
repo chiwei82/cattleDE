@@ -222,7 +222,8 @@ def main():
             n_depth += dep is not None
             n_no_depth += dep is None
         if dep is not None:
-            st = depth_stats(mi, mj, dep[0], dep[1])
+            st = depth_stats(mi, mj, dep[0], dep[1], dep[2],
+                             relative_boxes(record, *bgr.shape[:2]))
             n_no_stat += sum(v is None for v in st.values())
             base = readings[args.depth_reading]
             variants = {("none", None): base}

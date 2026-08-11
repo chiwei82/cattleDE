@@ -158,12 +158,13 @@ def main():
             if dep is None:
                 no_depth += 1
             else:
-                depth, spread = dep
+                depth, spread, inverse = dep
                 gates = {s: args.depth_tol for s in args.depth_gate.split(",")
                          if s.strip()}
-                gated = contact_readings(mi, mj, args.touch_px, args.dilate_px,
-                                         args.strip_px, depth, spread,
-                                         gates)[args.reading]
+                gated = contact_readings(
+                    mi, mj, args.touch_px, args.dilate_px, args.strip_px,
+                    depth, spread, gates, inverse,
+                    relative_boxes(record, *bgr.shape[:2]))[args.reading]
                 cut, region = region & ~gated, gated
 
         if ann["status"] == "none":

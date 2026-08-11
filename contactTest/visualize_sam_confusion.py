@@ -78,6 +78,7 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from contactTest.sam_contact_region import depth_stats, load_depth
 from contactTest.src.data import load_records, relative_boxes, split_records
 from contactTest.src.utils import load_config
 
@@ -330,8 +331,14 @@ def _mask_tile(img_rgb, mi, mj, points=None):
     return out
 
 
-def _map_tile(img_rgb, m, band=None):
+def _map_tile(img_rgb, m, band=None, cut=None):
     tile = _heat(img_rgb, m)
+    if cut is not None and cut.any():
+        # What the depth gate took out, outlined before the kept band so the
+        # green line stays on top where the two touch.
+        cnt, _ = cv2.findContours(cut.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                  cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(tile, cnt, -1, (190, 130, 240), 1)
     if band is not None and band.any():
         cnt, _ = cv2.findContours(band.astype(np.uint8), cv2.RETR_EXTERNAL,
                                   cv2.CHAIN_APPROX_SIMPLE)
@@ -343,7 +350,7 @@ def _map_tile(img_rgb, m, band=None):
     return tile
 
 
-def panel(img_rgb, boxes, whole, cropped, band):
+def panel(img_rgb, boxes, whole, cropped, band, cut=None):
     """One row comparing the two mechanisms.
 
     boxes | WHOLE: masks, strict | CROP: claims, mutual
@@ -361,7 +368,7 @@ def panel(img_rgb, boxes, whole, cropped, band):
 
     pts = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes]
     tiles.append(_mask_tile(img_rgb, whole["mi"], whole["mj"], pts))
-    tiles.append(_map_tile(img_rgb, whole["strict"], band))
+    tiles.append(_map_tile(img_rgb, whole["strict"], band, cut))
     tiles.append(_mask_tile(img_rgb, cropped["ci"] > 0.5, cropped["cj"] > 0.5, pts))
     tiles.append(_map_tile(img_rgb, cropped["mutual"], None))
 
@@ -448,6 +455,16 @@ def main():
                          "nothing outside the box is seen or used. A positive "
                          "value pads the crop and restores the box prompt, which "
                          "needs an outside to contrast against")
+    ap.add_argument("--dilate-px", type=int, default=15,
+                    help="radius for panel 3's green band")
+    ap.add_argument("--depth-tol", type=float, default=None,
+                    help="apply depth gates to panel 3's band at this "
+                         "tolerance. Needs precompute_depth.py")
+    ap.add_argument("--depth-gate", default="pair",
+                    help="comma-separated: pair (animals at different range), "
+                         "body (floor and feet), step (occlusion edges). "
+                         "pair is the only one that scored above 1.0 for "
+                         "selectivity across a range of tolerances")
     ap.add_argument("--no-images", action="store_true")
     args = ap.parse_args()
 
@@ -496,6 +513,7 @@ def main():
     out_dir = os.path.join(CONTACT_ROOT, "log", "sam_confusion", args.split)
     os.makedirs(out_dir, exist_ok=True)
     report = []
+    n_no_depth = 0
 
     for i, record in enumerate(records):
         bgr = cv2.imread(record["image_path"])
@@ -520,7 +538,30 @@ def main():
             box_area = max((bx2 - bx1) * (by2 - by1), 1)
             whole_fill.append(float(m[by1:by2, bx1:bx2].sum()) / box_area)
         strict, loose = confusion_maps(li, lj)
-        band = contact_band(mi, mj)
+        band = contact_band(mi, mj, args.dilate_px)
+
+        # Panel 3's band, narrowed by depth. `cut` is what the gate removed and
+        # is outlined separately, so the picture shows the band that would be
+        # scored AND what paying for it cost — a gate that is working takes away
+        # ground and occluded torso, one that is not takes away the place the
+        # animals meet.
+        cut = None
+        if args.depth_tol is not None:
+            dep = load_depth(record, bgr.shape[:2])
+            if dep is None:
+                n_no_depth += 1
+            else:
+                st = depth_stats(mi.astype(np.uint8), mj.astype(np.uint8),
+                                 dep[0], dep[1], dep[2], boxes)
+                keep = None
+                for gname in args.depth_gate.split(","):
+                    s_map = st.get(gname.strip())
+                    if s_map is None:
+                        continue
+                    k_ = s_map <= args.depth_tol
+                    keep = k_ if keep is None else (keep & k_)
+                if keep is not None:
+                    cut, band = band & ~keep, band & keep
         whole = {"mi": mi, "mj": mj, "strict": strict, "loose": loose,
                  "overlap": (mi & mj).astype(np.float32)}
 
@@ -592,7 +633,7 @@ def main():
 
         if not args.no_images:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            row = panel(rgb, boxes, whole, cropped, band)
+            row = panel(rgb, boxes, whole, cropped, band, cut)
             name = (f"{i:03d}_{annotation.replace(' ', '-')}_"
                     f"{os.path.basename(record['rel_image'])}")
             cv2.imwrite(os.path.join(out_dir, name), cv2.cvtColor(row, cv2.COLOR_RGB2BGR))
@@ -658,7 +699,15 @@ def main():
     print("      CROP  = each box segmented alone; the signal is where both "
           "confidently claim")
     print("      green outline = where the two dilated masks meet; "
-          "white ring = the peak\n")
+          "white ring = the peak")
+    if args.depth_tol is not None:
+        print(f"      purple outline = band pixels the depth gate "
+              f"({args.depth_gate} at {args.depth_tol}) removed; the green "
+              "line is what survives")
+        if n_no_depth:
+            print(f"      {n_no_depth} pairs drawn ungated - no cached depth "
+                  "map; run precompute_depth.py")
+    print()
 
     # Everything below describes the maps themselves. The interaction label is
     # NOT used: SAM's uncertainty is a property of the image, so asking whether

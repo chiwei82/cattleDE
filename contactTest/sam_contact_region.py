@@ -83,7 +83,86 @@ def load_depth(record, shape):
     if depth.shape != shape:
         depth = cv2.resize(depth, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
     spread = float(data["p98"]) - float(data["p2"])
-    return depth, max(spread, 1e-6)
+    inverse = bool(int(data["inverse"])) if "inverse" in data else True
+    return depth, max(spread, 1e-6), inverse
+
+
+def farness(depth, inverse):
+    """Depth rewritten so that a larger number always means further away.
+
+    The relative checkpoints predict inverse depth (larger = nearer) and the
+    metric ones predict metres (larger = further). Every comparison below is
+    about which of two things is further from the lens, so the direction is
+    normalised once here instead of being re-derived, and got wrong, at each use.
+    """
+    return -depth if inverse else depth
+
+
+def body_reference(depth, boxes, inverse, disc_frac=0.10):
+    """The animals' own depth, read where the image is known to be animal.
+
+    The detector put a box round each cow, so the centre of that box is on the
+    animal. That single fact is the anchor, and it is deliberately the ONLY
+    thing assumed about which pixels are cattle.
+
+    It replaces an earlier rule that took the nearest mode of the depth
+    histogram to be the cattle. That is not true of this camera: the ceiling
+    mount is angled, so railings, feed barriers and pipework routinely sit
+    NEARER the lens than a cow's back, and the near mode is then hardware, not
+    an animal. The far end carries no such ambiguity, which is why the floor is
+    identified from that end and the cattle from the box centre.
+
+    A small disc is used rather than the single centre pixel so that one noisy
+    prediction cannot set the reference. Returns one depth per box, plus the
+    disc radius used.
+    """
+    h, w = depth.shape
+    refs = []
+    for b in boxes:
+        x1, y1, x2, y2 = (int(max(0, b[0])), int(max(0, b[1])),
+                          int(min(w, b[2])), int(min(h, b[3])))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        r = max(3, int(disc_frac * min(x2 - x1, y2 - y1)))
+        disc = depth[max(0, cy - r):min(h, cy + r + 1),
+                     max(0, cx - r):min(w, cx + r + 1)]
+        if disc.size:
+            refs.append(float(np.median(disc)))
+    return refs or None
+
+
+def ground_split(depth, inverse, boxes, spread, margin=0.05):
+    """Separate the cattle from the ground, anchored on what is actually known.
+
+    The floor is everything lying further from the lens than the animals by more
+    than `margin` of the crop's depth spread. Both ends are pinned by something
+    reliable: the animals' depth comes from the box centres, and "further than
+    that" is the direction in which an angled ceiling camera can only be looking
+    at ground.
+
+    Nothing is claimed about what sits NEARER than the cattle. Railings and feed
+    barriers live there, and they are not floor, so they are not put in the far
+    class — but they are not contact either, which the two-sided `body` reading
+    handles without needing to identify them.
+
+    Returns (floor, refs, separation, floor_share), or None when the box centres
+    give no usable reading. `floor_share` near zero means no ground is visible
+    in this crop, so the separation is not a body-to-floor distance and should
+    not be read as one.
+    """
+    refs = body_reference(depth, boxes, inverse)
+    if refs is None:
+        return None
+    f = farness(depth, inverse)
+    # Furthest of the two animals: a pixel only counts as ground when it is
+    # beyond BOTH, otherwise the further cow's own back is called floor.
+    ref_far = max(farness(np.float32(r), inverse) for r in refs)
+    floor = f > (ref_far + margin * spread)
+    if not floor.any():
+        return floor, refs, 0.0, 0.0
+    sep = float(np.median(f[floor]) - ref_far)
+    return floor, refs, sep, float(floor.mean())
 
 
 def nearest_value(mask, value):
@@ -107,7 +186,7 @@ def nearest_value(mask, value):
 DEPTH_STATS = ["body", "step", "pair"]
 
 
-def depth_stats(mi, mj, depth, spread):
+def depth_stats(mi, mj, depth, spread, inverse=True, boxes=None):
     """Three per-pixel depth readings, each in units of the crop's depth spread.
 
     Depth Anything V2 performs no amodal completion: it emits the range of the
@@ -115,12 +194,23 @@ def depth_stats(mi, mj, depth, spread):
     three readings below are therefore plain lookups into that one map — nothing
     here tries to recover an occluded surface, because nothing can.
 
-    body  |depth - median depth over the two masks|
-          How far this pixel sits from the animals' own body depth. The floor is
-          the far mode of an overhead crop, so this is what removes the pen
-          surface: the band's habit of running along the ground between two
-          animals, and of catching feet where they meet the floor. This is the
-          reading aimed at the failure that actually dominates.
+    body  distance from the NEARER of the two animals' own depths
+          How far this pixel sits from cattle depth, where that depth is read at
+          the box centres — the one place the detector guarantees is animal.
+          This removes the pen surface: the band's habit of running along the
+          ground between two animals, and of catching feet where they meet it.
+
+          Two-sided on purpose. Rejecting only what lies FURTHER than the cattle
+          would keep the railings and feed barriers that an angled ceiling
+          camera sees nearer than a cow's back, and those are not contact
+          either. Taking the smaller distance to either animal, rather than to
+          one pooled depth, keeps it right when one cow stands nearer than the
+          other.
+
+          Anchored neither on the masks (which would inherit their errors) nor
+          on the near mode of the histogram (which on this camera is as likely
+          to be hardware as an animal). Needs `boxes`; without them there is no
+          trustworthy anchor and the reading is not formed at all.
 
           It cannot distinguish a genuinely low contact from the floor, because
           there is nothing in a depth map that would: a head lowered to another
@@ -148,9 +238,9 @@ def depth_stats(mi, mj, depth, spread):
     """
     out = {}
 
-    both = ((mi > 0) | (mj > 0))
-    out["body"] = (np.abs(depth - float(np.median(depth[both]))) / spread
-                   if both.any() else None)
+    refs = body_reference(depth, boxes, inverse) if boxes is not None else None
+    out["body"] = (np.minimum.reduce([np.abs(depth - r) for r in refs]) / spread
+                   if refs else None)
 
     gx = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
@@ -206,7 +296,8 @@ def boundary(mask):
 
 
 def contact_readings(mi, mj, touch_px, dilate_px, strip_px,
-                     depth=None, spread=None, gates=None):
+                     depth=None, spread=None, gates=None, inverse=True,
+                     boxes=None):
     """Four candidate definitions of the contact region.
 
     `gates` is {stat name: tolerance}; a pixel survives only where every named
@@ -232,7 +323,7 @@ def contact_readings(mi, mj, touch_px, dilate_px, strip_px,
     }
 
     if depth is not None and gates:
-        stats_ = depth_stats(mi, mj, depth, spread)
+        stats_ = depth_stats(mi, mj, depth, spread, inverse, boxes)
         keep = None
         for name, tol in gates.items():
             s = stats_.get(name)
