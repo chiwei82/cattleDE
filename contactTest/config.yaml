@@ -46,6 +46,26 @@ labels:
   # the existing binary classifier. See README.md before changing this.
   exclude_positive_v2: []
 
+# ── Depth (Depth Anything V2) ─────────────────────────────────────────────────
+# The contact band is built from two silhouettes, which is an image-plane
+# statement only: from an overhead camera, two projections that meet may be
+# touching or may be a metre apart with one animal behind the other. Depth is
+# the axis that separates those, and it is the one thing tuning the dilation
+# radius can never supply.
+#
+# Written by precompute_depth.py; read by sam_contact_region.py when a tolerance
+# is supplied. Nothing outside contactTest/ is touched.
+depth:
+  cache_dir: log/depth_cache
+  encoder: vitl            # vits | vitb | vitl  (relative checkpoints)
+  # Tolerance is a fraction of the crop's own robust depth spread (2nd to 98th
+  # percentile), not an absolute distance: the relative checkpoints predict
+  # inverse depth up to an unknown scale, so only within-crop comparisons mean
+  # anything. Two surfaces count as "the same range" when they differ by less
+  # than this. Measure before trusting any value — score_contact reports whether
+  # the gate beats deleting the same number of pixels at random.
+  tol: 0.05
+
 # ── Contact-candidate region R_ij ─────────────────────────────────────────────
 region:
   # Dilation radius in pixels, applied AFTER letterboxing (i.e. in model input

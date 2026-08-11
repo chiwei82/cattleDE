@@ -46,7 +46,8 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from contactTest.sam_contact_region import contact_readings, load_masks
+from contactTest.sam_contact_region import (DEPTH_STATS, contact_readings,
+                                            depth_stats, load_depth, load_masks)
 from contactTest.src.data import load_records, relative_boxes, split_records
 from contactTest.src.utils import load_config
 
@@ -147,6 +148,12 @@ def main():
     ap.add_argument("--strip-px", type=int, default=6)
     ap.add_argument("--gt", default=None,
                     help="defaults to log/annotate/<split>/contact_gt.csv")
+    ap.add_argument("--depth-tol", default="0.05,0.10",
+                    help="comma-separated depth tolerances, as a fraction of the "
+                         "crop's depth spread. Empty string disables the depth "
+                         "section. Requires precompute_depth.py to have run")
+    ap.add_argument("--depth-reading", default="dilated", choices=ORDER,
+                    help="which contact region the depth gates are applied to")
     ap.add_argument("--check-only", action="store_true",
                     help="inspect the ground truth and stop. Needs no masks and "
                          "no torch, so an annotation pass can be verified before "
@@ -177,6 +184,17 @@ def main():
     fires = {n: [] for n in ORDER}         # per "no contact" crop: non-empty or not
     n_pts = n_none = missing_mask = missing_row = 0
 
+    tols = [float(t) for t in args.depth_tol.split(",") if t.strip()]
+    # Keyed by (stat, tolerance) for the single region named by --depth-reading.
+    # ("none", None) is the ungated band that every gated row is compared
+    # against; "all" is every gate applied together.
+    combos = [("none", None)] + [(st, t) for st in DEPTH_STATS + ["all"] for t in tols]
+    d_hits = {c: [] for c in combos}
+    d_area = {c: [] for c in combos}
+    d_frac = {c: [] for c in combos}
+    d_fires = {c: [] for c in combos}
+    n_depth = n_no_depth = n_no_stat = 0
+
     for rel, ann in gt.items():
         if ann["status"] == "skip":
             continue
@@ -195,6 +213,41 @@ def main():
         mi, mj = masks
         readings = contact_readings(mi, mj, args.touch_px, args.dilate_px,
                                     args.strip_px)
+
+        # The same rows scored again under each depth gate. The statistics do
+        # not depend on the tolerance, so they are computed once and
+        # thresholded rather than rebuilding the dilations for every setting.
+        dep = load_depth(record, bgr.shape[:2]) if tols else None
+        if tols:
+            n_depth += dep is not None
+            n_no_depth += dep is None
+        if dep is not None:
+            st = depth_stats(mi, mj, dep[0], dep[1])
+            n_no_stat += sum(v is None for v in st.values())
+            base = readings[args.depth_reading]
+            variants = {("none", None): base}
+            for tol in tols:
+                keep_all = None
+                for sname in DEPTH_STATS:
+                    if st.get(sname) is None:
+                        continue
+                    k = st[sname] <= tol
+                    variants[(sname, tol)] = base & k
+                    keep_all = k if keep_all is None else (keep_all & k)
+                if keep_all is not None:
+                    variants[("all", tol)] = base & keep_all
+            for key, reg in variants.items():
+                if ann["status"] == "none":
+                    d_fires[key].append(int(reg.any()))
+                    continue
+                if not ann["points"]:
+                    continue
+                d_area[key].append(int(reg.sum()))
+                d_frac[key].append(reg.sum() / float(bgr.shape[0] * bgr.shape[1]))
+                for (px, py) in ann["points"]:
+                    xx = int(np.clip(px, 0, bgr.shape[1] - 1))
+                    yy = int(np.clip(py, 0, bgr.shape[0] - 1))
+                    d_hits[key].append(int(bool(reg[yy, xx])))
 
         # Normaliser for the distances: the geometric mean of the two box
         # diagonals, so "20 px away" means the same thing on a near and a far
@@ -277,6 +330,67 @@ def main():
     print("            animal's scale, so near misses and wild ones separate")
     print("fires on none = crops marked 'no contact' where the region is not empty")
 
+    depth_summary = {}
+    if tols and n_depth:
+        if n_no_depth:
+            print(f"\n[depth] {n_no_depth} of {n_depth + n_no_depth} crops have no "
+                  "cached depth map and sit out the section below; run "
+                  "precompute_depth.py to cover them")
+        if n_no_stat:
+            print(f"[depth] {n_no_stat} statistics could not be formed (one "
+                  "silhouette lies wholly inside the other, leaving the hidden "
+                  "animal with no visible pixel to read a depth from)")
+
+        print(f"\nDEPTH GATES on '{args.depth_reading}' — {n_depth} crops")
+        print("  body  drop pixels far from the animals' body depth  -> FLOOR, FEET")
+        print("  step  drop pixels on a depth discontinuity          -> OCCLUSION EDGE")
+        print("  pair  drop pixels where the two animals are at different range")
+        print("  all   every gate at once\n")
+        print(f"{'gate':<7}{'tol':>7}{'hit rate':>10}{'area':>10}{'of crop':>9}"
+              f"{'lift':>8}{'selectivity':>13}{'fires on none':>15}")
+
+        h0 = float(np.mean(d_hits[("none", None)])) if d_hits[("none", None)] else 0.0
+        a0 = float(np.mean(d_area[("none", None)])) if d_area[("none", None)] else 0.0
+        for key in combos:
+            if not d_hits[key] and not d_fires[key]:
+                continue
+            hr = float(np.mean(d_hits[key])) if d_hits[key] else 0.0
+            ar = float(np.mean(d_area[key])) if d_area[key] else 0.0
+            # Mean, not median: a gate strong enough to empty the band on more
+            # than half the crops drives a median area to zero, which would
+            # report a region that is not empty as having infinite lift.
+            fr = float(np.mean(d_frac[key])) if d_frac[key] else 0.0
+            fo = float(np.mean(d_fires[key])) if d_fires[key] else float("nan")
+            # A gate deleting pixels at random would keep hits in the same
+            # proportion as area, so selectivity is 1 for a gate that carries no
+            # information about WHERE contact is.
+            sel = ((hr / h0) / (ar / a0)) if (h0 > 0 and a0 > 0 and ar > 0) \
+                else float("nan")
+            lift = (hr / fr) if fr > 0 else float("nan")
+            sname, tol = key
+            label = "-" if tol is None else f"{tol:.2f}"
+            depth_summary[f"{sname}@{label}"] = {
+                "hit_rate": hr, "area_px_mean": ar, "frac_of_crop": fr,
+                "lift": lift, "selectivity": sel, "fires_on_no_contact": fo}
+            liftxt = f"{lift:>7.0f}x" if np.isfinite(lift) else f"{'-':>8}"
+            selxt = f"{sel:>13.2f}" if np.isfinite(sel) else f"{'-':>13}"
+            print(f"{sname:<7}{label:>7}{hr:>9.0%}{ar:>9.0f}px{fr:>9.1%}"
+                  f"{liftxt}{selxt}{fo:>14.0%}")
+
+        print("\nselectivity = (share of hits kept) / (share of area kept).")
+        print("  1.00  the gate removed contact points at exactly the rate it")
+        print("        removed area — no better than deleting random pixels, so")
+        print("        depth added nothing and the smaller region is not a gain.")
+        print("  >1    the pixels it discarded were disproportionately NOT")
+        print("        contact. This is the only column that justifies a gate.")
+        print("  <1    worse than random: the gate is cutting away the right")
+        print("        pixels. For 'body' that means low contacts are being lost")
+        print("        along with the floor, which no depth map can separate.")
+        print("\n'fires on none' is the control. The ungated band is non-empty on")
+        print("100% of them, which is why it is a candidate region and not a")
+        print("detector. A gate that drives that down while holding selectivity")
+        print("above 1 has turned it into one.")
+
     best = max(ORDER, key=lambda n: (summary[n]["hit_rate"] or 0)
                - (summary[n]["frac_of_crop"] or 0))
     print(f"\n[score] highest hit rate for its size: {best}")
@@ -287,7 +401,10 @@ def main():
                        "contact_score.json")
     with open(out, "w") as f:
         json.dump({"split": args.split, "n_points": n_pts, "n_no_contact": n_none,
-                   "touch_px": args.touch_px, "readings": summary}, f, indent=2)
+                   "touch_px": args.touch_px, "dilate_px": args.dilate_px,
+                   "readings": summary, "depth_reading": args.depth_reading,
+                   "n_with_depth": n_depth, "depth_gates": depth_summary},
+                  f, indent=2)
     print(f"[score] wrote {out}")
 
 

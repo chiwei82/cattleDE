@@ -67,6 +67,133 @@ def load_masks(record, shape):
     return mi, mj
 
 
+def load_depth(record, shape):
+    """Cached Depth Anything V2 map for a pair as (depth, range), or None.
+
+    `range` is the robust 2nd-to-98th percentile spread of the map, which is what
+    a depth tolerance is quoted as a fraction of. The relative checkpoints
+    predict inverse depth up to an unknown scale and shift, so no absolute
+    meaning survives; a fraction of the spread WITHIN one crop does, and that is
+    the only comparison made.
+    """
+    if not record.get("depth_path"):
+        return None
+    data = np.load(record["depth_path"])
+    depth = data["depth"].astype(np.float32)
+    if depth.shape != shape:
+        depth = cv2.resize(depth, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
+    spread = float(data["p98"]) - float(data["p2"])
+    return depth, max(spread, 1e-6)
+
+
+def nearest_value(mask, value):
+    """For every pixel, `value` sampled at the nearest pixel inside `mask`.
+
+    The distance transform's DIST_LABEL_PIXEL labels are turned into a lookup by
+    reading each label at the mask pixel that owns it, which is exact and does
+    not rely on the order in which OpenCV enumerates them.
+    """
+    if not mask.any():
+        return None
+    _, lab = cv2.distanceTransformWithLabels(
+        (mask == 0).astype(np.uint8), cv2.DIST_L2, 5,
+        labelType=cv2.DIST_LABEL_PIXEL)
+    ys, xs = np.nonzero(mask)
+    lut = np.zeros(int(lab.max()) + 1, np.float32)
+    lut[lab[ys, xs]] = value[ys, xs]
+    return lut[lab]
+
+
+DEPTH_STATS = ["body", "step", "pair"]
+
+
+def depth_stats(mi, mj, depth, spread):
+    """Three per-pixel depth readings, each in units of the crop's depth spread.
+
+    Depth Anything V2 performs no amodal completion: it emits the range of the
+    VISIBLE surface at each pixel and has no notion that anything is hidden. All
+    three readings below are therefore plain lookups into that one map — nothing
+    here tries to recover an occluded surface, because nothing can.
+
+    body  |depth - median depth over the two masks|
+          How far this pixel sits from the animals' own body depth. The floor is
+          the far mode of an overhead crop, so this is what removes the pen
+          surface: the band's habit of running along the ground between two
+          animals, and of catching feet where they meet the floor. This is the
+          reading aimed at the failure that actually dominates.
+
+          It cannot distinguish a genuinely low contact from the floor, because
+          there is nothing in a depth map that would: a head lowered to another
+          animal's leg is at floor depth by definition. Watch selectivity.
+
+    step  |grad depth|, per pixel
+          Contact is where two surfaces MEET, so depth runs continuously across
+          the junction. Occlusion is where one surface passes in front of
+          another, which puts a step in the depth map at the silhouette edge.
+          The size of that step is the signal, and it is available precisely
+          because the model does not try to smooth occlusion away.
+
+    pair  |depth of the nearest exclusive pixel of i - the same for j|
+          Whether the two animals are at the same range at all. Unlike `step`
+          this fires over the whole interior of an occluding overlap rather than
+          only at its edge, which is the one thing the other two readings miss.
+          Each side is read from the part of that animal the other mask does not
+          cover: inside the intersection both masks contain the pixel, so
+          sampling either one there returns the same single value and the
+          difference would be identically zero — an occluding pair would score
+          as perfectly agreeing.
+
+    Returns None for a reading that cannot be formed, rather than a zero map that
+    would silently pass everything.
+    """
+    out = {}
+
+    both = ((mi > 0) | (mj > 0))
+    out["body"] = (np.abs(depth - float(np.median(depth[both]))) / spread
+                   if both.any() else None)
+
+    gx = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
+    # Sobel's 3x3 kernel carries a factor of 8 relative to a per-pixel slope.
+    out["step"] = np.sqrt(gx * gx + gy * gy) / (8.0 * spread)
+
+    out["pair"] = depth_disagreement(mi, mj, depth, spread)
+    return out
+
+
+def depth_disagreement(mi, mj, depth, spread):
+    """Per pixel: how far apart the two animals' surfaces are in depth, in units
+    of the crop's depth spread.
+
+    At a given pixel there is only one depth value, so comparing "the depth
+    there" against itself says nothing. The quantity that distinguishes contact
+    from occlusion is whether the two SURFACES are at the same range where their
+    silhouettes meet, so each animal's own depth is carried in from its nearest
+    mask pixel and the two are differenced. Touching animals agree; one passing
+    behind the other does not, however much their projections overlap.
+
+    Each depth is read from the part of that animal the OTHER mask does not
+    cover. This matters, and getting it wrong makes the gate useless precisely
+    where it is needed: inside the intersection both masks contain the pixel, so
+    sampling either mask there returns the same single value and the difference
+    is identically zero — an occluding pair would be scored as perfectly
+    agreeing. A depth map only ever holds the range of the FRONT surface, so the
+    occluded animal's depth is not observable inside the intersection at all and
+    has to be carried in from where that animal is actually visible.
+
+    Returns None when either animal has no exclusive region, i.e. one silhouette
+    lies entirely inside the other. There is then no independent reading of the
+    hidden animal and the honest answer is that depth cannot judge this pair.
+    """
+    mi_only = (mi > 0) & ~(mj > 0)
+    mj_only = (mj > 0) & ~(mi > 0)
+    di = nearest_value(mi_only.astype(np.uint8), depth)
+    dj = nearest_value(mj_only.astype(np.uint8), depth)
+    if di is None or dj is None:
+        return None
+    return np.abs(di - dj) / spread
+
+
 def distance_to(mask):
     """Distance from every pixel to the nearest pixel inside `mask`."""
     return cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 3)
@@ -78,8 +205,16 @@ def boundary(mask):
     return (mask.astype(bool) & ~er.astype(bool)).astype(np.uint8)
 
 
-def contact_readings(mi, mj, touch_px, dilate_px, strip_px):
-    """Four candidate definitions of the contact region."""
+def contact_readings(mi, mj, touch_px, dilate_px, strip_px,
+                     depth=None, spread=None, gates=None):
+    """Four candidate definitions of the contact region.
+
+    `gates` is {stat name: tolerance}; a pixel survives only where every named
+    reading of depth_stats is at or below its tolerance. Gating can only ever
+    REMOVE pixels, so it is worth keeping only if it removes area faster than it
+    removes true contact points — which is what score_contact measures, and is
+    not something to assume.
+    """
     di, dj = distance_to(mi), distance_to(mj)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1,) * 2)
     ks = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * strip_px + 1,) * 2)
@@ -89,12 +224,24 @@ def contact_readings(mi, mj, touch_px, dilate_px, strip_px):
     touch_j = (boundary(mj) > 0) & (di <= touch_px)
     surface = cv2.dilate((touch_i | touch_j).astype(np.uint8), ks) > 0
 
-    return {
+    out = {
         "overlap": (mi.astype(bool) & mj.astype(bool)),
         "gap": ((di + dj) <= touch_px),
         "surface": surface,
         "dilated": (cv2.dilate(mi, k) > 0) & (cv2.dilate(mj, k) > 0),
     }
+
+    if depth is not None and gates:
+        stats_ = depth_stats(mi, mj, depth, spread)
+        keep = None
+        for name, tol in gates.items():
+            s = stats_.get(name)
+            if s is None:
+                continue
+            keep = (s <= tol) if keep is None else (keep & (s <= tol))
+        if keep is not None:
+            out = {n: (r & keep) for n, r in out.items()}
+    return out
 
 
 def stats(name, region, mi, mj):

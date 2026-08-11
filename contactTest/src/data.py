@@ -121,6 +121,8 @@ def load_records(cfg, splits=None, require_label=True):
     # outside this folder.
     mask_dir = cfg["data"].get("mask_dir")
     mask_root = os.path.join(CONTACT_ROOT, mask_dir) if mask_dir else None
+    depth_dir = (cfg.get("depth") or {}).get("cache_dir")
+    depth_root = os.path.join(CONTACT_ROOT, depth_dir) if depth_dir else None
 
     records, missing, unlabelled = [], 0, 0
     with open(csv_path, newline="") as f:
@@ -152,10 +154,18 @@ def load_records(cfg, splits=None, require_label=True):
                 if os.path.exists(candidate):
                     mask_path = candidate
 
+            depth_path = None
+            if depth_root is not None:
+                candidate = os.path.join(depth_root,
+                                         os.path.splitext(rel_image)[0] + ".npz")
+                if os.path.exists(candidate):
+                    depth_path = candidate
+
             records.append({
                 "image_path": abs_image,
                 "rel_image": rel_image,
                 "mask_path": mask_path,
+                "depth_path": depth_path,
                 "bbox1": parse_bbox(row["bbox1_xyxy"]),
                 "bbox2": parse_bbox(row["bbox2_xyxy"]),
                 "merged": parse_bbox(row["merged_bbox_xyxy"]),

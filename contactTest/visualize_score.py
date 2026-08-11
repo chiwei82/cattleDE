@@ -30,7 +30,7 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from contactTest.sam_contact_region import contact_readings, load_masks
+from contactTest.sam_contact_region import contact_readings, load_depth, load_masks
 from contactTest.score_contact import read_gt
 from contactTest.src.data import load_records, relative_boxes, split_records
 from contactTest.src.utils import load_config
@@ -40,16 +40,25 @@ CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 C_HIT = (90, 220, 110)      # RGB
 C_MISS = (235, 90, 80)
 C_BAND = (120, 235, 130)
+C_CUT = (150, 120, 190)     # band pixels the depth gate removed
 C_I, C_J = (214, 120, 42), (52, 104, 235)
 
 
-def render(bgr, boxes, region, points, mi, mj):
-    """Crop, the two masks, the scored region, and each click marked hit or miss."""
+def render(bgr, boxes, region, points, mi, mj, cut=None):
+    """Crop, the two masks, the scored region, and each click marked hit or miss.
+
+    `cut` is the part of the ungated band that the depth gate discarded. It is
+    shaded separately so that what depth removed can be judged by eye: a gate
+    that is working takes away floor and occluded torso, and a gate that is not
+    takes away the place the animals actually meet.
+    """
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
 
     for m, c in ((mi, C_I), (mj, C_J)):
         sel = m > 0
         rgb[sel] = rgb[sel] * 0.82 + np.asarray(c, np.float32) * 0.18
+    if cut is not None and cut.any():
+        rgb[cut] = rgb[cut] * 0.62 + np.asarray(C_CUT, np.float32) * 0.38
     rgb[region] = rgb[region] * 0.55 + np.asarray(C_BAND, np.float32) * 0.45
     out = rgb.astype(np.uint8)
 
@@ -102,6 +111,12 @@ def main():
     ap.add_argument("--touch-px", type=int, default=10)
     ap.add_argument("--strip-px", type=int, default=6)
     ap.add_argument("--limit", type=int, default=60)
+    ap.add_argument("--depth-tol", type=float, default=None,
+                    help="apply the depth gates at this tolerance and shade what "
+                         "they removed. Needs precompute_depth.py")
+    ap.add_argument("--depth-gate", default="body",
+                    help="comma-separated gates to apply: body (floor and feet), "
+                         "step (occlusion edges), pair (animals at different range)")
     ap.add_argument("--gt", default=None)
     args = ap.parse_args()
 
@@ -118,7 +133,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     made, no_mask, total_hits, total_pts = [], 0, 0, 0
-    none_fired = none_total = 0
+    none_fired = none_total = no_depth = 0
 
     for rel, ann in gt.items():
         if ann["status"] == "skip":
@@ -137,11 +152,25 @@ def main():
         region = contact_readings(mi, mj, args.touch_px, args.dilate_px,
                                   args.strip_px)[args.reading]
 
+        cut = None
+        if args.depth_tol is not None:
+            dep = load_depth(record, bgr.shape[:2])
+            if dep is None:
+                no_depth += 1
+            else:
+                depth, spread = dep
+                gates = {s: args.depth_tol for s in args.depth_gate.split(",")
+                         if s.strip()}
+                gated = contact_readings(mi, mj, args.touch_px, args.dilate_px,
+                                         args.strip_px, depth, spread,
+                                         gates)[args.reading]
+                cut, region = region & ~gated, gated
+
         if ann["status"] == "none":
             none_total += 1
             none_fired += int(region.any())
             img, _ = render(bgr, relative_boxes(record, *bgr.shape[:2]),
-                            region, [], mi, mj)
+                            region, [], mi, mj, cut)
             frac = region.sum() / float(bgr.shape[0] * bgr.shape[1])
             made.append((-1.0, banner(img, [
                 ("MARKED 'NO CONTACT' - control", (150, 30, 30)),
@@ -152,7 +181,7 @@ def main():
         if not ann["points"]:
             continue
         img, hits = render(bgr, relative_boxes(record, *bgr.shape[:2]),
-                           region, ann["points"], mi, mj)
+                           region, ann["points"], mi, mj, cut)
         n = len(ann["points"])
         total_hits += hits
         total_pts += n
@@ -175,9 +204,12 @@ def main():
         cv2.imwrite(os.path.join(out_dir, f"{tag}_{i:03d}_{name}"),
                     cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
-    print(f"\n[vis] {args.reading} at dilate_px={args.dilate_px}")
+    print(f"\n[vis] {args.reading} at dilate_px={args.dilate_px}"
+          + (f", depth gate at {args.depth_tol}" if args.depth_tol is not None else ""))
     if no_mask:
         print(f"[vis] {no_mask} crops skipped for want of a cached mask")
+    if no_depth:
+        print(f"[vis] {no_depth} crops drawn ungated - no cached depth map")
     print(f"[vis] {total_hits}/{total_pts} clicks inside the region "
           f"({total_hits / max(total_pts, 1):.0%})")
     if none_total:
@@ -187,6 +219,10 @@ def main():
     print("[vis] green dot = click inside, red dot = outside with a line to the")
     print("      nearest band pixel. Files sort worst-first; 'none_*' are the")
     print("      control crops, which carry no clicks.")
+    if args.depth_tol is not None:
+        print("[vis] purple = band pixels the depth gate removed. Look at whether")
+        print("      those are floor and occluded torso, or the place the two")
+        print("      animals actually meet.")
 
 
 if __name__ == "__main__":
