@@ -78,6 +78,7 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from contactTest.precompute_masks import depth_prompts
 from contactTest.sam_contact_region import depth_stats, load_depth
 from contactTest.src.data import load_records, relative_boxes, split_records
 from contactTest.src.utils import load_config
@@ -100,7 +101,7 @@ class SamLogits:
         print(f"[sam] segment-anything {model_type} on {device}")
 
     def __call__(self, bgr, boxes, use_point=True, use_box=True, select="single",
-                 n_points=1, point_spread=0.25):
+                 n_points=1, point_spread=0.25, prompts=None):
         """Returns a list of full-resolution logit maps, one per box.
 
         A box alone only says "the object spans roughly this rectangle", and SAM
@@ -133,7 +134,13 @@ class SamLogits:
             kwargs = {"return_logits": True}
             if use_box:
                 kwargs["box"] = np.array([x1, y1, x2, y2], np.float32)[None]
-            if use_point or not use_box:
+            if prompts is not None:
+                # Depth-derived prompts replace the fixed pattern entirely: some
+                # of these carry label 0, which the pattern below cannot express.
+                pp, ll = prompts[len(out)]
+                kwargs["point_coords"] = np.asarray(pp, np.float32)
+                kwargs["point_labels"] = np.asarray(ll, np.int32)
+            elif use_point or not use_box:
                 # A point is mandatory without a box: some prompt must be given.
                 pts = _point_pattern(x1, y1, x2, y2, n_points, point_spread)
                 kwargs["point_coords"] = pts
@@ -457,6 +464,13 @@ def main():
                          "needs an outside to contrast against")
     ap.add_argument("--dilate-px", type=int, default=15,
                     help="radius for panel 3's green band")
+    ap.add_argument("--prompt-source", default="rgb",
+                    choices=["rgb", "depth_points"],
+                    help="depth_points adds NEGATIVE point prompts on the "
+                         "ground and on the other animal, so depth changes the "
+                         "SEGMENTATION in panels 2 and 3 rather than only "
+                         "filtering the band afterwards. Needs "
+                         "precompute_depth.py"),
     ap.add_argument("--depth-tol", type=float, default=None,
                     help="apply depth gates to panel 3's band at this "
                          "tolerance. Needs precompute_depth.py")
@@ -513,7 +527,11 @@ def main():
     out_dir = os.path.join(CONTACT_ROOT, "log", "sam_confusion", args.split)
     os.makedirs(out_dir, exist_ok=True)
     report = []
-    n_no_depth = 0
+    n_no_depth = n_floor_found = n_boxes_seen = 0
+    # Separate from the sampling rng so that adding depth prompts does not
+    # change WHICH pairs are drawn; the same --limit and seed give the same
+    # crops with and without them, which is what makes the two comparable.
+    prompt_rng = np.random.default_rng(int(cfg["random_seed"]))
 
     for i, record in enumerate(records):
         bgr = cv2.imread(record["image_path"])
@@ -521,10 +539,27 @@ def main():
             continue
         h, w = bgr.shape[:2]
         boxes = relative_boxes(record, h, w)
+
+        # Depth-derived prompts, when asked for. These change what SAM is told
+        # before it segments, so they move panels 2 and 3 themselves; the
+        # --depth-tol gate further down only filters the band afterwards. The
+        # two are independent and can be used together.
+        whole_prompts = None
+        if args.prompt_source == "depth_points":
+            dep_p = load_depth(record, bgr.shape[:2])
+            if dep_p is None:
+                n_no_depth += 1
+            else:
+                whole_prompts, used = depth_prompts(
+                    dep_p[0], dep_p[1], dep_p[2], boxes, prompt_rng)
+                n_floor_found += used
+                n_boxes_seen += len(boxes)
+
         try:
             li, lj = sam(bgr, boxes, use_point=not args.no_point,
                          select=args.mask_select, n_points=args.points,
-                         point_spread=args.point_spread)
+                         point_spread=args.point_spread,
+                         prompts=whole_prompts)
         except Exception as err:                   # noqa: BLE001
             print(f"[sam] failed on {record['rel_image']}: {err}")
             continue
@@ -700,6 +735,12 @@ def main():
           "confidently claim")
     print("      green outline = where the two dilated masks meet; "
           "white ring = the peak")
+    if args.prompt_source == "depth_points":
+        print(f"      SAM was prompted with depth: negative points on the "
+              "ground and on the other animal")
+        if n_boxes_seen:
+            print(f"      visible ground found in {n_floor_found}/{n_boxes_seen} "
+                  f"boxes ({n_floor_found / n_boxes_seen:.0%})")
     if args.depth_tol is not None:
         print(f"      purple outline = band pixels the depth gate "
               f"({args.depth_gate} at {args.depth_tol}) removed; the green "
