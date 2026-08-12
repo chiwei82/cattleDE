@@ -1,11 +1,18 @@
-"""Cluster-level evaluation of the contact region against clicked ground truth.
+"""Cluster-level evaluation of the SAM 3 contact region against clicked GT.
 
 Usage (from the repository root):
 
-    python -m contactTest.evaluate_contact --split train --dilate-px 22
-    python -m contactTest.evaluate_contact --split train --dilate-px 22 \\
+    python -m contactTest.evaluate_contact --split train --weights sam3.pt
+    python -m contactTest.evaluate_contact --split train --weights sam3.pt \\
         --depth-tol 0.10 --depth-gate pair
-    python -m contactTest.evaluate_contact --split train --no-images
+    python -m contactTest.evaluate_contact --split train --source cache \\
+        --mask-dir log/mask_cache          # the SAM 1 baseline, for comparison
+
+Runs the SAM 3 pipeline itself by default — concept prompt `--text cow`, then
+the returned instances assigned to the two detector boxes — so no mask cache has
+to exist first and there is no way to measure one segmenter while believing it
+is another. `--source cache` reads a prebuilt cache instead, which is how the
+SAM 1 baseline is put through exactly the same metrics.
 
 Writes to contactTest/log/evaluate/<split>/ only: one image per crop, a
 per-image CSV, and a summary JSON. The aggregate numbers are printed.
@@ -67,6 +74,7 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from contactTest.precompute_masks import _SAM3Text
 from contactTest.sam_contact_region import (contact_readings, depth_stats,
                                             load_depth, load_masks)
 from contactTest.score_contact import read_gt
@@ -211,11 +219,39 @@ def main():
                          "raising it improves FPPI by definition, so any value "
                          "above 0 must be reported alongside the number")
     ap.add_argument("--limit", type=int, default=0, help="0 = every annotated crop")
+    ap.add_argument("--source", default="sam3_text",
+                    choices=["sam3_text", "sam3_boxes", "cache"],
+                    help="sam3_text (default) runs SAM 3 concept segmentation "
+                         "here and now; sam3_boxes runs SAM 3 with box+point "
+                         "prompts; cache reads a prebuilt mask cache. This is "
+                         "what decides WHICH segmenter is measured, so it is "
+                         "echoed in the output")
+    ap.add_argument("--weights", default="sam3.pt")
+    ap.add_argument("--text", default="cow",
+                    help="noun phrase for concept segmentation")
+    ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--mask-dir", default=None,
+                    help="cache to read when --source cache, overriding "
+                         "data.mask_dir")
     ap.add_argument("--gt", default=None)
     ap.add_argument("--no-images", action="store_true")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.mask_dir:
+        cfg["data"]["mask_dir"] = args.mask_dir
+    mask_dir = cfg["data"].get("mask_dir")
+
+    seg = None
+    if args.source == "sam3_text":
+        seg = _SAM3Text(args.weights, args.text, args.conf)
+        source_label = f"SAM 3 concept prompt, text={args.text!r}"
+    elif args.source == "sam3_boxes":
+        from contactTest.visualize_sam3_confusion import Sam3Boxes
+        seg = Sam3Boxes(args.weights)
+        source_label = f"SAM 3 box+point prompts ({args.weights})"
+    else:
+        source_label = f"cached masks from {mask_dir}"
     gt_path = args.gt or os.path.join(CONTACT_ROOT, "log", "annotate", args.split,
                                       "contact_gt.csv")
     if not os.path.exists(gt_path):
@@ -242,12 +278,23 @@ def main():
         bgr = cv2.imread(record["image_path"])
         if bgr is None:
             continue
-        masks = load_masks(record, bgr.shape[:2])
-        if masks is None:
+        boxes = relative_boxes(record, *bgr.shape[:2])
+        if seg is None:
+            masks = load_masks(record, bgr.shape[:2])
+        else:
+            try:
+                got = (seg(bgr, boxes, path=record["image_path"])
+                       if args.source == "sam3_text" else seg(bgr, boxes)[0])
+                masks = ([(np.asarray(g) > 0.5).astype(np.uint8) for g in got]
+                         if got is not None else None)
+            except Exception as err:                   # noqa: BLE001
+                print(f"[eval] SAM 3 failed on {rel}: {err}")
+                masks = None
+        if masks is None or len(masks) < 2 or masks[0].sum() == 0 \
+                or masks[1].sum() == 0:
             no_mask += 1
             continue
-        mi, mj = masks
-        boxes = relative_boxes(record, *bgr.shape[:2])
+        mi, mj = masks[0], masks[1]
         region = contact_readings(mi, mj, args.touch_px, args.dilate_px,
                                   args.strip_px)[args.reading]
 
@@ -326,7 +373,11 @@ def main():
     hit_q = (sum(v * n for v, n in wq) / sum(n for _, n in wq)) if wq else float("nan")
 
     if no_mask:
-        print(f"[eval] {no_mask} crops skipped for want of a cached mask")
+        what = ("produced no usable pair of instances" if seg is not None
+                else "have no cached mask")
+        print(f"[eval] {no_mask} crops skipped: {what}. They are EXCLUDED from\n"
+              "       every number below, so a large count makes the rest\n"
+              "       optimistic - it is a success rate, not a neutral filter.")
     if no_depth:
         print(f"[eval] {no_depth} crops evaluated ungated - no cached depth map")
 
@@ -336,6 +387,7 @@ def main():
              if args.depth_tol is not None else ", no depth gate"))
     print(f"  {n_img} images ({len(scored)} annotated, {len(ctrl)} controls), "
           f"{tot_pts} GT points")
+    print(f"  masks: {source_label}")
     print(f"{'=' * 62}\n")
     print(f"  1  Sensitivity   {sensitivity:>9.3f}   {tot_cov}/{tot_pts} points covered")
     print(f"  2  FPPI          {fppi:>9.3f}   {tot_fp} empty clusters / {n_img} images")
@@ -376,6 +428,8 @@ def main():
             wtr.writerow({k: r.get(k, "") for k in keys})
 
     summary = {"split": args.split, "reading": args.reading,
+               "source": args.source, "source_label": source_label,
+               "n_skipped": no_mask,
                "dilate_px": args.dilate_px, "gt_disc_radius_px": gt_radius,
                "depth_tol": args.depth_tol,
                "depth_gate": args.depth_gate if args.depth_tol is not None else None,
