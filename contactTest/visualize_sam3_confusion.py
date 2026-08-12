@@ -24,10 +24,14 @@ point, five points, depth-derived negative points — works around that.
 
 SAM 3 takes the concept itself. `--text cow` asks for cattle, so the floor is
 not a candidate answer at all, and promptable concept segmentation returns every
-instance with its own identity rather than one mask per prompt. The returned
-instances are assigned to the two detector boxes by mask/box IoU (reusing the
-tested assignment in precompute_masks), because a pair crop routinely holds a
-third animal at its edge.
+instance with its own identity rather than one mask per prompt.
+
+Those instances come back in no particular order, and nothing in them says which
+belongs to bbox1 and which to bbox2, so they are assigned to the two detector
+boxes by mask/box IoU (reusing the assignment in precompute_masks). The
+assignment is for identity, not for filtering out extra animals. It is greedy
+without replacement because the pair filter keeps only boxes overlapping by
+IoU > 0.1, so choosing independently could give the same animal to both.
 
 The two panels built from UNCERTAINTY cannot be carried over unchanged. The SAM
 1 script asks the predictor for raw logits and reads

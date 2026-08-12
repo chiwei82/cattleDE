@@ -86,14 +86,21 @@ class _SAM3Text:
     prompts are all ways of steering that. SAM 3 accepts the concept itself, so
     the floor is not a candidate answer in the first place.
 
-    Promptable concept segmentation returns EVERY instance of the concept in the
-    image with its own identity, not one mask per prompt. A pair crop can hold a
-    third animal at its edge, so the returned instances are assigned to the two
-    detector boxes by mask/box IoU, greedily and without replacement, and a pair
-    is rejected if either box finds nothing. That assignment is the one piece
-    here with no counterpart in the box-prompted path, and it is where this
-    backend can go wrong: check a sample with compare_masks.py before trusting a
-    whole cache of it.
+    Promptable concept segmentation returns EVERY instance of the concept with
+    its own identity, in no particular order, rather than one mask per prompt.
+    Nothing in that output says which instance belongs to bbox1 and which to
+    bbox2, so the returned instances are assigned to the two detector boxes by
+    mask/box IoU and a pair is rejected if either box finds nothing. That is the
+    whole reason the assignment exists: identity, not filtering.
+
+    The assignment is greedy WITHOUT replacement because the pair filter keeps
+    only boxes overlapping by IoU > 0.1. The two boxes therefore always overlap,
+    and picking the best instance for each independently could hand the same
+    animal to both.
+
+    This step is the one piece here with no counterpart in the box-prompted
+    path, and it is where this backend can go wrong: check a sample with
+    compare_masks.py before trusting a whole cache of it.
     """
 
     def __init__(self, weights, text="cow", conf=0.25):
