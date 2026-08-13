@@ -23,7 +23,7 @@ undifferentiated set of pixels: a cluster is a candidate contact site, so a
 region made of one blob on the right animals and four scattered on the railing
 is not the same result as a single blob, even though both have the same hit rate.
 
-THE FIVE METRICS
+THE SIX METRICS
 
   1  Sensitivity = GT points covered by any cluster / all GT points
      Pooled over points, not averaged over images, so a crop with 20 clicks
@@ -59,6 +59,17 @@ THE FIVE METRICS
      --gt-dilate-scale x dilate_px (0.5 x by default), and the denominator is
      the area of their UNION within that image, so overlapping clicks are not
      counted twice. Set --gt-dilate-px to give the radius in pixels instead.
+
+  6  Blind area = pixels in clusters covering no GT point / all predicted pixels
+     The pixel-weighted counterpart of FPPI. FPPI counts how many places are
+     wrongly proposed; this is how much of the prediction they consume. One
+     huge blind blob and ten blind specks score the same FPPI and very
+     different blind area, and they are different problems: the first wastes
+     the budget, the second is noise.
+
+     Pooled over all pixels in all images, matching "total proposed area".
+     The per-image ratio is in the CSV as blind_frac. Control images
+     contribute all of their area, since none of it can cover a point.
 
 Everything is reported per image as well, in evaluation.csv.
 """
@@ -127,6 +138,14 @@ def evaluate_one(region, points, shape, gt_radius):
     area = float(region.sum())
     a_i = area / float(h * w)
 
+    # Metric 6. Area of the clusters covering no GT point at all. FPPI counts
+    # how MANY places are wrongly proposed; this is how much of the prediction
+    # they consume, which is a different failure: one huge blind blob and ten
+    # specks give the same FPPI and very different blind area.
+    sizes_all = np.bincount(lab.ravel(), minlength=n_lab).astype(float)
+    blind = float(sum(sizes_all[c] for c in range(1, n_lab)
+                      if c not in hitting))
+
     rec = {
         "n_points": len(points),
         "n_covered": len(covered),
@@ -137,14 +156,15 @@ def evaluate_one(region, points, shape, gt_radius):
         "a_i": a_i,
         "lift": ((len(covered) / len(points)) / a_i)
                 if points and a_i > 0 else float("nan"),
+        "blind_area_px": int(blind),
+        "blind_frac": (blind / area) if area > 0 else float("nan"),
     }
 
     # Metric 5. Denominator is the union of the GT discs in this image, so two
     # clicks a few pixels apart do not inflate it.
     if covered:
         gt_area = float(gt_disc_mask((h, w), points, gt_radius).sum())
-        sizes = np.bincount(lab.ravel(), minlength=n_lab).astype(float)
-        q = [sizes[c] / gt_area for c in covered] if gt_area > 0 else []
+        q = [sizes_all[c] / gt_area for c in covered] if gt_area > 0 else []
         rec["hit_quality"] = float(np.mean(q)) if q else float("nan")
         rec["gt_disc_px"] = int(gt_area)
     else:
@@ -365,6 +385,10 @@ def main():
     a_bar = float(np.mean([r["a_i"] for r in rows]))
     lift = sensitivity / a_bar if a_bar > 0 else float("nan")
 
+    tot_area = sum(r["area_px"] for r in rows)
+    tot_blind = sum(r["blind_area_px"] for r in rows)
+    blind_frac = tot_blind / tot_area if tot_area else float("nan")
+
     q = [r["hit_quality"] for r in rows if np.isfinite(r["hit_quality"])]
     # Weighted by covered points so the mean is over MEASUREMENTS, matching the
     # per-point definition, rather than over images.
@@ -395,6 +419,8 @@ def main():
     print(f"  4  Lift          {lift:>9.1f}   Sensitivity / a-bar")
     print(f"  5  Hit quality   {hit_q:>9.2f}   cluster area / GT disc area "
           f"(r={gt_radius}px)")
+    print(f"  6  Blind area    {blind_frac:>9.3f}   {tot_blind}/{tot_area} px in "
+          "clusters covering no GT")
 
     if ctrl:
         c_fp = sum(r["n_fp_clusters"] for r in ctrl)
@@ -406,6 +432,15 @@ def main():
         print("  it measures firing when it should not fire at all, which is a "
               "different fault")
         print("  from firing in the wrong place.")
+
+    if np.isfinite(blind_frac):
+        print(f"\n  Blind area {blind_frac:.1%} of everything predicted sits in "
+              "clusters that")
+        print("  cover no GT point. Read it with FPPI: the same FPPI with a low "
+              "blind")
+        print("  area means the wrong proposals are small, with a high one means "
+              "they are")
+        print("  eating the budget that a-bar charges for.")
 
     if np.isfinite(hit_q):
         print(f"\n  Hit quality {hit_q:.2f} means the cluster that found a contact "
@@ -420,7 +455,7 @@ def main():
     per = os.path.join(out_dir, "evaluation.csv")
     keys = ["rel_image", "is_control", "n_points", "n_covered", "sensitivity",
             "n_clusters", "n_fp_clusters", "area_px", "a_i", "lift",
-            "hit_quality", "gt_disc_px"]
+            "hit_quality", "gt_disc_px", "blind_area_px", "blind_frac"]
     with open(per, "w", newline="") as f:
         wtr = csv.DictWriter(f, fieldnames=keys)
         wtr.writeheader()
@@ -436,7 +471,9 @@ def main():
                "min_cluster_px": args.min_cluster_px,
                "n_images": n_img, "n_controls": len(ctrl), "n_points": tot_pts,
                "sensitivity": sensitivity, "fppi": fppi, "a_bar": a_bar,
-               "lift": lift, "hit_quality": hit_q}
+               "lift": lift, "hit_quality": hit_q,
+               "blind_area_frac": blind_frac,
+               "blind_area_px": tot_blind, "total_area_px": tot_area}
     with open(os.path.join(out_dir, "evaluation.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
