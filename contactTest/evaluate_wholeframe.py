@@ -168,6 +168,10 @@ def main():
     ap.add_argument("--depth-gate", default="pair")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--gt", default=None)
+    ap.add_argument("--match-iou", type=float, default=0.3,
+                    help="least IoU between a SAM 3 instance box and a detector "
+                         "box before that animal counts as segmented, for the "
+                         "pair-reconstruction diagnostic only")
     ap.add_argument("--no-images", action="store_true")
     args = ap.parse_args()
 
@@ -239,7 +243,7 @@ def main():
     out_dir = os.path.join(CONTACT_ROOT, "log", "wholeframe", args.split)
     os.makedirs(out_dir, exist_ok=True)
 
-    rows, failed = [], 0
+    rows, diag, failed = [], [], 0
     det_yolo, det_sam3, pair_yolo, pair_sam3 = [], [], [], []
 
     for (video, fno), items in sorted(frames.items()):
@@ -282,6 +286,25 @@ def main():
         det_sam3.append(len(inst))
         pair_sam3.append(len(pairs))
         pair_yolo.append(n_yolo_pairs)
+
+        # Why a frame scores badly splits three ways, and only a direct check
+        # separates them: SAM 3 never segmented one of the two animals; it did,
+        # but their MASK boxes are tighter than the detector boxes and the IoU
+        # fell outside the pairing rule, so the pair was never proposed; or the
+        # pair was proposed and the band simply missed. Without this the first
+        # two are invisible and the method looks worse than its segmentation is.
+        for rel, ann, rec in items:
+            b1, b2 = rec["bbox1"], rec["bbox2"]
+            i1 = max(range(len(boxes3)), key=lambda k: box_iou(boxes3[k], b1))
+            i2 = max(range(len(boxes3)), key=lambda k: box_iou(boxes3[k], b2))
+            m1, m2 = box_iou(boxes3[i1], b1), box_iou(boxes3[i2], b2)
+            matched = (m1 >= args.match_iou and m2 >= args.match_iou and i1 != i2)
+            pair_iou = box_iou(boxes3[i1], boxes3[i2]) if i1 != i2 else 1.0
+            formed = matched and (args.iou_low < pair_iou < args.iou_high)
+            diag.append({"rel_image": rel, "match_iou_1": m1, "match_iou_2": m2,
+                         "same_instance": int(i1 == i2), "matched": int(matched),
+                         "pair_iou": pair_iou, "pair_formed": int(formed),
+                         "yolo_pair_iou": box_iou(b1, b2)})
 
         # GT points, mapped out of every annotated crop in this frame.
         points, scope = [], np.zeros((H, W), bool)
@@ -403,6 +426,41 @@ def main():
     print(f"  5  Hit quality   {hit_q:>9.2f}   (GT discs r={gt_radius}px)")
     print(f"  6  Blind area    {blind:>9.3f}   {tot_blind}/{tot_area} px")
 
+    if diag:
+        n = len(diag)
+        # Order matters. A cow SAM 3 never segmented leaves its box matching
+        # whatever else is nearest, which is often the other cow's instance, so
+        # testing "same instance" first would file a missed animal as a merge.
+        # Poor match quality is therefore checked before anything else.
+        def _cls(d):
+            if min(d["match_iou_1"], d["match_iou_2"]) < args.match_iou:
+                return "unsegmented"
+            if d["same_instance"]:
+                return "merged"
+            return "formed" if d["pair_formed"] else "outrange"
+        kinds = [_cls(d) for d in diag]
+        formed = kinds.count("formed")
+        outrange = kinds.count("outrange")
+        same = kinds.count("merged")
+        nomatch = kinds.count("unsegmented")
+        print(f"\n  Could SAM 3 have reproduced the annotated pair at all?"
+              f"   ({n} annotated pairs)")
+        print(f"    pair formed by the same rule   {formed:>4}  {formed / n:>5.0%}")
+        print(f"    both animals found, IoU outside {args.iou_low}-{args.iou_high}"
+              f"   {outrange:>3}  {outrange / n:>5.0%}")
+        print(f"    the two boxes matched ONE instance {same:>3}  {same / n:>5.0%}"
+              "   (SAM 3 merged them)")
+        print(f"    an animal not segmented at all  {nomatch:>4}  {nomatch / n:>5.0%}"
+              f"   (best IoU < {args.match_iou})")
+        pi = np.array([d["pair_iou"] for d in diag], float)
+        yi = np.array([d["yolo_pair_iou"] for d in diag], float)
+        print(f"    median IoU between the two SAM 3 mask boxes  {np.median(pi):.3f}")
+        print(f"    median IoU between the two DETECTOR boxes    {np.median(yi):.3f}")
+        if np.median(pi) < np.median(yi):
+            print("    Mask boxes hug the animal, so they overlap less than the")
+            print("    detector boxes did. The pairing threshold was chosen for")
+            print("    detector boxes and does not transfer unchanged.")
+
     print(f"\n  Detector stage, same frames:")
     print(f"    SAM 3 found  {np.mean(det_sam3):.1f} cattle per frame "
           f"-> {np.mean(pair_sam3):.1f} pairs at {args.iou_low}-{args.iou_high} IoU")
@@ -436,6 +494,11 @@ def main():
         wtr.writeheader()
         for r in rows:
             wtr.writerow({k: r.get(k, "") for k in keys})
+    if diag:
+        with open(os.path.join(out_dir, "pair_recall.csv"), "w", newline="") as f:
+            wtr = csv.DictWriter(f, fieldnames=list(diag[0].keys()))
+            wtr.writeheader()
+            wtr.writerows(diag)
     with open(os.path.join(out_dir, "wholeframe.json"), "w") as f:
         json.dump({"split": args.split, "scope": args.scope, "text": args.text,
                    "iou_low": args.iou_low, "iou_high": args.iou_high,
