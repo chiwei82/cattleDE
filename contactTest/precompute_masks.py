@@ -123,7 +123,13 @@ class _SAM3Text:
         union = float(mask.sum()) + (x2 - x1) * (y2 - y1) - inter
         return inter / max(union, 1.0)
 
-    def __call__(self, bgr, boxes, use_point=True, prompts=None, path=None):
+    def instances(self, bgr, path=None):
+        """Every instance of the concept in the image, unassigned.
+
+        Split out from __call__ because the whole-frame control needs the raw
+        instances — it has no detector boxes to assign them to, that being the
+        point of it.
+        """
         # set_image is documented with a path; an array works in the ultralytics
         # predictors, and the path is preferred when we have one so that any
         # internal preprocessing matches the documented behaviour exactly.
@@ -131,7 +137,7 @@ class _SAM3Text:
         results = self.predictor(text=[self.text])
         masks = getattr(results[0], "masks", None)
         if masks is None or masks.data is None or len(masks.data) == 0:
-            return None
+            return []
 
         inst = []
         for m in masks.data:
@@ -140,6 +146,12 @@ class _SAM3Text:
                 a = cv2.resize(a, (bgr.shape[1], bgr.shape[0]),
                                interpolation=cv2.INTER_NEAREST)
             inst.append(a)
+        return inst
+
+    def __call__(self, bgr, boxes, use_point=True, prompts=None, path=None):
+        inst = self.instances(bgr, path)
+        if not inst:
+            return None
 
         # Greedy assignment over the full IoU matrix: take the best box/instance
         # pair, remove both, repeat. With two boxes this is optimal.
