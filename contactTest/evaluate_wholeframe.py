@@ -2,8 +2,7 @@
 
 Usage (from the repository root):
 
-    python -m contactTest.evaluate_wholeframe --split train --weights sam3.pt \\
-        --video-root /user/work/sf24225/data/Full_behav/Marco
+    python -m contactTest.evaluate_wholeframe --split train --weights sam3.pt
     python -m contactTest.evaluate_wholeframe --split train --weights sam3.pt \\
         --scope frame          # unrestricted, and biased - see below
     python -m contactTest.evaluate_wholeframe --split train --weights sam3.pt \\
@@ -68,11 +67,6 @@ from contactTest.src.data import load_records, split_records
 from contactTest.src.utils import load_config
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
-
-# Default from global_config.yaml paths.data_root. Duplicated rather than
-# imported so contactTest stays self-contained; the videos are only ever read.
-DEFAULT_VIDEO_ROOT = "/user/work/sf24225/data/Full_behav/Marco"
-
 
 def box_iou(a, b):
     ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
@@ -146,13 +140,17 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="train", choices=["train", "val", "test"])
-    ap.add_argument("--video-root", default=DEFAULT_VIDEO_ROOT)
+    ap.add_argument("--video-root", default=None,
+                    help="default: data.video_dir from config.yaml, which "
+                         "mirrors interaction_prep.video_dir of "
+                         "global_config.yaml. The search is recursive")
     ap.add_argument("--weights", default="sam3.pt")
     ap.add_argument("--text", default="cow")
     ap.add_argument("--conf", type=float, default=0.25)
-    ap.add_argument("--iou-low", type=float, default=0.1,
-                    help="pairing rule, matching prep/interaction_prep.py")
-    ap.add_argument("--iou-high", type=float, default=0.8)
+    ap.add_argument("--iou-low", type=float, default=None,
+                    help="pairing rule; default is data.pair_iou_low from "
+                         "config.yaml, which mirrors the value prep used")
+    ap.add_argument("--iou-high", type=float, default=None)
     ap.add_argument("--scope", default="annotated", choices=["annotated", "frame"],
                     help="annotated (default) scores only inside the merged boxes "
                          "of the annotated pairs, which is the only like-for-like "
@@ -174,6 +172,18 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    # Taken from config rather than hardcoded: the path and the pair rule are
+    # recorded in global_config.yaml and mirrored there, so a hand-copied value
+    # in this file is one more thing that can silently fall out of step - which
+    # is exactly how an earlier version ended up pointing at the wrong folder.
+    if args.video_root is None:
+        args.video_root = cfg["data"].get("video_dir")
+        if not args.video_root:
+            raise SystemExit("no data.video_dir in config.yaml; pass --video-root")
+    if args.iou_low is None:
+        args.iou_low = float(cfg["data"].get("pair_iou_low", 0.1))
+    if args.iou_high is None:
+        args.iou_high = float(cfg["data"].get("pair_iou_high", 0.8))
     gt_path = args.gt or os.path.join(CONTACT_ROOT, "log", "annotate", args.split,
                                       "contact_gt.csv")
     if not os.path.exists(gt_path):
@@ -198,18 +208,33 @@ def main():
     gt_radius = (args.gt_dilate_px if args.gt_dilate_px is not None
                  else max(1, int(round(args.gt_dilate_scale * args.dilate_px))))
 
+    # Resolve the videos FIRST. SAM 3's checkpoint is 3.45 GB, so discovering a
+    # bad path after loading it wastes the whole GPU allocation.
+    src = FrameSource(args.video_root)
+    needed = {os.path.splitext(v)[0] for (v, _) in frames}
+    missing = sorted(needed - set(src.index))
+    if missing:
+        found = sorted(src.index)[:6]
+        raise SystemExit(
+            f"{len(missing)} of {len(needed)} videos not found under "
+            f"{args.video_root}\n"
+            "  missing: " + ", ".join(missing[:4])
+            + (" ..." if len(missing) > 4 else "") + "\n"
+            + (f"  {len(src.index)} video(s) WERE found there, e.g. "
+               + ", ".join(found) + "\n" if src.index
+               else "  no video files at all were found there\n")
+            + "The search is recursive, so give the parent directory of the "
+              "batch folders,\n"
+              "e.g. --video-root /user/work/sf24225/data/Full_behav\n"
+              "Quote it if the path contains spaces.")
+    print(f"[wf] {len(needed)} videos resolved under {args.video_root}")
+
     try:
         from contactTest.precompute_masks import _SAM3Text
         seg = _SAM3Text(args.weights, args.text, args.conf)
     except Exception as err:                       # noqa: BLE001
         raise SystemExit(f"could not load SAM 3 ({err}). See visualize_sam3_"
                          "confusion.py for the install and access steps.")
-
-    src = FrameSource(args.video_root)
-    if not src.index:
-        raise SystemExit(f"no videos found under {args.video_root}\n"
-                         "pass --video-root; the crops were cut from video, not "
-                         "from stored frames, so the frames must be decoded")
 
     out_dir = os.path.join(CONTACT_ROOT, "log", "wholeframe", args.split)
     os.makedirs(out_dir, exist_ok=True)

@@ -34,6 +34,21 @@ data:
   # Weights for precompute_masks.py; ultralytics downloads this on first use.
   sam_weights: sam_b.pt
 
+  # Source videos, for evaluate_wholeframe.py. The crops were cut straight from
+  # video rather than from stored frames, so the whole-frame control has to
+  # decode them; `frame_number` in the CSV is the raw decoder index, so seeking
+  # is exact. The search is recursive, so the parent of the batch folders works
+  # and the spaces in their names never have to be typed.
+  #
+  # Mirrors interaction_prep.video_dir of global_config.yaml, and the pair rule
+  # below mirrors interaction_prep.iou_low / iou_high. Duplicated rather than
+  # imported so contactTest stays self-contained, exactly as the pose block is.
+  # Read-only. If prep is ever re-run against different footage, these are the
+  # two entries that have to be brought back into step.
+  video_dir: "/user/work/sf24225/data/Full_behav/Videos to process batch 1 - social contacts"
+  pair_iou_low: 0.1
+  pair_iou_high: 0.8
+
 # ── Label mapping ─────────────────────────────────────────────────────────────
 # Mirrors the rule already used by train/interaction_with_image.py so that this
 # experiment trains on exactly the same rows as the stage-2 classifier.
