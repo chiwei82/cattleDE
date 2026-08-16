@@ -139,7 +139,50 @@ class FrameSource:
                 if os.path.splitext(f)[1].lower() in (".mp4", ".avi", ".mov", ".mkv"):
                     self.index.setdefault(os.path.splitext(f)[0], os.path.join(dirpath, f))
 
+    def frames_for(self, source_video, wanted):
+        """Yield (frame_number, frame) decoding exactly as prep did.
+
+        interaction_prep never seeked. It read the file straight through and
+        counted successful cap.read() calls, storing that counter as
+        `frame_number`. Reproducing it means counting the same way, which makes
+        the mapping exact by construction instead of something to verify.
+
+        cap.set(CAP_PROP_POS_FRAMES, n) addresses a DIFFERENT quantity — the
+        decoder's own position — and the two diverge whenever the container has
+        dropped or reordered frames, quite apart from long-GOP H.264 seeks
+        landing on a neighbouring keyframe. Either way the box then gets drawn
+        over animals that have moved.
+
+        One pass per video serves every frame wanted from it, so this costs a
+        single sequential decode rather than one seek per frame.
+        """
+        stem = os.path.splitext(source_video)[0]
+        path = self.index.get(stem)
+        if path is None:
+            return
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            return
+        want = set(int(w) for w in wanted)
+        remaining = len(want)
+        idx = 0
+        while remaining > 0:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx in want:
+                yield idx, frame
+                remaining -= 1
+            idx += 1
+        cap.release()
+
     def get(self, source_video, frame_number):
+        """Random access by seeking. APPROXIMATE — see frames_for().
+
+        Kept for check_frame_mapping, which needs to probe arbitrary offsets.
+        Not used for the main pass, because a seek does not address the same
+        quantity prep counted.
+        """
         stem = os.path.splitext(source_video)[0]
         path = self.index.get(stem)
         if path is None:
@@ -305,182 +348,204 @@ def main():
     rows, diag, failed = [], [], 0
     det_yolo, det_sam3, pair_yolo, pair_sam3 = [], [], [], []
 
-    for (video, fno), items in sorted(frames.items()):
-        if args.limit and len(rows) >= args.limit:
+    # Grouped by video so each file is decoded ONCE, straight through, exactly
+    # as prep read it. Ordering within a video follows the frame counter, which
+    # is the order the sequential reader emits.
+    by_video = collections.defaultdict(list)
+    for (video, fno) in frames:
+        by_video[video].append(fno)
+
+    stop = False
+    for video in sorted(by_video):
+        if stop:
             break
-        frame, err = src.get(video, fno)
-        if frame is None:
-            print(f"[wf] {video} frame {fno}: {err}")
-            failed += 1
-            continue
-        H, W = frame.shape[:2]
+        wanted = sorted(by_video[video])
+        seen = 0
+        for fno, frame in src.frames_for(video, wanted):
+            seen += 1
 
-        try:
-            inst = seg.instances(frame)
-        except Exception as err:                   # noqa: BLE001
-            print(f"[wf] SAM 3 failed on {video} frame {fno}: {err}")
-            failed += 1
-            continue
-        if not inst or len(inst) < 2:
-            failed += 1
-            continue
+            items = frames[(video, fno)]
+            if args.limit and len(rows) >= args.limit:
+                stop = True
+                break
+            H, W = frame.shape[:2]
 
-        boxes3 = [mask_box(m) for m in inst]
-        keep = [k for k, b in enumerate(boxes3) if b is not None]
-        inst = [inst[k] for k in keep]
-        boxes3 = [boxes3[k] for k in keep]
+            try:
+                inst = seg.instances(frame)
+            except Exception as err:                   # noqa: BLE001
+                print(f"[wf] SAM 3 failed on {video} frame {fno}: {err}")
+                failed += 1
+                continue
+            if not inst or len(inst) < 2:
+                failed += 1
+                continue
 
-        if args.pairs_from == "sam3":
-            if args.pair_by == "box_iou":
-                # Exactly the rule the detector stage used. Kept as the default
-                # so this arm stays comparable with the crop pipeline, but see
-                # mask_gap(): the rule discards touching pairs.
-                pairs = [(i, j) for i in range(len(inst))
-                         for j in range(i + 1, len(inst))
-                         if args.iou_low < box_iou(boxes3[i], boxes3[j])
-                         < args.iou_high]
+            boxes3 = [mask_box(m) for m in inst]
+            keep = [k for k, b in enumerate(boxes3) if b is not None]
+            inst = [inst[k] for k in keep]
+            boxes3 = [boxes3[k] for k in keep]
+
+            if args.pairs_from == "sam3":
+                if args.pair_by == "box_iou":
+                    # Exactly the rule the detector stage used. Kept as the default
+                    # so this arm stays comparable with the crop pipeline, but see
+                    # mask_gap(): the rule discards touching pairs.
+                    pairs = [(i, j) for i in range(len(inst))
+                             for j in range(i + 1, len(inst))
+                             if args.iou_low < box_iou(boxes3[i], boxes3[j])
+                             < args.iou_high]
+                else:
+                    pairs = []
+                    for i in range(len(inst)):
+                        for j in range(i + 1, len(inst)):
+                            g = mask_gap(inst[i], inst[j])
+                            if g is not None and g <= args.pair_gap_px:
+                                pairs.append((i, j))
             else:
+                # The DETECTOR's pairs, reused verbatim: SAM 3's whole-frame
+                # instances are matched to bbox1 and bbox2 of each annotated pair.
+                # This is the arm that isolates the crop. With `sam3` the two arms of
+                # TODO 1 differ in two ways at once — cropped or not, AND whose boxes
+                # define a pair — so a gap between them cannot be attributed to
+                # either. Here the detector is held fixed and the only remaining
+                # difference from evaluate_contact is whether SAM 3 saw the whole
+                # frame or just the crop.
                 pairs = []
-                for i in range(len(inst)):
-                    for j in range(i + 1, len(inst)):
-                        g = mask_gap(inst[i], inst[j])
-                        if g is not None and g <= args.pair_gap_px:
-                            pairs.append((i, j))
-        else:
-            # The DETECTOR's pairs, reused verbatim: SAM 3's whole-frame
-            # instances are matched to bbox1 and bbox2 of each annotated pair.
-            # This is the arm that isolates the crop. With `sam3` the two arms of
-            # TODO 1 differ in two ways at once — cropped or not, AND whose boxes
-            # define a pair — so a gap between them cannot be attributed to
-            # either. Here the detector is held fixed and the only remaining
-            # difference from evaluate_contact is whether SAM 3 saw the whole
-            # frame or just the crop.
-            pairs = []
+                for rel, ann, rec in items:
+                    b1, b2 = rec["bbox1"], rec["bbox2"]
+                    i1 = max(range(len(boxes3)), key=lambda k: box_iou(boxes3[k], b1))
+                    i2 = max(range(len(boxes3)), key=lambda k: box_iou(boxes3[k], b2))
+                    if i1 != i2 and min(box_iou(boxes3[i1], b1),
+                                        box_iou(boxes3[i2], b2)) >= args.match_iou:
+                        pairs.append((i1, i2))
+
+            region = np.zeros((H, W), bool)
+            for (i, j) in pairs:
+                r = contact_readings(inst[i], inst[j], args.touch_px, args.dilate_px,
+                                     args.strip_px)[args.reading]
+                region |= r
+
+            # How many animals and pairs each route produced, for the same frame.
+            n_yolo_pairs = len(items)
+            det_sam3.append(len(inst))
+            pair_sam3.append(len(pairs))
+            pair_yolo.append(n_yolo_pairs)
+
+            # Why a frame scores badly splits three ways, and only a direct check
+            # separates them: SAM 3 never segmented one of the two animals; it did,
+            # but their MASK boxes are tighter than the detector boxes and the IoU
+            # fell outside the pairing rule, so the pair was never proposed; or the
+            # pair was proposed and the band simply missed. Without this the first
+            # two are invisible and the method looks worse than its segmentation is.
             for rel, ann, rec in items:
                 b1, b2 = rec["bbox1"], rec["bbox2"]
                 i1 = max(range(len(boxes3)), key=lambda k: box_iou(boxes3[k], b1))
                 i2 = max(range(len(boxes3)), key=lambda k: box_iou(boxes3[k], b2))
-                if i1 != i2 and min(box_iou(boxes3[i1], b1),
-                                    box_iou(boxes3[i2], b2)) >= args.match_iou:
-                    pairs.append((i1, i2))
+                m1, m2 = box_iou(boxes3[i1], b1), box_iou(boxes3[i2], b2)
+                matched = (m1 >= args.match_iou and m2 >= args.match_iou and i1 != i2)
+                pair_iou = box_iou(boxes3[i1], boxes3[i2]) if i1 != i2 else 1.0
+                formed = matched and (args.iou_low < pair_iou < args.iou_high)
+                diag.append({"rel_image": rel, "match_iou_1": m1, "match_iou_2": m2,
+                             "same_instance": int(i1 == i2), "matched": int(matched),
+                             "pair_iou": pair_iou, "pair_formed": int(formed),
+                             "yolo_pair_iou": box_iou(b1, b2)})
 
-        region = np.zeros((H, W), bool)
-        for (i, j) in pairs:
-            r = contact_readings(inst[i], inst[j], args.touch_px, args.dilate_px,
-                                 args.strip_px)[args.reading]
-            region |= r
-
-        # How many animals and pairs each route produced, for the same frame.
-        n_yolo_pairs = len(items)
-        det_sam3.append(len(inst))
-        pair_sam3.append(len(pairs))
-        pair_yolo.append(n_yolo_pairs)
-
-        # Why a frame scores badly splits three ways, and only a direct check
-        # separates them: SAM 3 never segmented one of the two animals; it did,
-        # but their MASK boxes are tighter than the detector boxes and the IoU
-        # fell outside the pairing rule, so the pair was never proposed; or the
-        # pair was proposed and the band simply missed. Without this the first
-        # two are invisible and the method looks worse than its segmentation is.
-        for rel, ann, rec in items:
-            b1, b2 = rec["bbox1"], rec["bbox2"]
-            i1 = max(range(len(boxes3)), key=lambda k: box_iou(boxes3[k], b1))
-            i2 = max(range(len(boxes3)), key=lambda k: box_iou(boxes3[k], b2))
-            m1, m2 = box_iou(boxes3[i1], b1), box_iou(boxes3[i2], b2)
-            matched = (m1 >= args.match_iou and m2 >= args.match_iou and i1 != i2)
-            pair_iou = box_iou(boxes3[i1], boxes3[i2]) if i1 != i2 else 1.0
-            formed = matched and (args.iou_low < pair_iou < args.iou_high)
-            diag.append({"rel_image": rel, "match_iou_1": m1, "match_iou_2": m2,
-                         "same_instance": int(i1 == i2), "matched": int(matched),
-                         "pair_iou": pair_iou, "pair_formed": int(formed),
-                         "yolo_pair_iou": box_iou(b1, b2)})
-
-        # GT points, mapped out of every annotated crop in this frame.
-        points, scope = [], np.zeros((H, W), bool)
-        n_ctrl = 0
-        for rel, ann, rec in items:
-            merged = rec["merged"]
-            x1, y1 = max(0, int(merged[0])), max(0, int(merged[1]))
-            x2, y2 = min(W, int(merged[2])), min(H, int(merged[3]))
-            if x2 > x1 and y2 > y1:
-                scope[y1:y2, x1:x2] = True
-            if ann["status"] == "none":
-                n_ctrl += 1
-                continue
-            points.extend(crop_to_frame(ann["points"], merged, (H, W)))
-
-        if args.scope == "annotated":
-            region = region & scope
-
-        if args.depth_tol is not None:
-            # Depth is cached per CROP, not per frame, so a whole-frame gate
-            # would need a whole-frame depth pass. Rather than resize a crop's
-            # map onto the frame — which would put its values in the wrong
-            # place — the gate is applied per annotated pair, inside that pair's
-            # own box, and pixels outside every annotated box are left ungated.
-            gated = region.copy()
+            # GT points, mapped out of every annotated crop in this frame.
+            points, scope = [], np.zeros((H, W), bool)
+            n_ctrl = 0
             for rel, ann, rec in items:
                 merged = rec["merged"]
                 x1, y1 = max(0, int(merged[0])), max(0, int(merged[1]))
                 x2, y2 = min(W, int(merged[2])), min(H, int(merged[3]))
-                if x2 <= x1 or y2 <= y1:
+                if x2 > x1 and y2 > y1:
+                    scope[y1:y2, x1:x2] = True
+                if ann["status"] == "none":
+                    n_ctrl += 1
                     continue
-                sub_shape = (y2 - y1, x2 - x1)
-                dep = load_depth(rec, sub_shape)
-                if dep is None:
-                    continue
-                sub = region[y1:y2, x1:x2]
-                if not sub.any():
-                    continue
-                # Instance masks restricted to this box, for the pair readings.
-                loc = [m[y1:y2, x1:x2] for m in inst]
-                areas = sorted(range(len(loc)), key=lambda k: -loc[k].sum())[:2]
-                if len(areas) < 2 or loc[areas[1]].sum() == 0:
-                    continue
-                lb = [(0.0, 0.0, float(sub_shape[1]), float(sub_shape[0]))] * 2
-                st = depth_stats(loc[areas[0]], loc[areas[1]], dep[0], dep[1],
-                                 dep[2], lb)
-                keepm = None
-                for g in args.depth_gate.split(","):
-                    s_map = st.get(g.strip())
-                    if s_map is None:
-                        continue
-                    k_ = s_map <= args.depth_tol
-                    keepm = k_ if keepm is None else (keepm & k_)
-                if keepm is not None:
-                    gated[y1:y2, x1:x2] = sub & keepm
-            region = gated
+                points.extend(crop_to_frame(ann["points"], merged, (H, W)))
 
-        rec_m, lab, hitting = evaluate_one(region, points, (H, W), gt_radius)
-        rec_m["rel_image"] = f"{video}#{fno}"
-        rec_m["is_control"] = int(len(points) == 0)
-        rec_m["n_sam3_instances"] = len(inst)
-        rec_m["n_sam3_pairs"] = len(pairs)
-        rec_m["n_yolo_pairs"] = n_yolo_pairs
-        rows.append(rec_m)
-
-        if not args.no_images:
-            img = render(frame, region, lab, hitting, points, gt_radius, rec_m)
             if args.scope == "annotated":
-                cnt, _ = cv2.findContours(scope.astype(np.uint8), cv2.RETR_EXTERNAL,
-                                          cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(img, cnt, -1, (255, 255, 255), 2, cv2.LINE_AA)
-            s = rec_m["sensitivity"]
-            img = banner(img, [
-                (f"{video} frame {fno}   "
-                 + ("CONTROL" if rec_m["is_control"] else
-                    f"sensitivity {s:.0%} ({rec_m['n_covered']}/{rec_m['n_points']})"),
-                 (150, 30, 30) if rec_m["is_control"] else
-                 ((25, 110, 40) if s >= .8 else (170, 60, 25))),
-                (f"SAM 3 found {len(inst)} cattle -> {len(pairs)} pairs   "
-                 f"YOLO gave {n_yolo_pairs} annotated pair(s)", (80, 80, 80)),
-                (f"clusters {rec_m['n_clusters']}  blind {rec_m['blind_frac']:.0%}"
-                 f"   a_i {rec_m['a_i']:.2%}   scope={args.scope}"
-                 + ("  (white outline = scored area)"
-                    if args.scope == "annotated" else ""), (80, 80, 80))])
-            tag = "ctrl" if rec_m["is_control"] else f"{int(round(s * 100)):03d}"
-            cv2.imwrite(os.path.join(out_dir, f"{tag}_{video}_{fno:08d}.jpg"),
-                        cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                region = region & scope
+
+            if args.depth_tol is not None:
+                # Depth is cached per CROP, not per frame, so a whole-frame gate
+                # would need a whole-frame depth pass. Rather than resize a crop's
+                # map onto the frame — which would put its values in the wrong
+                # place — the gate is applied per annotated pair, inside that pair's
+                # own box, and pixels outside every annotated box are left ungated.
+                gated = region.copy()
+                for rel, ann, rec in items:
+                    merged = rec["merged"]
+                    x1, y1 = max(0, int(merged[0])), max(0, int(merged[1]))
+                    x2, y2 = min(W, int(merged[2])), min(H, int(merged[3]))
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    sub_shape = (y2 - y1, x2 - x1)
+                    dep = load_depth(rec, sub_shape)
+                    if dep is None:
+                        continue
+                    sub = region[y1:y2, x1:x2]
+                    if not sub.any():
+                        continue
+                    # Instance masks restricted to this box, for the pair readings.
+                    loc = [m[y1:y2, x1:x2] for m in inst]
+                    areas = sorted(range(len(loc)), key=lambda k: -loc[k].sum())[:2]
+                    if len(areas) < 2 or loc[areas[1]].sum() == 0:
+                        continue
+                    lb = [(0.0, 0.0, float(sub_shape[1]), float(sub_shape[0]))] * 2
+                    st = depth_stats(loc[areas[0]], loc[areas[1]], dep[0], dep[1],
+                                     dep[2], lb)
+                    keepm = None
+                    for g in args.depth_gate.split(","):
+                        s_map = st.get(g.strip())
+                        if s_map is None:
+                            continue
+                        k_ = s_map <= args.depth_tol
+                        keepm = k_ if keepm is None else (keepm & k_)
+                    if keepm is not None:
+                        gated[y1:y2, x1:x2] = sub & keepm
+                region = gated
+
+            rec_m, lab, hitting = evaluate_one(region, points, (H, W), gt_radius)
+            rec_m["rel_image"] = f"{video}#{fno}"
+            rec_m["is_control"] = int(len(points) == 0)
+            rec_m["n_sam3_instances"] = len(inst)
+            rec_m["n_sam3_pairs"] = len(pairs)
+            rec_m["n_yolo_pairs"] = n_yolo_pairs
+            rows.append(rec_m)
+
+            if not args.no_images:
+                img = render(frame, region, lab, hitting, points, gt_radius, rec_m)
+                if args.scope == "annotated":
+                    cnt, _ = cv2.findContours(scope.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                              cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(img, cnt, -1, (255, 255, 255), 2, cv2.LINE_AA)
+                s = rec_m["sensitivity"]
+                img = banner(img, [
+                    (f"{video} frame {fno}   "
+                     + ("CONTROL" if rec_m["is_control"] else
+                        f"sensitivity {s:.0%} ({rec_m['n_covered']}/{rec_m['n_points']})"),
+                     (150, 30, 30) if rec_m["is_control"] else
+                     ((25, 110, 40) if s >= .8 else (170, 60, 25))),
+                    (f"SAM 3 found {len(inst)} cattle -> {len(pairs)} pairs   "
+                     f"YOLO gave {n_yolo_pairs} annotated pair(s)", (80, 80, 80)),
+                    (f"clusters {rec_m['n_clusters']}  blind {rec_m['blind_frac']:.0%}"
+                     f"   a_i {rec_m['a_i']:.2%}   scope={args.scope}"
+                     + ("  (white outline = scored area)"
+                        if args.scope == "annotated" else ""), (80, 80, 80))])
+                tag = "ctrl" if rec_m["is_control"] else f"{int(round(s * 100)):03d}"
+                cv2.imwrite(os.path.join(out_dir, f"{tag}_{video}_{fno:08d}.jpg"),
+                            cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+        if seen < len(wanted):
+            # The reader stopped before reaching every wanted index, which means
+            # the file has fewer decodable frames than prep counted. Reported
+            # rather than absorbed into `failed`, because it is a property of
+            # the video and not of anything this script did.
+            short = len(wanted) - seen
+            print(f"[wf] {video}: {short} of {len(wanted)} wanted frames were "
+                  "never reached by a sequential read")
+            failed += short
 
     if not rows:
         raise SystemExit("nothing evaluated")

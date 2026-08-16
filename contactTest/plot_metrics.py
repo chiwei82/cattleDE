@@ -23,7 +23,7 @@ distribution separates them.
 PANELS
 
     1  Sensitivity, histogram        piles at 0 and 1 are the thing to look for
-    2  a_i, violin + strip           predicted area as a share of the crop
+    2  a_i, violin + strip           proposed area as a share of the crop
     3  Lift, violin on a log axis    a ratio, so it is read multiplicatively;
                                      1.0 is chance and is drawn
     4  Blind area, violin + strip    share of prediction covering no GT point;
@@ -192,7 +192,7 @@ def main():
     # 2 — a_i
     ax = axes[0][1]
     violin_strip(ax, [r["a_i"] for r in runs], labels)
-    ax.set_title("2  a$_i$  — predicted area / image area", fontsize=10)
+    ax.set_title("2  a$_i$  — proposed area / image area", fontsize=10)
     ax.set_ylabel("share of the crop", fontsize=8)
 
     # 3 — lift, log axis
@@ -218,7 +218,7 @@ def main():
             ax.scatter(k + rng4.normal(0, 0.05, len(cv)), cv, s=11, marker="x",
                        color="0.5", alpha=0.7, linewidths=0.8)
     ax.set_title("4  Blind area — prediction covering no GT point", fontsize=10)
-    ax.set_ylabel("share of predicted pixels", fontsize=8)
+    ax.set_ylabel("share of proposed pixels", fontsize=8)
     if n_at_one:
         ax.annotate("x = controls, 1.0 by construction\n(no GT points, so every "
                     "cluster is blind)\nexcluded from the violin",
@@ -252,7 +252,7 @@ def main():
     ax.set_xlim(0, top)
     ax.set_ylim(0, 1.02)
     ax.set_title("6  Sensitivity vs a$_i$", fontsize=10)
-    ax.set_xlabel("a$_i$ — share of the crop predicted", fontsize=8)
+    ax.set_xlabel("a$_i$ — share of the crop proposed", fontsize=8)
     ax.set_ylabel("sensitivity", fontsize=8)
     ax.legend(fontsize=7.5, loc="lower right")
 
