@@ -103,17 +103,42 @@ class _SAM3Text:
     compare_masks.py before trusting a whole cache of it.
     """
 
-    def __init__(self, weights, text="cow", conf=0.25, model_id="facebook/sam3"):
+    DEFAULT_MODEL_ID = "facebook/sam3"
+
+    def __init__(self, weights=None, text="cow", conf=0.25, device=None):
         import torch
         from transformers import Sam3Model, Sam3Processor
 
+        # `weights` may be a Hugging Face id or a local snapshot DIRECTORY. It
+        # may not be an ultralytics .pt: that is a different serialisation of
+        # the same model and Sam3Model.from_pretrained cannot read it. Saying so
+        # beats loading the default and letting the run look as though the
+        # requested checkpoint was used.
+        model_id = self.DEFAULT_MODEL_ID
+        if weights:
+            if os.path.isdir(weights) or "/" in str(weights) and not str(
+                    weights).endswith((".pt", ".pth", ".safetensors")):
+                model_id = weights
+            elif str(weights).endswith((".pt", ".pth")):
+                print(f"[mask] NOTE: {weights} is an ultralytics checkpoint; the "
+                      "transformers path needs the Hugging Face layout "
+                      "(config.json + safetensors). Loading "
+                      f"{self.DEFAULT_MODEL_ID} instead — pass a local snapshot "
+                      "directory to --weights to use one on disk.")
+            else:
+                model_id = weights
+
+        # No device_map: that routes through accelerate, which is an extra
+        # dependency and is meant for sharding a model across several GPUs. One
+        # explicit .to() is enough here and fails more clearly when it fails.
         self.torch = torch
         self.text = text
         self.conf = conf
-        self.model = Sam3Model.from_pretrained(model_id, device_map="auto")
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = Sam3Model.from_pretrained(model_id).to(self.device).eval()
         self.processor = Sam3Processor.from_pretrained(model_id)
-        print(f"[mask] SAM 3 concept prompting via transformers, "
-              f"text={text!r}, conf={conf}")
+        print(f"[mask] SAM 3 concept prompting via transformers ({model_id}) "
+              f"on {self.device}, text={text!r}, conf={conf}")
 
     def _raw(self, bgr):
         """Per-query mask probabilities and scores, at the crop's resolution.
@@ -138,7 +163,7 @@ class _SAM3Text:
 
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         inputs = self.processor(images=Image.fromarray(rgb), text=self.text,
-                                return_tensors="pt").to(self.model.device)
+                                return_tensors="pt").to(self.device)
         with self.torch.no_grad():
             out = self.model(**inputs)
 
