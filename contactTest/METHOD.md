@@ -7,6 +7,84 @@ actually evaluated, not a simplification of them.
 
 ---
 
+## 0. Where this sits in the pipeline
+
+```
+STAGE 1  — has training
+  YOLO detects individual cattle
+  box pairs kept when 0.1 < IoU < 0.8
+  dataset split train/val/test (per source video)
+  a ViT interaction classifier was to be trained on those crops
+
+STAGE 2  — NO training, no learning of any kind
+  SAM 3 concept segmentation of the pair crop
+  dilate the instance masks, take the overlap
+  output: a binary mask, by fixed calculation
+```
+
+Everything below concerns **stage 2 only**. Nothing in it is fitted, so no
+concept belonging to stage 1's training — held-out splits, overfitting,
+generalisation gap — transfers into it. The clicked points are used to *measure*
+a fixed calculation, never to choose it.
+
+### Where stage 1's boxes came from
+
+Recorded here because no file in the repository states it, and it decides how
+the two questions below can be answered.
+
+```
+SAM 3 ──► tracklets.json ──► YOLO OBB training set
+              ~22% of cattle missing from those labels
+                    │  (unlabelled cattle act as negatives, so the model
+                    ▼   learns to suppress confidence)
+          COCO-pretrained YOLO fills the gaps ──► retrain ──► yolo_pseudo.pt
+                    │
+                    ▼
+          interaction_prep: boxes, pairs at 0.1 < IoU < 0.8, merged crop
+```
+
+`prep/yolo_prep.py` consumes `tracklets.json` as given and does not say what
+produced it; `prep/pseudo_label.py` records only that its labels "miss ~22% of
+cattle" and calls COCO an "INDEPENDENT second opinion" — independent of SAM 3,
+which is the property that makes the fill meaningful.
+
+Three consequences, all of which constrain what the measurements can support:
+
+- **The evaluation set is downstream of the detector.** A crop exists only where
+  the detector found two boxes overlapping by 0.1 to 0.8. Cattle it missed never
+  became a crop and were never clicked, so **detection failure is invisible to
+  all six metrics**. They answer "given that two animals were already found, is
+  the region right", not "were they found".
+- **Question 2 compares a student with its teacher.** Most of YOLO's supervision
+  is SAM 3's own output, so SAM 3 and YOLO agreeing is the expected result of
+  distillation and is not evidence that the detector is interchangeable. A
+  confound runs the other way too: YOLO was fitted to this footage while SAM 3 is
+  zero-shot, so YOLO carries domain adaptation SAM 3 does not.
+- **SAM 3's recall here is already on record, and it is not high.** If
+  `tracklets.json` is SAM 3's output then SAM 3 missed roughly a fifth of the
+  cattle, and a far smaller COCO model found them. That is prior evidence
+  against SAM 3 replacing the first stage, and it sits awkwardly beside
+  `evaluate_wholeframe` reporting 35.1 cattle per frame — the two cannot both
+  describe the same recall, so the settings or the tracking step between
+  segmentation and `tracklets.json` must differ. Resolve that before quoting
+  either figure.
+
+The two open questions this is meant to answer:
+
+1. **Is the two-stage structure needed at all?** Can the whole frame go in
+   directly, without cropping to a candidate pair? — `evaluate_wholeframe.py`,
+   and it must be run with `--pairs-from detector`. The default `sam3` arm lets
+   SAM 3 pair the animals as well, so it differs from `evaluate_contact.py` in
+   two ways at once — cropped or not, AND whose boxes define a pair — and a gap
+   between them cannot be attributed to either. Mask boxes hug the animal and
+   overlap less than detector boxes, so the same 0.1 threshold rejects pairs the
+   detector accepted; that alone can zero a frame for reasons having nothing to
+   do with cropping.
+2. **If two stages are needed, must stage 1 be YOLO?** Can SAM 3 do the
+   detection too, with everything downstream unchanged? — `prep_sam3.py`. Read
+   the provenance note below before interpreting the answer: this is not a
+   comparison between two independent detectors.
+
 ## 1. The problem this is solving
 
 The task is per-pixel: for each frame, which pixels are where two cattle are
@@ -67,9 +145,8 @@ dilated   dilate(mi, r) & dilate(mj, r)          <- panel 3's green outline
 ```
 
 `dilated` at `r = 22` is the operating point everything is currently reported
-at. It was chosen by sweeping r on the annotated crops — one scalar on a
-monotonic trade-off curve, so there is little room for it to be overfitted, but
-it was chosen on the same data it is reported on and that should be stated.
+at. It is a fixed constant of the calculation, not a learned quantity — see the
+caveat in section 7 for what it is and is not tied to.
 
 **What none of them can do.** All four are statements about two silhouettes in
 the image plane. Two failure modes follow directly and cannot be tuned away by
@@ -228,8 +305,8 @@ metrics need an area to compare against.
 
 ## 6. Measured so far
 
-81 crops, 634 clicked points, 18 "no contact" controls, `dilated` at r = 22,
-train split only. Area figures here are means, as in the depth table.
+81 crops, 634 clicked points, 18 "no contact" controls, `dilated` at r = 22.
+Area figures here are means, as in the depth table.
 
 ```
 gate       tol   hit rate     area   of crop   lift   selectivity   fires on none
@@ -255,12 +332,32 @@ sweep that would locate each gate's knee has not been run.
 
 ## 7. Standing caveats
 
-- **Train split only.** The 99 annotated crops come from **2 videos**, both
+**The train/val/test split is not one of them.** That split exists for stage 1,
+where a ViT interaction classifier was to be trained. Stage 2 fits nothing, so
+none of the reasoning that split supports — held-out evaluation, memorisation,
+overfitting — applies to anything in this document. The 99 clicked crops happen
+to have been drawn from the train split; that is an accident of which crops were
+convenient to annotate, and carries no methodological weight here. Statements of
+the form "measured on train only, val not yet annotated" are category errors and
+have been removed.
+
+What does limit the results:
+
+- **Condition coverage.** The 99 annotated crops come from **2 videos**, both
   morning colour footage. The dataset has **15**, spanning 08:00 to 22:10, and
   one of them (22:10) is pure greyscale night footage — measured saturation
-  exactly 0.0. SAM and Depth Anything have not been checked there at all.
-- **`r = 22` was chosen on the data it is reported on.** One scalar on a
-  monotonic curve, so the risk is small, but it should be stated.
+  exactly 0.0. SAM and Depth Anything have not been checked there at all. This
+  is a sampling question — do the measured numbers hold under other lighting —
+  and it would be exactly as pressing if every crop in the dataset were in one
+  split.
+- **`r = 22` is a hand-set constant in pixels.** It is not learned; it is part
+  of the fixed calculation. Two things follow. It is tied to this camera's
+  resolution and mounting, so it does not transfer to another site unaltered.
+  And it was picked by looking at these crops, which makes the number reported
+  *at that particular value* mildly optimistic — that is selection, not
+  overfitting, and the distinction matters because there is no model to overfit.
+  For the two comparisons in the TODO it is held identical on both arms, which
+  is the only property those comparisons need from it.
 - **The 634 points are not 634 independent samples.** Seven clicks on one crop
   share two animals and one segmentation. The effective sample size is nearer
   the 81 crops, so a confidence interval should be computed at crop level:

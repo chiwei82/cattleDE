@@ -103,14 +103,53 @@ class _SAM3Text:
     compare_masks.py before trusting a whole cache of it.
     """
 
-    def __init__(self, weights, text="cow", conf=0.25):
-        from ultralytics.models.sam import SAM3SemanticPredictor
+    def __init__(self, weights, text="cow", conf=0.25, model_id="facebook/sam3"):
+        import torch
+        from transformers import Sam3Model, Sam3Processor
 
+        self.torch = torch
         self.text = text
-        self.predictor = SAM3SemanticPredictor(overrides={
-            "conf": conf, "task": "segment", "mode": "predict",
-            "model": weights, "quantize": 16, "save": False, "verbose": False})
-        print(f"[mask] SAM 3 concept prompting, text={text!r}, conf={conf}")
+        self.conf = conf
+        self.model = Sam3Model.from_pretrained(model_id, device_map="auto")
+        self.processor = Sam3Processor.from_pretrained(model_id)
+        print(f"[mask] SAM 3 concept prompting via transformers, "
+              f"text={text!r}, conf={conf}")
+
+    def _raw(self, bgr):
+        """Per-query mask probabilities and scores, at the crop's resolution.
+
+        transformers rather than ultralytics deliberately. Ultralytics' wrapper
+        ends its postprocess with
+
+            masks = masks > self.model.mask_threshold   # to bool
+
+        so the per-pixel score is gone before anything can read it, and the
+        uncertainty panels cannot be built from what it returns. The model emits
+        `pred_masks` as floats; sigmoid turns them into probabilities and nothing
+        thresholds them here. `post_process_instance_segmentation` would also
+        binarise, so it is not used either.
+
+        Query scores follow the documented form
+        `pred_logits.sigmoid() * presence_logits.sigmoid()`: the presence head is
+        what separates "this query found something" from "this query is one of
+        the 200 that matched nothing".
+        """
+        from PIL import Image
+
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        inputs = self.processor(images=Image.fromarray(rgb), text=self.text,
+                                return_tensors="pt").to(self.model.device)
+        with self.torch.no_grad():
+            out = self.model(**inputs)
+
+        scores = out.pred_logits.sigmoid()[0]
+        if getattr(out, "presence_logits", None) is not None:
+            scores = scores * out.presence_logits.sigmoid()[0]
+        probs = self.torch.sigmoid(out.pred_masks)          # (1, Q, H, W)
+        probs = self.torch.nn.functional.interpolate(
+            probs.float(), size=bgr.shape[:2], mode="bilinear",
+            align_corners=False)[0]
+        return probs, scores.reshape(-1)
 
     @staticmethod
     def _iou_with_box(mask, box):
@@ -123,35 +162,39 @@ class _SAM3Text:
         union = float(mask.sum()) + (x2 - x1) * (y2 - y1) - inter
         return inter / max(union, 1.0)
 
-    def instances(self, bgr, path=None):
+    def instances(self, bgr, path=None, binary=True):
         """Every instance of the concept in the image, unassigned.
 
         Split out from __call__ because the whole-frame control needs the raw
         instances — it has no detector boxes to assign them to, that being the
         point of it.
-        """
-        # set_image is documented with a path; an array works in the ultralytics
-        # predictors, and the path is preferred when we have one so that any
-        # internal preprocessing matches the documented behaviour exactly.
-        self.predictor.set_image(path if path else bgr)
-        results = self.predictor(text=[self.text])
-        masks = getattr(results[0], "masks", None)
-        if masks is None or masks.data is None or len(masks.data) == 0:
-            return []
 
+        `binary=False` returns the probabilities untouched, for the uncertainty
+        panels. The default thresholds, because everything else here wants a
+        mask; that threshold is applied HERE and visibly, rather than buried in
+        a wrapper's postprocess where it silently removes the only quantity
+        those panels need.
+        """
+        probs, scores = self._raw(bgr)
+        keep = (scores >= self.conf).nonzero().reshape(-1).tolist()
         inst = []
-        for m in masks.data:
-            a = m.cpu().numpy().astype(np.uint8)
-            if a.shape != bgr.shape[:2]:
-                a = cv2.resize(a, (bgr.shape[1], bgr.shape[0]),
-                               interpolation=cv2.INTER_NEAREST)
-            inst.append(a)
+        for q in keep:
+            a = probs[q].cpu().numpy().astype(np.float32)
+            inst.append((a > 0.5).astype(np.uint8) if binary else a)
         return inst
 
-    def __call__(self, bgr, boxes, use_point=True, prompts=None, path=None):
-        inst = self.instances(bgr, path)
-        if not inst:
+    def __call__(self, bgr, boxes, use_point=True, prompts=None, path=None,
+                 binary=True):
+        # Assignment is done on thresholded masks because it ranks by IoU, which
+        # wants areas; what is RETURNED follows `binary`, so a caller that needs
+        # per-pixel scores gets them for the same instances the assignment chose.
+        probs, qscores = self._raw(bgr)
+        keep = (qscores >= self.conf).nonzero().reshape(-1).tolist()
+        if not keep:
             return None
+        soft = [probs[q].cpu().numpy().astype(np.float32) for q in keep]
+        inst = [(a > 0.5).astype(np.uint8) for a in soft]
+        want = inst if binary else soft
 
         # Greedy assignment over the full IoU matrix: take the best box/instance
         # pair, remove both, repeat. With two boxes this is optimal.
@@ -170,7 +213,7 @@ class _SAM3Text:
                         best, bk, bi = scores[k][i], k, i
             if bk is None or best <= 0.0:
                 break
-            out[bk] = inst[bi]
+            out[bk] = want[bi]
             taken.add(bi)
         return None if any(o is None for o in out) else out
 

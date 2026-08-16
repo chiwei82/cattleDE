@@ -77,6 +77,41 @@ def box_iou(a, b):
     return inter / ua if ua > 0 else 0.0
 
 
+def mask_gap(a, b):
+    """Shortest distance between two masks; 0 when they overlap.
+
+    The pairing measure for a mask-native pipeline. Box IoU exists because a
+    detector only emits boxes; given masks the separation is measurable directly
+    and needs no proxy.
+
+    How much that matters is NOT settled, and the dataset cannot settle it.
+    Synthetic ellipses meeting end-on score IoU 0.007, far under the 0.1 the
+    detector stage used — but real cattle are not ellipses, and their heads and
+    necks interleave when they groom, so the real figure is higher. The recorded
+    pairs cannot arbitrate: interaction_prep wrote only pairs with
+    0.1 < IoU < 0.8, so every category in the CSV has a minimum of exactly 0.100
+    and any contact below the cut was discarded before the file existed. The
+    evidence that would decide it was removed by the selection.
+
+    What the surviving shape hints at: social grooming crowds the cut-off more
+    than non-interacting pairs do — 31% of it below IoU 0.13 against 22%, a
+    factor of 1.4. That is consistent with a distribution truncated at 0.1, and
+    equally consistent with contact pairs simply sitting at lower IoU without
+    extending below it. Suggestive, not conclusive.
+
+    Running this option against --pair-by box_iou on the same frames measures
+    the thing directly: the difference is how many pairs capable of producing a
+    contact region the IoU rule discards.
+    """
+    if not a.any() or not b.any():
+        return None
+    if (a.astype(bool) & b.astype(bool)).any():
+        return 0.0
+    d = cv2.distanceTransform((b == 0).astype(np.uint8), cv2.DIST_L2,
+                              cv2.DIST_MASK_PRECISE)
+    return float(d[a > 0].min())
+
+
 def mask_box(m):
     ys, xs = np.nonzero(m)
     if len(xs) == 0:
@@ -168,6 +203,30 @@ def main():
     ap.add_argument("--depth-gate", default="pair")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--gt", default=None)
+    ap.add_argument("--pair-by", default="box_iou",
+                    choices=["box_iou", "mask_gap"],
+                    help="how two instances are judged near enough to pair. "
+                         "box_iou reuses the detector stage's rule, which was "
+                         "designed for boxes and rejects touching pairs whose "
+                         "boxes meet end-on. mask_gap uses the shortest distance "
+                         "between the two masks, which is what the rule is a "
+                         "proxy for and needs no proxy once masks exist. "
+                         "Applies to --pairs-from sam3 only")
+    ap.add_argument("--pair-gap-px", type=float, default=44.0,
+                    help="with --pair-by mask_gap, the separation at or below "
+                         "which two instances are paired. Twice the dilation "
+                         "radius by default, since the band is empty beyond that "
+                         "anyway: dilate(a,r) AND dilate(b,r) is non-empty "
+                         "exactly when the gap is at most 2r, so a wider "
+                         "threshold proposes pairs that cannot produce a region")
+    ap.add_argument("--pairs-from", default="sam3", choices=["sam3", "detector"],
+                    help="sam3 (default): SAM 3 finds the animals AND pairs them, "
+                         "so this answers 'can SAM 3 replace the whole first "
+                         "stage'. detector: SAM 3 segments the whole frame but "
+                         "the pairs are the detector's, which is the only arm "
+                         "that isolates the CROP - with sam3 the comparison "
+                         "against evaluate_contact varies the detector too, and "
+                         "a gap cannot be attributed to either")
     ap.add_argument("--match-iou", type=float, default=0.3,
                     help="least IoU between a SAM 3 instance box and a detector "
                          "box before that animal counts as segmented, for the "
@@ -271,9 +330,39 @@ def main():
         inst = [inst[k] for k in keep]
         boxes3 = [boxes3[k] for k in keep]
 
-        # SAM 3's own pairing, by exactly the rule the detector stage used.
-        pairs = [(i, j) for i in range(len(inst)) for j in range(i + 1, len(inst))
-                 if args.iou_low < box_iou(boxes3[i], boxes3[j]) < args.iou_high]
+        if args.pairs_from == "sam3":
+            if args.pair_by == "box_iou":
+                # Exactly the rule the detector stage used. Kept as the default
+                # so this arm stays comparable with the crop pipeline, but see
+                # mask_gap(): the rule discards touching pairs.
+                pairs = [(i, j) for i in range(len(inst))
+                         for j in range(i + 1, len(inst))
+                         if args.iou_low < box_iou(boxes3[i], boxes3[j])
+                         < args.iou_high]
+            else:
+                pairs = []
+                for i in range(len(inst)):
+                    for j in range(i + 1, len(inst)):
+                        g = mask_gap(inst[i], inst[j])
+                        if g is not None and g <= args.pair_gap_px:
+                            pairs.append((i, j))
+        else:
+            # The DETECTOR's pairs, reused verbatim: SAM 3's whole-frame
+            # instances are matched to bbox1 and bbox2 of each annotated pair.
+            # This is the arm that isolates the crop. With `sam3` the two arms of
+            # TODO 1 differ in two ways at once — cropped or not, AND whose boxes
+            # define a pair — so a gap between them cannot be attributed to
+            # either. Here the detector is held fixed and the only remaining
+            # difference from evaluate_contact is whether SAM 3 saw the whole
+            # frame or just the crop.
+            pairs = []
+            for rel, ann, rec in items:
+                b1, b2 = rec["bbox1"], rec["bbox2"]
+                i1 = max(range(len(boxes3)), key=lambda k: box_iou(boxes3[k], b1))
+                i2 = max(range(len(boxes3)), key=lambda k: box_iou(boxes3[k], b2))
+                if i1 != i2 and min(box_iou(boxes3[i1], b1),
+                                    box_iou(boxes3[i2], b2)) >= args.match_iou:
+                    pairs.append((i1, i2))
 
         region = np.zeros((H, W), bool)
         for (i, j) in pairs:
@@ -417,7 +506,13 @@ def main():
     print(f"  {args.reading} at dilate_px={args.dilate_px}"
           + (f", depth gate {args.depth_gate} <= {args.depth_tol}"
              if args.depth_tol is not None else ", no depth gate"))
-    print(f"  {n_img} frames, {tot_pts} GT points, scope={args.scope}")
+    print(f"  {n_img} frames, {tot_pts} GT points, scope={args.scope}, "
+          f"pairs from {args.pairs_from}"
+          + (f" by {args.pair_by}" if args.pairs_from == "sam3" else ""))
+    if args.pairs_from == "sam3":
+        print("  NOTE: this arm changes the detector as well as the cropping, so")
+        print("  a gap against evaluate_contact is the two combined. Run")
+        print("  --pairs-from detector to isolate the crop.")
     print(f"{'=' * 66}\n")
     print(f"  1  Sensitivity   {sensitivity:>9.3f}   {tot_cov}/{tot_pts} points covered")
     print(f"  2  FPPI          {fppi:>9.3f}   {tot_fp} empty clusters / {n_img} frames")

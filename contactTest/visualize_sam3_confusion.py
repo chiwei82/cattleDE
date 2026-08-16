@@ -22,9 +22,18 @@ coherent region than a high-contrast Holstein, so a slightly loose box is often
 answered with the ground. Every prompt trick in the SAM 1 script — a centre
 point, five points, depth-derived negative points — works around that.
 
-SAM 3 takes the concept itself. `--text cow` asks for cattle, so the floor is
-not a candidate answer at all, and promptable concept segmentation returns every
-instance with its own identity rather than one mask per prompt.
+SAM 3 can take different prompts. For example,
+in our dataset, we can simply use text promt "cow" to segment a cow. 
+since the model has provided general abilities
+example:
+```
+# Prompt the model with text
+output = processor.set_text_prompt(state=inference_state, prompt="<YOUR_TEXT_PROMPT>")
+
+# Get the masks, bounding boxes, and scores
+masks, boxes, scores = output["masks"], output["boxes"], output["scores"]
+```
+after we get the boxes, we can mapping that back to bbox1 and bbox2
 
 Those instances come back in no particular order, and nothing in them says which
 belongs to bbox1 and which to bbox2, so they are assigned to the two detector
@@ -33,37 +42,52 @@ assignment is for identity, not for filtering out extra animals. It is greedy
 without replacement because the pair filter keeps only boxes overlapping by
 IoU > 0.1, so choosing independently could give the same animal to both.
 
-The two panels built from UNCERTAINTY cannot be carried over unchanged. The SAM
-1 script asks the predictor for raw logits and reads
+The panel built from UNCERTAINTY needs a per-pixel score, not a mask:
 
     u_x(p)    = 4 * sigmoid(logit_x) * (1 - sigmoid(logit_x))
     strict(p) = u_i(p) * u_j(p)
 
-which needs a per-pixel score, not a mask.
+SAM 3 provides it. `pred_masks` is a float tensor of shape
+(batch, num_queries, H, W) and sigmoid turns it into per-pixel probabilities, so
+this panel carries over unchanged. That is the reason the text backend goes
+through transformers rather than ultralytics: ultralytics' postprocess ends in
+`masks = masks > mask_threshold`, discarding the only quantity these two panels
+are made of, and `post_process_instance_segmentation` binarises as well. Neither
+is used. Queries are kept by the documented score
+`pred_logits.sigmoid() * presence_logits.sigmoid()`.
 
-Ultralytics' high-level path throws that score away: its postprocess ends in
+`--prompt-mode boxes` reaches for the same scores below the high-level
+ultralytics API. If it cannot get them the run stops rather than drawing
+something else: an earlier version substituted the binary mask overlap into
+these panels when the scores were missing, which changed what panel 3 MEANS between runs. For a figure built to be read beside the SAM 1 one, a panel whose
+meaning varies is worse than a panel that is absent.
 
-    masks = masks > self.model.mask_threshold   # to bool
+Promptable Concept Segmentation (PCS) takes such prompts and returns 
+segmentation masks and unique identities for all matching object instances
+which means SAM3's output is a pixel-level mask.
+example:
+```
+inputs = processor(images=image, text="ear", return_tensors="pt").to(model.device)
 
-so Results carries booleans and the raw logits are gone. They are still
-reachable one level down — `set_image()` caches the image features and
-`inference()` / `prompt_inference()` return the decoder's output before
-thresholding — so `--prompt-mode boxes` computes the same uncertainty product as
-the SAM 1 figure. That path reaches past the documented interface, so it is
-attempted once and falls back to thresholded masks if anything about it fails;
-the run says which it used, and when only masks are available panels 3 and 5
-show the mask OVERLAP with the tile labelled accordingly, so the two readings
-are never confused. Panel 3's green band is unaffected either way — it is built
-from the masks alone, and it is the thing score_contact actually measures.
+with torch.no_grad():
+    outputs = model(**inputs)
+
+# Instance segmentation masks
+instance_masks = torch.sigmoid(outputs.pred_masks)  # [batch, num_queries, H, W]
+
+# Semantic segmentation (single channel)
+semantic_seg = outputs.semantic_seg  # [batch, 1, H, W]
+
+print(f"Instance masks: {instance_masks.shape}")
+print(f"Semantic segmentation: {semantic_seg.shape}")
+```
 
 PANELS
 
     1  crop with the two detector boxes
     2  the two instance masks
-    3  overlap or uncertainty, with the contact band outlined in green
+    3  the uncertainty product, with the contact band outlined in green
        (and in purple what the depth gate removed, if one is applied)
-    4  each box segmented in isolation
-    5  what both isolated runs claim
 """
 
 import argparse
@@ -101,7 +125,6 @@ class Sam3Boxes:
         from ultralytics import SAM
 
         self.model = SAM(weights)
-        self.logit_path = None          # set on the first call: True if usable
         print(f"[sam3] box/point prompts ({weights})")
 
     def _prompt_args(self, boxes, prompts):
@@ -112,22 +135,8 @@ class Sam3Boxes:
                 [1] * len(boxes))
 
     def _logits(self, bgr, boxes, prompts):
-        """Raw mask logits, by calling the predictor below the high-level API.
-
-        The high-level `model(...)` path ends in
-
-            masks = masks > self.model.mask_threshold   # to bool
-
-        so the per-pixel score is thresholded away before Results is built, and
-        the uncertainty panels cannot be computed from what comes back.
-        `inference()` / `prompt_inference()` return the decoder's output before
-        that step, and `set_image()` caches the image features, so the logits
-        are reachable without re-encoding.
-
-        Best effort: this reaches past the documented interface, so any failure
-        falls back to the thresholded path rather than aborting the run. Which
-        one was used is reported, because it decides whether panels 3 and 5 mean
-        the same thing as in the SAM 1 figure.
+        """
+        Raw mask logits
         """
         from ultralytics.utils import ops
 
@@ -148,81 +157,31 @@ class Sam3Boxes:
         out = ops.scale_masks(pred[None].float(), bgr.shape[:2])[0]
         return [out[k].cpu().numpy().astype(np.float32) for k in range(len(boxes))]
 
-    def __call__(self, bgr, boxes, prompts=None):
-        if self.logit_path is not False:
-            try:
-                got = self._logits(bgr, boxes, prompts)
-                if got is not None and len(got) >= len(boxes):
-                    if self.logit_path is None:
-                        self.logit_path = True
-                        print("[sam3] raw logits reachable via predictor."
-                              "inference(); panels 3 and 5 are the same "
-                              "uncertainty product as the SAM 1 figure")
-                    # Logits, not probabilities: sigmoid before they are read as
-                    # confidences, matching what the SAM 1 script does.
-                    return [1.0 / (1.0 + np.exp(-g)) for g in got], True
-            except Exception as err:                   # noqa: BLE001
-                if self.logit_path is None:
-                    print(f"[sam3] raw logits not reachable ({err}); falling back "
-                          "to thresholded masks, so panels 3 and 5 will show "
-                          "overlap rather than uncertainty")
-                self.logit_path = False
+    def __call__(self, bgr, boxes, prompts=None, binary=False):
+        """Per-pixel probabilities for each box.
 
-        pts, labs = self._prompt_args(boxes, prompts)
-        res = self.model(bgr, verbose=False,
-                         bboxes=[list(map(float, b)) for b in boxes],
-                         points=pts, labels=labs)
-        return _extract(res, bgr.shape[:2], len(boxes))
-
-
-def _extract(results, shape, n_expected):
-    """Masks out of an ultralytics Results, kept float when the wrapper gives one.
-
-    `masks.data` is normally a binary tensor. If a build ever returns something
-    continuous it is passed through untouched, because the uncertainty panels
-    can use it; `soft_scores` records which happened so the tiles can be
-    labelled honestly rather than a thresholded mask being drawn as a score.
-    """
-    masks = getattr(results[0], "masks", None)
-    if masks is None or masks.data is None or len(masks.data) < n_expected:
-        return None, False
-    out, soft = [], False
-    for k in range(len(masks.data)):
-        a = masks.data[k].cpu().numpy().astype(np.float32)
-        u = np.unique(a[:: max(1, a.shape[0] // 64)])
-        if u.size > 3:                      # more than {0, 1} (and maybe a stray)
-            soft = True
-        if a.shape != shape:
-            a = cv2.resize(a, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
-        out.append(a)
-    return out, soft
-
-
-def crop_reading(seg_fn, bgr, boxes, pad):
-    """Segment each box in isolation and paste the result back onto the crop.
-
-    The SAM 1 version reads this as "what both isolated runs confidently claim":
-    blind to the second animal, SAM absorbs whatever overlaps into the object,
-    so the pixels both runs claim are the pixels the two bodies share. With
-    binary masks the product of the two claims degenerates to their
-    intersection, which is still that reading, only without a confidence to
-    weight it by.
-    """
-    h, w = bgr.shape[:2]
-    claims = []
-    for b in boxes:
-        x1 = int(max(0, b[0] - pad)); y1 = int(max(0, b[1] - pad))
-        x2 = int(min(w, b[2] + pad)); y2 = int(min(h, b[3] + pad))
-        full = np.zeros((h, w), np.float32)
-        if x2 <= x1 + 4 or y2 <= y1 + 4:
-            claims.append(full)
-            continue
-        sub = bgr[y1:y2, x1:x2]
-        got = seg_fn(sub)
-        if got is not None:
-            full[y1:y2, x1:x2] = got
-        claims.append(full)
-    return claims
+        No fallback to thresholded masks. An earlier version substituted the
+        binary overlap into panels 3 and 5 when the logits could not be reached,
+        which quietly changed what those panels MEAN from one run to the next —
+        fatal for a figure whose whole purpose is to be read beside the SAM 1
+        one. If the scores are unavailable the run stops and says so.
+        """
+        try:
+            got = self._logits(bgr, boxes, prompts)
+        except Exception as err:                       # noqa: BLE001
+            raise RuntimeError(
+                f"SAM 3 box mode could not produce per-pixel scores ({err}). "
+                "Panel 3 is built from them, so there is nothing "
+                "meaningful to draw. Use --prompt-mode text, whose backend "
+                "returns pred_masks as floats by construction.") from err
+        if got is None or len(got) < len(boxes):
+            raise RuntimeError(
+                "SAM 3 box mode returned no per-pixel scores; see --prompt-mode "
+                "text, which does not depend on reaching past the high-level API.")
+        # Logits, not probabilities: sigmoid before they are read as confidences,
+        # matching what the SAM 1 script does.
+        soft = [1.0 / (1.0 + np.exp(-g)) for g in got]
+        return [(a > 0.5).astype(np.uint8) for a in soft] if binary else soft
 
 
 def main():
@@ -248,8 +207,6 @@ def main():
     ap.add_argument("--dilate-px", type=int, default=22,
                     help="radius for panel 3's green band. 22 is the operating "
                          "point score_contact reports at")
-    ap.add_argument("--crop-pad", type=int, default=0,
-                    help="context around each box in the isolated reading")
     ap.add_argument("--prompt-source", default="rgb", choices=["rgb", "depth_points"],
                     help="depth_points adds negative point prompts on the ground "
                          "and on the other animal. Applies to --prompt-mode boxes "
@@ -300,7 +257,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     prompt_rng = np.random.default_rng(int(cfg["random_seed"]))
 
-    report, failed, no_depth, soft_seen = [], 0, 0, []
+    report, failed, no_depth = [], 0, 0
     n_floor = n_boxes = 0
 
     for i, record in enumerate(records):
@@ -322,13 +279,13 @@ def main():
                 n_boxes += len(boxes)
 
         try:
-            if args.prompt_mode == "text":
-                got = seg(bgr, boxes, path=record["image_path"])
-                whole_masks = ([g.astype(np.float32) for g in got]
-                               if got is not None else None)
-                soft = False
-            else:
-                whole_masks, soft = seg(bgr, boxes, prompts=prompts)
+            # Both backends return per-pixel probabilities, so panels 3 and 5
+            # mean the same thing whichever is used and whichever figure they
+            # are compared against.
+            got = (seg(bgr, boxes, path=record["image_path"], binary=False)
+                   if args.prompt_mode == "text"
+                   else seg(bgr, boxes, prompts=prompts, binary=False))
+            whole_masks = list(got) if got is not None else None
         except Exception as err:                   # noqa: BLE001
             print(f"[sam3] failed on {record['rel_image']}: {err}")
             failed += 1
@@ -336,7 +293,6 @@ def main():
         if whole_masks is None or len(whole_masks) < 2:
             failed += 1
             continue
-        soft_seen.append(bool(soft))
 
         mi = (whole_masks[0] > 0.5).astype(np.uint8)
         mj = (whole_masks[1] > 0.5).astype(np.uint8)
@@ -362,42 +318,21 @@ def main():
                 if keep is not None:
                     cut, band = band & ~keep, band & keep
 
-        # Panel 3. With a soft output this is the same uncertainty product the
-        # SAM 1 script draws; with binary masks it is their overlap, which is a
-        # real quantity but a different one, so the tile says which.
-        if soft:
-            ui = 4.0 * whole_masks[0] * (1.0 - whole_masks[0])
-            uj = 4.0 * whole_masks[1] * (1.0 - whole_masks[1])
-            strict = ui * uj
-        else:
-            strict = (mi & mj).astype(np.float32)
-
-        def seg_crop(sub, _seg=seg):
-            if args.prompt_mode == "text":
-                g = _seg(sub, [(0, 0, sub.shape[1], sub.shape[0])],
-                         path=None)
-                return g[0].astype(np.float32) if g is not None else None
-            g, _ = _seg(sub, [(0, 0, sub.shape[1], sub.shape[0])])
-            return g[0] if g is not None else None
-
-        try:
-            ci, cj = crop_reading(seg_crop, bgr, boxes, args.crop_pad)
-        except Exception as err:                   # noqa: BLE001
-            print(f"[sam3] crop reading failed on {record['rel_image']}: {err}")
-            ci = cj = np.zeros((h, w), np.float32)
-        mutual = ci * cj
+        # Panel 3: the same uncertainty product the SAM 1 script draws. One
+        # definition, always.
+        ui = 4.0 * whole_masks[0] * (1.0 - whole_masks[0])
+        uj = 4.0 * whole_masks[1] * (1.0 - whole_masks[1])
+        strict = ui * uj
 
         report.append({
             "rel_image": record["rel_image"],
             "annotation": {-1: "unlabelled", 0: "no_interaction",
                            1: "interaction"}[record["label"]],
-            "soft_scores": int(bool(soft)),
             "mi_px": int(mi.sum()), "mj_px": int(mj.sum()),
             "overlap_px": int((mi & mj).sum()),
             "band_px": int(band.sum()),
             "band_frac": round(float(band.sum()) / (h * w), 4),
             "cut_px": int(cut.sum()) if cut is not None else 0,
-            "mutual_px": int((mutual > 0.5).sum()),
         })
 
         if not args.no_images:
@@ -407,15 +342,7 @@ def main():
                 cv2.rectangle(tiles[0], (b[0], b[1]), (b[2], b[3]), c, 2)
             pts = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes]
             tiles.append(_mask_tile(rgb, mi, mj, pts))
-            t3 = _map_tile(rgb, strict, band, cut)
-            label = "uncertainty" if soft else "mask overlap (binary masks)"
-            for col, th in (((0, 0, 0), 3), ((255, 255, 255), 1)):
-                cv2.putText(t3, label, (6, t3.shape[0] - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, th, cv2.LINE_AA)
-            tiles.append(t3)
-            tiles.append(_mask_tile(rgb, (ci > 0.5).astype(np.uint8),
-                                    (cj > 0.5).astype(np.uint8), pts))
-            tiles.append(_map_tile(rgb, mutual, None))
+            tiles.append(_map_tile(rgb, strict, band, cut))
 
             gap = np.full((h, 6, 3), 250, np.uint8)
             row = np.hstack([t for pair in zip(tiles, [gap] * len(tiles))
@@ -436,16 +363,6 @@ def main():
         print(f"[sam3] depth found visible ground in {n_floor}/{n_boxes} boxes "
               f"({n_floor / n_boxes:.0%})")
 
-    if soft_seen and not any(soft_seen):
-        print("\n[sam3] the wrapper returned BINARY masks on every pair, so no")
-        print("[sam3] per-pixel score exists. Panels 3 and 5 therefore show mask")
-        print("[sam3] overlap, not the uncertainty product the SAM 1 figure")
-        print("[sam3] draws; they are labelled accordingly and must not be")
-        print("[sam3] compared with that figure's panels 3 and 5 as like for")
-        print("[sam3] like. Panels 1, 2 and the green band ARE comparable.")
-    elif any(soft_seen):
-        print(f"\n[sam3] soft scores available on {np.mean(soft_seen):.0%} of "
-              "pairs; panel 3 is the same uncertainty product as the SAM 1 figure")
 
     b = np.array([r["band_frac"] for r in report], float)
     print(f"\n[sam3] green band: median {np.median(b):.1%} of the crop, "
@@ -464,12 +381,11 @@ def main():
         json.dump({"split": args.split, "n": len(report),
                    "prompt_mode": args.prompt_mode, "text": args.text,
                    "dilate_px": args.dilate_px,
-                   "soft_scores_any": bool(any(soft_seen))}, f, indent=2)
+                   }, f, indent=2)
 
     print(f"\n[sam3] wrote {out_dir}")
     print("[sam3] panel order:")
-    print("      crop + boxes | instance masks | overlap/uncertainty + band"
-          " | isolated crops | both claims")
+    print("      crop + boxes | instance masks | uncertainty + band")
     print("[sam3] green outline = the contact band; "
           + ("purple = what the depth gate removed"
              if args.depth_tol is not None else "no depth gate applied"))
