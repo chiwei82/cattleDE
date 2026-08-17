@@ -247,13 +247,13 @@ def main():
                          "above 0 must be reported alongside the number")
     ap.add_argument("--limit", type=int, default=0, help="0 = every annotated crop")
     ap.add_argument("--source", default="sam3_text",
-                    choices=["sam3_text", "sam3_boxes", "cache"],
+                    choices=["sam3_text", "cache"],
                     help="sam3_text (default) runs SAM 3 concept segmentation "
-                         "here and now; sam3_boxes runs SAM 3 with box+point "
-                         "prompts; cache reads a prebuilt mask cache. This is "
-                         "what decides WHICH segmenter is measured, so it is "
+                         "here and now; cache reads a prebuilt mask cache. This "
+                         "is what decides WHICH segmenter is measured, so it is "
                          "echoed in the output")
-    ap.add_argument("--weights", default="sam3.pt")
+    ap.add_argument("--weights", default=None,
+                    help="Hugging Face id or a local snapshot DIRECTORY")
     ap.add_argument("--text", default="cow",
                     help="noun phrase for concept segmentation")
     ap.add_argument("--conf", type=float, default=None,
@@ -278,10 +278,6 @@ def main():
     if args.source == "sam3_text":
         seg = Sam3(args.weights, args.text, args.conf)
         source_label = f"SAM 3 concept prompt, text={args.text!r}"
-    elif args.source == "sam3_boxes":
-        from contactTest.visualize_sam3_confusion import Sam3Boxes
-        seg = Sam3Boxes(args.weights)
-        source_label = f"SAM 3 box+point prompts ({args.weights})"
     else:
         source_label = f"cached masks from {mask_dir}"
     gt_path = args.gt or os.path.join(CONTACT_ROOT, "log", "annotate", args.split,
@@ -315,8 +311,7 @@ def main():
             masks = load_masks(record, bgr.shape[:2])
         else:
             try:
-                got = (seg.assign_to_boxes(bgr, boxes)
-                       if args.source == "sam3_text" else seg(bgr, boxes)[0])
+                got = seg.assign_to_boxes(bgr, boxes)
                 masks = ([(np.asarray(g) > 0.5).astype(np.uint8) for g in got]
                          if got is not None else None)
             except Exception as err:                   # noqa: BLE001

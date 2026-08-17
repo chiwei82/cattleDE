@@ -289,7 +289,8 @@ def main():
                     help="default: data.video_dir from config.yaml, which "
                          "mirrors interaction_prep.video_dir of "
                          "global_config.yaml. The search is recursive")
-    ap.add_argument("--weights", default="sam3.pt")
+    ap.add_argument("--weights", default=None,
+                    help="Hugging Face id or a local snapshot DIRECTORY")
     ap.add_argument("--text", default="cow")
     ap.add_argument("--conf", type=float, default=None,
                     help="SAM 3 score floor; default is data.sam3_conf "

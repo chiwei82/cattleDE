@@ -155,7 +155,7 @@ class Sam3:
             scs.append(float(scores[q]))
         return masks, bxs, scs
 
-    def assign_to_boxes(self, bgr, boxes, binary=True, path=None):
+    def assign_to_boxes(self, bgr, boxes, binary=True):
         """The two instances best matching two given boxes, or None.
 
         Used where a detector has already decided WHICH two animals are in

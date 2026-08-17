@@ -2,12 +2,9 @@
 
 Usage (from the repository root):
 
+    python -m contactTest.visualize_sam3_confusion --balance --limit 24
     python -m contactTest.visualize_sam3_confusion --balance --limit 24 \\
-        --weights sam3.pt --dilate-px 22
-    python -m contactTest.visualize_sam3_confusion --balance --limit 24 \\
-        --weights sam3.pt --text cow --depth-tol 0.10 --depth-gate pair
-    python -m contactTest.visualize_sam3_confusion --limit 24 --weights sam3.pt \\
-        --prompt-mode boxes --prompt-source depth_points
+        --text cow --depth-tol 0.10 --depth-gate pair
 
 Writes to contactTest/log/sam3_confusion/<split>/ only.
 
@@ -49,19 +46,23 @@ The panel built from UNCERTAINTY needs a per-pixel score, not a mask:
 
 SAM 3 provides it. `pred_masks` is a float tensor of shape
 (batch, num_queries, H, W) and sigmoid turns it into per-pixel probabilities, so
-this panel carries over unchanged. That is the reason the text backend goes
-through transformers rather than ultralytics: ultralytics' postprocess ends in
-`masks = masks > mask_threshold`, discarding the only quantity these two panels
-are made of, and `post_process_instance_segmentation` binarises as well. Neither
-is used. Queries are kept by the documented score
+this panel carries over unchanged. That is why the model is reached through
+transformers rather than ultralytics: ultralytics' postprocess ends in
+`masks = masks > mask_threshold`, discarding the only quantity panel 3 is made
+of, and `post_process_instance_segmentation` binarises as well. Neither is used.
+Queries are kept by the documented score
 `pred_logits.sigmoid() * presence_logits.sigmoid()`.
 
-`--prompt-mode boxes` reaches for the same scores below the high-level
-ultralytics API. If it cannot get them the run stops rather than drawing
-something else: an earlier version substituted the binary mask overlap into
-these panels when the scores were missing, which changed what panel 3 MEANS
-between runs. For a figure whose point is comparing settings on identical crops,
-a panel whose meaning varies is worse than a panel that is absent.
+ONE SEGMENTER, ONE IMPORT
+
+Everything here goes through `contactTest.sam3.Sam3`. A second backend used to
+live in this file, driving the same checkpoint with SAM 2 style box+point
+prompts through ultralytics, so that the weights and the prompt type could be
+varied separately. It is gone, for two reasons. It reached past the high-level
+API for the per-pixel scores, which broke on every ultralytics change; and a
+box-prompted backend cannot answer the question this project is now asking —
+whether SAM 3 can replace the detector — because it needs the detector's boxes
+before it can be prompted at all.
 
 Promptable Concept Segmentation (PCS) takes such prompts and returns 
 segmentation masks and unique identities for all matching object instances
@@ -102,7 +103,6 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from contactTest.precompute_masks import depth_prompts
 from contactTest.sam3 import Sam3
 from contactTest.sam_contact_region import depth_stats, load_depth
 from contactTest.src.data import load_records, relative_boxes, split_records
@@ -192,122 +192,6 @@ def uncertainty(pi, pj):
     return (4.0 * pi * (1.0 - pi)) * (4.0 * pj * (1.0 - pj))
 
 
-class Sam3Boxes:
-    """SAM 3 driven with the SAM 2 style box/point interface.
-
-    Kept alongside the text backend so the checkpoint and the prompt type can be
-    varied separately: a change measured with `--prompt-mode boxes` isolates
-    what the newer weights are worth, and `--prompt-mode text` adds what the
-    concept prompt is worth on top of that.
-    """
-
-    def __init__(self, weights):
-        from ultralytics import SAM
-
-        self.model = SAM(weights)
-        print(f"[sam3] box/point prompts ({weights})")
-
-    def _prompt_args(self, boxes, prompts):
-        if prompts is not None:
-            return ([[[float(x), float(y)] for x, y in p] for p, _ in prompts],
-                    [[int(v) for v in lab] for _, lab in prompts])
-        return ([[(b[0] + b[2]) / 2, (b[1] + b[3]) / 2] for b in boxes],
-                [1] * len(boxes))
-
-    def _predictor(self, bgr):
-        """The predictor, built if ultralytics has not built it yet.
-
-        `SAM.predictor` is created lazily, on the first predict() call. Reaching
-        for it before that returns None, which is the whole of the
-        "'NoneType' object has no attribute 'set_image'" failure — inference was
-        never attempted, so it said nothing about whether the logits are
-        reachable.
-        """
-        if getattr(self.model, "predictor", None) is None:
-            h, w = bgr.shape[:2]
-            # One real call whose output is thrown away, purely to construct the
-            # predictor. A single centre point keeps it off the "segment
-            # everything" path, which would run the full grid for nothing.
-            self.model.predict(bgr, points=[[w / 2.0, h / 2.0]], labels=[1],
-                               verbose=False)
-        return self.model.predictor
-
-    def _logits(self, bgr, boxes, prompts):
-        """
-        Raw mask logits
-        """
-        import torch
-        from ultralytics.utils import ops
-
-        # inference_mode, not bare predict. Calling p.inference() directly walks
-        # past predictor.__call__, which is where ultralytics puts its
-        # @smart_inference_mode decorator — so without this the autograd graph
-        # for a 1036x1036 ViT is kept alive for every crop and the GPU fills up
-        # within a handful of pairs. The text backend has had `no_grad` since it
-        # was written; this path silently had nothing.
-        with torch.inference_mode():
-            p = self._predictor(bgr)
-            p.set_image(bgr)
-            im = getattr(p, "im", None)
-            if im is None:
-                return None
-            pts, labs = self._prompt_args(boxes, prompts)
-            pred, _ = p.inference(
-                im,
-                bboxes=np.asarray([list(map(float, b)) for b in boxes], np.float32),
-                points=np.asarray(pts, np.float32),
-                labels=np.asarray(labs, np.int32),
-                multimask_output=False)
-            # Decoder resolution -> the crop's own grid, the same rescaling the
-            # thresholded path applies before it binarises.
-            out = ops.scale_masks(pred[None].float(), bgr.shape[:2])[0]
-            # Copied to host inside the block so nothing on the device outlives
-            # it; the caller only ever sees numpy.
-            return [out[k].cpu().numpy().astype(np.float32)
-                    for k in range(len(boxes))]
-
-    def __call__(self, bgr, boxes, prompts=None, binary=False):
-        """Per-pixel probabilities for each box.
-
-        No fallback to thresholded masks. An earlier version substituted the
-        binary overlap into panels 3 and 5 when the logits could not be reached,
-        which quietly changed what those panels MEAN from one run to the next —
-        fatal for a figure whose whole purpose is to be read beside the SAM 1
-        one. If the scores are unavailable the run stops and says so.
-        """
-        try:
-            got = self._logits(bgr, boxes, prompts)
-        except Exception as err:                       # noqa: BLE001
-            # An OOM leaves the caching allocator full, so without this the
-            # SECOND pair onwards fails for a reason that has nothing to do with
-            # it — which is how one failure came to look like every pair
-            # failing.
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:                          # noqa: BLE001
-                pass
-            raise RuntimeError(
-                f"SAM 3 box mode raised {type(err).__name__}: {err}\n"
-                "Panel 3 is built from per-pixel scores, so there is nothing "
-                "meaningful to draw without them. Note this does NOT establish "
-                "that the scores are unreachable — it is whatever went wrong, "
-                "reported verbatim. Read it before switching backends.\n"
-                "--prompt-mode text is the alternative: it goes through "
-                "transformers, where pred_masks is a float tensor by "
-                "construction and nothing has to be reached for past a "
-                "high-level API.") from err
-        if got is None or len(got) < len(boxes):
-            raise RuntimeError(
-                "SAM 3 box mode returned no per-pixel scores; see --prompt-mode "
-                "text, which does not depend on reaching past the high-level API.")
-        # Logits, not probabilities: sigmoid before they are read as confidences,
-        # matching what the SAM 1 script does.
-        soft = [1.0 / (1.0 + np.exp(-g)) for g in got]
-        return [(a > 0.5).astype(np.uint8) for a in soft] if binary else soft
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -317,13 +201,10 @@ def main():
     ap.add_argument("--balance", action="store_true",
                     help="half interaction / half not. Affects which images are "
                          "shown, never how they are measured")
-    ap.add_argument("--weights", default="sam3.pt",
-                    help="sam3.pt is gated: request access at "
-                         "huggingface.co/facebook/sam3 and run 'hf auth login'")
-    ap.add_argument("--prompt-mode", default="text", choices=["text", "boxes"],
-                    help="text: concept segmentation, then instances assigned to "
-                         "the boxes by IoU. boxes: SAM 2 style box+point prompts, "
-                         "which isolates the checkpoint from the prompt type")
+    ap.add_argument("--weights", default=None,
+                    help="Hugging Face id or a local snapshot DIRECTORY. "
+                         "facebook/sam3 is gated: request access, then "
+                         "'hf auth login'")
     ap.add_argument("--text", default="cow",
                     help="noun phrase for concept segmentation. Worth sweeping - "
                          "concept prompting is sensitive to wording")
@@ -334,20 +215,12 @@ def main():
     ap.add_argument("--dilate-px", type=int, default=22,
                     help="radius for panel 3's green band. 22 is the operating "
                          "point score_contact reports at")
-    ap.add_argument("--prompt-source", default="rgb", choices=["rgb", "depth_points"],
-                    help="depth_points adds negative point prompts on the ground "
-                         "and on the other animal. Applies to --prompt-mode boxes "
-                         "only: a concept prompt has nowhere to put them")
     ap.add_argument("--depth-tol", type=float, default=None,
                     help="filter panel 3's band by depth at this tolerance")
     ap.add_argument("--depth-gate", default="pair",
                     help="comma-separated: pair, body, step")
     ap.add_argument("--no-images", action="store_true")
     args = ap.parse_args()
-
-    if args.prompt_source == "depth_points" and args.prompt_mode != "boxes":
-        raise SystemExit("--prompt-source depth_points needs --prompt-mode boxes; "
-                         "a concept prompt takes no point labels")
 
     cfg = load_config(args.config)
     if args.conf is None:
@@ -369,25 +242,17 @@ def main():
         raise SystemExit(f"no rows in split '{args.split}'")
 
     try:
-        if args.prompt_mode == "text":
-            seg = Sam3(args.weights, args.text, args.conf)
-        else:
-            seg = Sam3Boxes(args.weights)
+        seg = Sam3(args.weights, args.text, args.conf)
     except Exception as err:                       # noqa: BLE001
         raise SystemExit(
             f"could not load SAM 3 ({err}).\n"
-            "  pip install -U ultralytics          # >= 8.3.237\n"
             "  request access at huggingface.co/facebook/sam3, then: hf auth login\n"
-            "If a tokenizer error appears:\n"
-            "  pip uninstall clip -y && "
-            "pip install git+https://github.com/ultralytics/CLIP.git")
+            "  pip install -U transformers")
 
     out_dir = os.path.join(CONTACT_ROOT, "log", "sam3_confusion", args.split)
     os.makedirs(out_dir, exist_ok=True)
-    prompt_rng = np.random.default_rng(int(cfg["random_seed"]))
 
     report, failed, no_depth = [], 0, 0
-    n_floor = n_boxes = 0
 
     for i, record in enumerate(records):
         bgr = cv2.imread(record["image_path"])
@@ -396,24 +261,10 @@ def main():
         h, w = bgr.shape[:2]
         boxes = relative_boxes(record, h, w)
 
-        prompts = None
-        if args.prompt_source == "depth_points":
-            dep_p = load_depth(record, (h, w))
-            if dep_p is None:
-                no_depth += 1
-            else:
-                prompts, used = depth_prompts(dep_p[0], dep_p[1], dep_p[2],
-                                              boxes, prompt_rng)
-                n_floor += used
-                n_boxes += len(boxes)
-
         try:
-            # Both backends return per-pixel probabilities, so panels 3 and 5
-            # mean the same thing whichever is used and whichever figure they
-            # are compared against.
-            got = (seg(bgr, boxes, path=record["image_path"], binary=False)
-                   if args.prompt_mode == "text"
-                   else seg(bgr, boxes, prompts=prompts, binary=False))
+            # binary=False: panel 3 is an uncertainty product and needs the
+            # per-pixel probability, not a threshold of it.
+            got = seg.assign_to_boxes(bgr, boxes, binary=False)
             whole_masks = list(got) if got is not None else None
         except Exception as err:                   # noqa: BLE001
             print(f"[sam3] failed on {record['rel_image']}: {err}")
@@ -476,12 +327,7 @@ def main():
 
     print(f"\n[sam3] {len(report)} pairs, {failed} failed"
           + (f", {no_depth} without a cached depth map" if no_depth else ""))
-    print(f"[sam3] prompt mode: {args.prompt_mode}"
-          + (f", text={args.text!r}" if args.prompt_mode == "text" else ""))
-    if n_boxes:
-        print(f"[sam3] depth found visible ground in {n_floor}/{n_boxes} boxes "
-              f"({n_floor / n_boxes:.0%})")
-
+    print(f"[sam3] concept prompt, text={args.text!r}, conf={args.conf}")
 
     b = np.array([r["band_frac"] for r in report], float)
     print(f"\n[sam3] green band: median {np.median(b):.1%} of the crop, "
@@ -498,7 +344,7 @@ def main():
         wtr.writerows(report)
     with open(os.path.join(out_dir, "sam3_summary.json"), "w") as f:
         json.dump({"split": args.split, "n": len(report),
-                   "prompt_mode": args.prompt_mode, "text": args.text,
+                   "text": args.text, "conf": args.conf,
                    "dilate_px": args.dilate_px,
                    }, f, indent=2)
 

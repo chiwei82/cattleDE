@@ -31,8 +31,10 @@ data:
   # proximity = exp(-(dist_to_i + dist_to_j) / gap_scale_px), evaluated on the
   # letterboxed canvas: 1 where the two surfaces touch, decaying with the gap.
   gap_scale_px: 15.0
-  # Weights for precompute_masks.py; ultralytics downloads this on first use.
-  sam_weights: sam_b.pt
+  # SAM 3 is loaded by contactTest/sam3.py from the Hugging Face hub, not from a
+  # local .pt. The default id lives in that module; --weights takes an id or a
+  # local snapshot DIRECTORY. `sam_weights` below is dead and nothing reads it.
+  # sam_weights: sam_b.pt
 
   # Source videos, for evaluate_wholeframe.py. The crops were cut straight from
   # video rather than from stored frames, so the whole-frame control has to

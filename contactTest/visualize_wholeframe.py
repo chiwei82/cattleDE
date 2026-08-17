@@ -182,7 +182,8 @@ def main():
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="train", choices=["train", "val", "test"])
     ap.add_argument("--video-root", default=None)
-    ap.add_argument("--weights", default="sam3.pt")
+    ap.add_argument("--weights", default=None,
+                    help="Hugging Face id or a local snapshot DIRECTORY")
     ap.add_argument("--text", default="cow")
     ap.add_argument("--conf", type=float, default=None,
                     help="SAM 3 score floor; default is data.sam3_conf "
