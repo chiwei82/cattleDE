@@ -197,6 +197,42 @@ class FrameSource:
             idx += 1
         cap.release()
 
+    def frames_every(self, source_video, step):
+        """Yield (frame_number, frame) for every `step`-th frame, from the start.
+
+        This is prep's own sampling loop: it read the file straight through and
+        acted whenever `frame_idx % frame_step == 0`, where frame_idx counted
+        successful reads. Reproducing the walk reproduces both which frames are
+        chosen AND what number they were given.
+        """
+        stem = os.path.splitext(source_video)[0]
+        path = self.index.get(stem)
+        if path is None:
+            return
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            return
+        idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % step == 0:
+                yield idx, frame
+            idx += 1
+        cap.release()
+
+    def fps(self, source_video):
+        """Source frame rate, for turning a sample_fps into a frame step."""
+        stem = os.path.splitext(source_video)[0]
+        path = self.index.get(stem)
+        if path is None:
+            return None
+        cap = cv2.VideoCapture(path)
+        v = cap.get(cv2.CAP_PROP_FPS) if cap.isOpened() else None
+        cap.release()
+        return v or None
+
     def get(self, source_video, frame_number):
         """Random access by seeking. NOT USED, and not safe on this footage.
 

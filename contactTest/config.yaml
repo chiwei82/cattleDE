@@ -48,6 +48,10 @@ data:
   video_dir: "/user/work/sf24225/data/Full_behav/Videos to process batch 1 - social contacts"
   pair_iou_low: 0.1
   pair_iou_high: 0.8
+  # Frames per second at which prep walked each video. Mirrors
+  # interaction_prep.sample_fps; prep_sam3 needs it to visit the same frames
+  # rather than only the ones the other detector already produced a pair in.
+  sample_fps: 1.0
 
 # ── Label mapping ─────────────────────────────────────────────────────────────
 # Mirrors the rule already used by train/interaction_with_image.py so that this

@@ -132,11 +132,24 @@ def main():
     ap.add_argument("--nested-thresh", type=float, default=0.85,
                     help="mirrors interaction_prep.nested_thresh")
     ap.add_argument("--out-dir", default=os.path.join("log", "prep_sam3"),
-                    help="relative to contactTest/; nothing outside it is written")
+                    help="where the dataset goes. A path starting with data/ or "
+                         "an absolute path is taken from the repository root, so "
+                         "--out-dir data/interaction_sam3 sits beside "
+                         "data/interaction; anything else is under contactTest/. "
+                         "Nothing existing is ever overwritten - this only ever "
+                         "creates a new tree")
+    ap.add_argument("--sample-fps", type=float, default=None,
+                    help="walk each video at this rate, exactly as prep did, "
+                         "instead of visiting only frames that already appear "
+                         "in the CSV. THIS IS WHAT BUILDS A PARALLEL DATASET: "
+                         "the CSV only holds frames where YOLO already found a "
+                         "pair, so without this a frame SAM 3 would have paired "
+                         "and YOLO did not is never even decoded. Default comes "
+                         "from data.sample_fps in config.yaml")
     ap.add_argument("--all-frames", action="store_true",
-                    help="every sampled frame of the split. The default is the "
-                         "frames your clicks live in, which is all the "
-                         "comparison needs and far cheaper")
+                    help="every frame in the CSV for this split, rather than "
+                         "only the clicked ones. Still limited to frames YOLO "
+                         "produced a pair in - see --sample-fps")
     ap.add_argument("--match-iou", type=float, default=0.3,
                     help="least merged-box IoU before a SAM 3 pair counts as the "
                          "counterpart of an annotated pair")
@@ -151,6 +164,8 @@ def main():
         args.iou_low = float(cfg["data"].get("pair_iou_low", 0.1))
     if args.iou_high is None:
         args.iou_high = float(cfg["data"].get("pair_iou_high", 0.8))
+    if args.sample_fps is None and cfg["data"].get("sample_fps") is not None:
+        args.sample_fps = float(cfg["data"]["sample_fps"])
 
     gt_path = args.gt or os.path.join(CONTACT_ROOT, "log", "annotate", args.split,
                                       "contact_gt.csv")
@@ -178,7 +193,16 @@ def main():
         raise SystemExit(f"{len(missing)} videos not found under {args.video_root}: "
                          + ", ".join(sorted(missing)[:4]))
 
-    out_root = os.path.join(CONTACT_ROOT, args.out_dir)
+    out_root = (args.out_dir if os.path.isabs(args.out_dir)
+                else os.path.join(REPO_ROOT, args.out_dir)
+                if args.out_dir.split(os.sep)[0] == "data"
+                else os.path.join(CONTACT_ROOT, args.out_dir))
+    if os.path.isdir(out_root) and os.listdir(out_root):
+        raise SystemExit(
+            f"{out_root} already exists and is not empty.\n"
+            "Refusing to write into it: a half-overwritten dataset is worse "
+            "than none, and the crops are what every later measurement reads.\n"
+            "Remove it or pass a different --out-dir.")
     os.makedirs(out_root, exist_ok=True)
 
     from contactTest.sam3 import Sam3
@@ -204,11 +228,23 @@ def main():
         if stop:
             break
         video_stem = os.path.splitext(video)[0].replace(" ", "_")
-        for fno, frame in src.frames_for(video, sorted(by_video[video])):
+        if args.sample_fps:
+            # prep's own walk: every frame_step-th frame of the whole video,
+            # frame_step = round(src_fps / sample_fps). Selecting frames from
+            # the CSV instead would restrict this dataset to where the OTHER
+            # detector already succeeded, which is the asymmetry the experiment
+            # exists to avoid.
+            fps = src.fps(video) or 25.0
+            step = max(1, int(round(fps / args.sample_fps)))
+            print(f"[prep3] {video}: {fps:.1f} fps, sampling every {step} frames")
+            walker = src.frames_every(video, step)
+        else:
+            walker = src.frames_for(video, sorted(by_video[video]))
+        for fno, frame in walker:
             if args.limit and n_frames >= args.limit:
                 stop = True
                 break
-            items = wanted[(video, fno)]
+            items = wanted.get((video, fno), [])
             H, W = frame.shape[:2]
 
             # SAM 3's own pred_boxes and query scores. interaction_prep read
