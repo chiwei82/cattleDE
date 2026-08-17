@@ -29,11 +29,6 @@ PANELS
     4  Blind area, violin + strip    share of prediction covering no GT point;
                                      controls drawn apart, see below
     5  Hit quality, violin + strip   cluster area over GT disc area; 1.0 drawn
-    6  Sensitivity against a_i       with y = x, which IS the chance line:
-                                     a region of area a placed at random covers
-                                     a fraction a of the points, so points above
-                                     the diagonal beat chance and the vertical
-                                     distance from it is the margin
 
 The strip is every image drawn individually next to its violin, because a violin
 is a smoothed estimate and with 81 crops the smoothing can invent shapes the
@@ -141,7 +136,11 @@ def violin_strip(ax, series, labels, log=False, ref=None, ref_label=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--split", default="train", choices=["train", "val", "test"])
+    ap.add_argument("--split", default="all",
+                    choices=["train", "val", "test", "all"],
+                    help="picks the default --csv, log/evaluate/<split>/"
+                         "evaluation.csv. 'all' matches what annotate_contact "
+                         "samples and evaluate_contact writes")
     ap.add_argument("--csv", action="append", default=None,
                     help="per-image CSV, relative to contactTest/. Repeat to "
                          "overlay runs; default is the evaluate_contact output "
@@ -172,7 +171,11 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    # Five panels on a 2x3 grid: the sixth cell is removed rather than left
+    # blank, so tight_layout does not reserve space for an axis that is not there.
     fig, axes = plt.subplots(2, 3, figsize=(15.5, 8.6))
+    fig.delaxes(axes[1][2])
+    used = [axes[0][0], axes[0][1], axes[0][2], axes[1][0], axes[1][1]]
     fig.suptitle(args.title or f"per-image metric distributions — "
                  + ", ".join(f"{l} (n={r['n']})" for l, r in zip(labels, runs)),
                  fontsize=12)
@@ -232,32 +235,8 @@ def main():
     ax.set_title("5  Hit quality — cluster area / GT disc area", fontsize=10)
     ax.set_ylabel("x", fontsize=8)
 
-    # 6 — sensitivity against a_i, with the chance diagonal
-    ax = axes[1][2]
-    hi = 0.0
-    for k, r in enumerate(runs):
-        m = np.isfinite(r["sensitivity"]) & np.isfinite(r["a_i"])
-        ax.scatter(r["a_i"][m], r["sensitivity"][m], s=18, alpha=0.6,
-                   color=C_SERIES[k % len(C_SERIES)], linewidths=0,
-                   label=f"{labels[k]}  n={int(m.sum())}")
-        if m.any():
-            hi = max(hi, float(np.nanmax(r["a_i"][m])))
-    top = max(hi * 1.08, 0.05)
-    ax.plot([0, 1], [0, 1], ls="--", lw=1.0, color="0.45")
-    ax.annotate("y = x : a region of this area placed at random\n"
-                "covers this fraction of points — points above it\n"
-                "beat chance, and the gap is the margin",
-                (0.03, 0.97), xycoords="axes fraction", fontsize=7,
-                color="0.35", va="top")
-    ax.set_xlim(0, top)
-    ax.set_ylim(0, 1.02)
-    ax.set_title("6  Sensitivity vs a$_i$", fontsize=10)
-    ax.set_xlabel("a$_i$ — share of the crop proposed", fontsize=8)
-    ax.set_ylabel("sensitivity", fontsize=8)
-    ax.legend(fontsize=7.5, loc="lower right")
-
     n_ctrl = [int(np.nansum(r["is_control"] == 1)) for r in runs]
-    for a in axes.ravel():
+    for a in used:
         a.grid(alpha=0.18, linewidth=0.6)
         a.tick_params(labelsize=8)
     note = ("Controls (crops annotated 'no contact') have no GT points, so "

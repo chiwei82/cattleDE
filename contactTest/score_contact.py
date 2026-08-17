@@ -48,7 +48,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from contactTest.sam_contact_region import (DEPTH_STATS, contact_readings,
                                             depth_stats, load_depth, load_masks)
-from contactTest.src.data import load_records, relative_boxes, split_records
+from contactTest.src.data import load_records, records_for, relative_boxes
 from contactTest.src.utils import load_config
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -142,7 +142,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
-    ap.add_argument("--split", default="train", choices=["train", "val", "test"])
+    ap.add_argument("--split", default="train",
+                    choices=["train", "val", "test", "all"],
+                    help="all covers every session, which is what "
+                         "annotate_contact now samples over. Stage 2 "
+                         "fits nothing, so a held-out split protects "
+                         "against nothing here")
     ap.add_argument("--touch-px", type=int, default=10)
     ap.add_argument("--dilate-px", type=int, default=15)
     ap.add_argument("--strip-px", type=int, default=6)
@@ -170,7 +175,7 @@ def main():
     gt = read_gt(gt_path)
 
     by_rel = {r["rel_image"]: r
-              for r in split_records(load_records(cfg, require_label=False))[args.split]}
+              for r in records_for(load_records(cfg, require_label=False), args.split)}
 
     if args.check_only:
         check_gt(gt, by_rel)

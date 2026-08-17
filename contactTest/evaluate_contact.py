@@ -90,7 +90,7 @@ from contactTest.sam3 import Sam3
 from contactTest.sam_contact_region import (contact_readings, depth_stats,
                                             load_depth, load_masks)
 from contactTest.score_contact import read_gt
-from contactTest.src.data import load_records, relative_boxes, split_records
+from contactTest.src.data import load_records, records_for, relative_boxes
 from contactTest.src.utils import load_config
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -226,7 +226,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
-    ap.add_argument("--split", default="train", choices=["train", "val", "test"])
+    ap.add_argument("--split", default="train",
+                    choices=["train", "val", "test", "all"],
+                    help="all covers every session, which is what "
+                         "annotate_contact now samples over. Stage 2 "
+                         "fits nothing, so a held-out split protects "
+                         "against nothing here")
     ap.add_argument("--reading", default="dilated",
                     choices=["overlap", "gap", "surface", "dilated"])
     ap.add_argument("--dilate-px", type=int, default=22)
@@ -286,7 +291,7 @@ def main():
         raise SystemExit(f"no ground truth at {gt_path}")
     gt = read_gt(gt_path)
     by_rel = {r["rel_image"]: r
-              for r in split_records(load_records(cfg, require_label=False))[args.split]}
+              for r in records_for(load_records(cfg, require_label=False), args.split)}
 
     gt_radius = (args.gt_dilate_px if args.gt_dilate_px is not None
                  else max(1, int(round(args.gt_dilate_scale * args.dilate_px))))

@@ -170,6 +170,11 @@ def load_records(cfg, splits=None, require_label=True):
                 "bbox2": parse_bbox(row["bbox2_xyxy"]),
                 "merged": parse_bbox(row["merged_bbox_xyxy"]),
                 "label": label,
+                # Kept raw as well as mapped. `label` collapses "never
+                # annotated" and "annotated as a bad crop" into -1 when
+                # require_label is False, and telling those apart is the whole
+                # basis on which annotate_contact chooses its sample.
+                "label_v1": str(row.get("label_v1") or "").strip().lower(),
                 "label_v2": str(row.get("label_v2") or "").strip().lower(),
                 "split": split,
                 "source_video": str(row.get("source_video") or "").strip(),
@@ -504,6 +509,20 @@ def split_records(records):
     for r in records:
         buckets.get(r["split"], buckets["train"]).append(r)
     return buckets
+
+
+def records_for(records, split):
+    """Rows of one split, or every row when split == "all".
+
+    "all" exists for the post-processing measurements. Stage 2 fits nothing, so
+    train/val/test carry no meaning there — a held-out set protects against
+    having learned the answer, and nothing here learns. Restricting the ground
+    truth to one split would only shrink it.
+    """
+    b = split_records(records)
+    if split == "all":
+        return b["train"] + b["val"] + b["test"]
+    return b[split]
 
 
 def describe(buckets):
