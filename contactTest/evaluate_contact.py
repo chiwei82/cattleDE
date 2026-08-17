@@ -228,7 +228,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="train",
-                    choices=["train", "val", "test", "all"],
+                    choices=["train", "val", "test", "all", "known_interact"],
                     help="all covers every session, which is what "
                          "annotate_contact now samples over. Stage 2 "
                          "fits nothing, so a held-out split protects "

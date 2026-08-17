@@ -140,7 +140,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--split", default="all",
-                    choices=["train", "val", "test", "all"],
+                    choices=["train", "val", "test", "all", "known_interact"],
                     help="picks the default --csv, log/evaluate/<split>/"
                          "evaluation.csv. 'all' matches what annotate_contact "
                          "samples and evaluate_contact writes")

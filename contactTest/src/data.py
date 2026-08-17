@@ -520,7 +520,11 @@ def records_for(records, split):
     truth to one split would only shrink it.
     """
     b = split_records(records)
-    if split == "all":
+    if split in ("all", "known_interact"):
+        # known_interact is not a CSV split. It names a ground-truth SET, and
+        # which rows belong to it is decided by that set's contact_gt.csv, not
+        # here; this call only builds the rel_image -> record index the scorers
+        # look rows up in, so it has to span everything.
         return b["train"] + b["val"] + b["test"]
     return b[split]
 
