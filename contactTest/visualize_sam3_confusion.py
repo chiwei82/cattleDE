@@ -283,7 +283,10 @@ def main():
     ap.add_argument("--text", default="cow",
                     help="noun phrase for concept segmentation. Worth sweeping - "
                          "concept prompting is sensitive to wording")
-    ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--conf", type=float, default=None,
+                    help="SAM 3 score floor; default is data.sam3_conf "
+                         "from config.yaml, which mirrors the value the "
+                         "detector stage used")
     ap.add_argument("--dilate-px", type=int, default=22,
                     help="radius for panel 3's green band. 22 is the operating "
                          "point score_contact reports at")
@@ -303,6 +306,8 @@ def main():
                          "a concept prompt takes no point labels")
 
     cfg = load_config(args.config)
+    if args.conf is None:
+        args.conf = float(cfg["data"].get("sam3_conf", 0.6))
     rows = split_records(load_records(cfg, require_label=False))[args.split]
     rng = np.random.default_rng(int(cfg["random_seed"]))
 

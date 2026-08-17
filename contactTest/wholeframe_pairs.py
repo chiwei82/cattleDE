@@ -108,7 +108,10 @@ def main():
     ap.add_argument("--weights", default=None,
                     help="Hugging Face id or a local snapshot DIRECTORY")
     ap.add_argument("--text", default="cow")
-    ap.add_argument("--conf", type=float, default=0.85)
+    ap.add_argument("--conf", type=float, default=None,
+                    help="SAM 3 score floor; default is data.sam3_conf "
+                         "from config.yaml, which mirrors the value the "
+                         "detector stage used")
     ap.add_argument("--iou-low", type=float, default=None,
                     help="default: data.pair_iou_low, mirroring what prep used")
     ap.add_argument("--iou-high", type=float, default=None)
@@ -126,6 +129,8 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.conf is None:
+        args.conf = float(cfg["data"].get("sam3_conf", 0.6))
     if args.video_root is None:
         args.video_root = cfg["data"].get("video_dir")
     if args.iou_low is None:

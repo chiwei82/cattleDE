@@ -256,7 +256,10 @@ def main():
     ap.add_argument("--weights", default="sam3.pt")
     ap.add_argument("--text", default="cow",
                     help="noun phrase for concept segmentation")
-    ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--conf", type=float, default=None,
+                    help="SAM 3 score floor; default is data.sam3_conf "
+                         "from config.yaml, which mirrors the value the "
+                         "detector stage used")
     ap.add_argument("--mask-dir", default=None,
                     help="cache to read when --source cache, overriding "
                          "data.mask_dir")
@@ -265,6 +268,8 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.conf is None:
+        args.conf = float(cfg["data"].get("sam3_conf", 0.6))
     if args.mask_dir:
         cfg["data"]["mask_dir"] = args.mask_dir
     mask_dir = cfg["data"].get("mask_dir")

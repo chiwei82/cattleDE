@@ -291,7 +291,10 @@ def main():
                          "global_config.yaml. The search is recursive")
     ap.add_argument("--weights", default="sam3.pt")
     ap.add_argument("--text", default="cow")
-    ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--conf", type=float, default=None,
+                    help="SAM 3 score floor; default is data.sam3_conf "
+                         "from config.yaml, which mirrors the value the "
+                         "detector stage used")
     ap.add_argument("--iou-low", type=float, default=None,
                     help="pairing rule; default is data.pair_iou_low from "
                          "config.yaml, which mirrors the value prep used")
@@ -352,6 +355,8 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.conf is None:
+        args.conf = float(cfg["data"].get("sam3_conf", 0.6))
     # Taken from config rather than hardcoded: the path and the pair rule are
     # recorded in global_config.yaml and mirrored there, so a hand-copied value
     # in this file is one more thing that can silently fall out of step - which

@@ -48,11 +48,18 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 DEFAULT_MODEL_ID = "facebook/sam3"
 
+# Matches data.sam3_conf in config.yaml, which every entry point reads. Defined
+# here too so a direct construction does not silently get a different, looser
+# threshold than the scripts do — which is exactly what happened while this sat
+# at a library default nobody had chosen.
+DEFAULT_CONF = 0.6
+
 
 class Sam3:
     """SAM 3 concept segmentation on a whole image."""
 
-    def __init__(self, weights=None, text="cow", conf=0.25, device=None):
+    def __init__(self, weights=None, text="cow", conf=DEFAULT_CONF,
+                 device=None):
         import torch
         from transformers import Sam3Model, Sam3Processor
 

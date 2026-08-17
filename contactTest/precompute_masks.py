@@ -212,8 +212,9 @@ def main():
                     help="noun phrase for --backend sam3_text. SAM 3 segments "
                          "the concept itself, so the pen floor is not a "
                          "candidate answer the way it is for a bare box")
-    ap.add_argument("--conf", type=float, default=0.25,
-                    help="confidence floor for SAM 3 concept segmentation")
+    ap.add_argument("--conf", type=float, default=None,
+                    help="SAM 3 score floor; default is data.sam3_conf "
+                         "from config.yaml")
     ap.add_argument("--limit", type=int, default=None,
                     help="process only the first N pairs, for a quick quality check")
     ap.add_argument("--prompt-source", default="rgb",
@@ -235,6 +236,8 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.conf is None:
+        args.conf = float(cfg["data"].get("sam3_conf", 0.6))
     if args.weights:
         cfg["data"]["sam_weights"] = args.weights
     cache_root = os.path.join(

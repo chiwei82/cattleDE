@@ -52,6 +52,17 @@ data:
   # interaction_prep.sample_fps; prep_sam3 needs it to visit the same frames
   # rather than only the ones the other detector already produced a pair in.
   sample_fps: 1.0
+  # Confidence floor for SAM 3 concept segmentation, used EVERYWHERE SAM 3 is
+  # asked to do the first stage's job. Mirrors the VALUE of
+  # interaction_prep.yolo_conf, which was chosen on best F1 for the detector.
+  #
+  # It is not the same QUANTITY. YOLO's conf is a detection confidence; SAM 3's
+  # is pred_logits.sigmoid() * presence_logits.sigmoid(). Equal numbers do not
+  # mean equal strictness, and nothing here claims they do — the value is
+  # matched so that neither stage is quietly given an easier threshold than the
+  # other, which is what happened while this was left at a default nobody had
+  # discussed.
+  sam3_conf: 0.6
 
 # ── Label mapping ─────────────────────────────────────────────────────────────
 # Mirrors the rule already used by train/interaction_with_image.py so that this
