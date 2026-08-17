@@ -107,7 +107,7 @@ from contactTest.sam3 import Sam3
 from contactTest.sam_contact_region import depth_stats, load_depth
 from contactTest.src.data import load_records, relative_boxes, split_records
 from contactTest.src.utils import load_config
-from contactTest.sam_contact_region import contact_readings
+from contactTest.sam_contact_region import dilated_band
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 C_I, C_J = (214, 120, 42), (52, 104, 235)
@@ -280,8 +280,7 @@ def main():
             failed += 1
             continue
 
-        band = contact_readings(mi, mj, args.touch_px, args.dilate_px,
-                                    args.strip_px)["dilated"]
+        band = dilated_band(mi, mj, args.dilate_px)
         cut = None
         if args.depth_tol is not None:
             dep = load_depth(record, (h, w))

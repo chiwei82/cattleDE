@@ -71,7 +71,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from contactTest.evaluate_wholeframe import FrameSource
 from contactTest.sam3 import Sam3, box_iou
-from contactTest.sam_contact_region import contact_readings
+from contactTest.sam_contact_region import dilated_band
 from contactTest.src.data import load_records, split_records
 from contactTest.src.utils import load_config
 from contactTest.visualize_sam3_confusion import panel, uncertainty
@@ -116,8 +116,6 @@ def main():
                     help="default: data.pair_iou_low, mirroring what prep used")
     ap.add_argument("--iou-high", type=float, default=None)
     ap.add_argument("--dilate-px", type=int, default=22)
-    ap.add_argument("--touch-px", type=int, default=10)
-    ap.add_argument("--strip-px", type=int, default=6)
     ap.add_argument("--frames", type=int, default=6, help="frames to process")
     ap.add_argument("--limit", type=int, default=24, help="pairs to draw")
     ap.add_argument("--crop-to-pair", action="store_true",
@@ -189,8 +187,7 @@ def main():
                   f"{len(pairs)} pairs at {args.iou_low}-{args.iou_high} box IoU")
 
             for (i, j) in pairs:
-                band = contact_readings(hard[i], hard[j], args.touch_px,
-                                        args.dilate_px, args.strip_px)["dilated"]
+                band = dilated_band(hard[i], hard[j], args.dilate_px)
                 strict = uncertainty(masks[i], masks[j])
                 rows.append({
                     "source_video": video, "frame_number": fno,

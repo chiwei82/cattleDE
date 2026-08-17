@@ -295,6 +295,23 @@ def boundary(mask):
     return (mask.astype(bool) & ~er.astype(bool)).astype(np.uint8)
 
 
+def dilated_band(mi, mj, dilate_px):
+    """dilate(mi, r) AND dilate(mj, r) — the ROI, on its own.
+
+    Callers that only want this reading should use it instead of
+    contact_readings(...)["dilated"]: the four readings are computed in one pass,
+    so asking for all of them costs two distance transforms and a boundary pass
+    that are then thrown away, and it forces the caller to supply touch_px and
+    strip_px, which have no bearing whatsoever on this band. That is how a file
+    drawing only the green outline came to carry two parameters it never used.
+
+    contact_readings calls this, so there is one definition of the band and the
+    figures cannot drift from the numbers.
+    """
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1,) * 2)
+    return (cv2.dilate(mi, k) > 0) & (cv2.dilate(mj, k) > 0)
+
+
 def contact_readings(mi, mj, touch_px, dilate_px, strip_px,
                      depth=None, spread=None, gates=None, inverse=True,
                      boxes=None):
@@ -319,7 +336,7 @@ def contact_readings(mi, mj, touch_px, dilate_px, strip_px,
         "overlap": (mi.astype(bool) & mj.astype(bool)),
         "gap": ((di + dj) <= touch_px),
         "surface": surface,
-        "dilated": (cv2.dilate(mi, k) > 0) & (cv2.dilate(mj, k) > 0),
+        "dilated": dilated_band(mi, mj, dilate_px),
     }
 
     if depth is not None and gates:
