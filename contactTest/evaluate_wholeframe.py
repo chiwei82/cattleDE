@@ -633,7 +633,7 @@ def main():
             rec_m, lab, hitting = evaluate_one(region, points, (H, W), gt_radius,
                                                denom_px=denom)
             rec_m["rel_image"] = f"{video}#{fno}"
-            rec_m["is_control"] = int(len(points) == 0)
+            rec_m["no_contact"] = int(len(points) == 0)
             rec_m["n_sam3_instances"] = len(inst)
             rec_m["n_sam3_pairs"] = len(pairs)
             rec_m["n_yolo_pairs"] = n_yolo_pairs
@@ -648,9 +648,9 @@ def main():
                 s = rec_m["sensitivity"]
                 img = banner(img, [
                     (f"{video} frame {fno}   "
-                     + ("CONTROL" if rec_m["is_control"] else
+                     + ("no contact" if rec_m["no_contact"] else
                         f"sensitivity {s:.0%} ({rec_m['n_covered']}/{rec_m['n_points']})"),
-                     (150, 30, 30) if rec_m["is_control"] else
+                     (150, 30, 30) if rec_m["no_contact"] else
                      ((25, 110, 40) if s >= .8 else (170, 60, 25))),
                     (f"SAM 3 found {len(inst)} cattle -> {len(pairs)} pairs   "
                      f"YOLO gave {n_yolo_pairs} annotated pair(s)", (80, 80, 80)),
@@ -658,7 +658,7 @@ def main():
                      f"   a_i {rec_m['a_i']:.2%}   scope={args.scope}"
                      + ("  (white outline = scored area)"
                         if args.scope == "annotated" else ""), (80, 80, 80))])
-                tag = "ctrl" if rec_m["is_control"] else f"{int(round(s * 100)):03d}"
+                tag = "none" if rec_m["no_contact"] else f"{int(round(s * 100)):03d}"
                 cv2.imwrite(os.path.join(out_dir, f"{tag}_{video}_{fno:08d}.jpg"),
                             cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
@@ -798,7 +798,7 @@ def main():
         print(f"\n  {failed} frames skipped (video or SAM 3 failure); excluded "
               "from every number above")
 
-    keys = ["rel_image", "is_control", "n_points", "n_covered", "sensitivity",
+    keys = ["rel_image", "no_contact", "n_points", "n_covered", "sensitivity",
             "n_clusters", "n_fp_clusters", "area_px", "a_i", "lift",
             "hit_quality", "gt_disc_px", "blind_area_px", "blind_frac",
             "n_sam3_instances", "n_sam3_pairs", "n_yolo_pairs"]

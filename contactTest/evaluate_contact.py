@@ -35,10 +35,10 @@ THE SIX METRICS
      False positives per image. Counts CLUSTERS, not pixels, so one large
      wrong blob costs the same as one small wrong blob — this measures how
      many wrong places are proposed, and metric 3 measures how much they cost.
-     Images annotated "no contact" contribute every cluster they have, since
-     none of them can cover a GT point; they are reported separately as well,
-     because that split is the difference between "fires in the wrong place"
-     and "fires when it should not fire at all".
+     Images marked "no contact" contribute every cluster they have, since
+     none of them can cover a GT point. They are counted in with the rest:
+     a "no contact" mark is the annotator's finding about that image, not a
+     designed negative arm, so there is nothing to report separately.
 
   3  a-bar = mean over images of (predicted pixels / image pixels)
      Mean over images as specified, so every crop counts once regardless of
@@ -69,8 +69,9 @@ THE SIX METRICS
      the budget, the second is noise.
 
      Pooled over all pixels in all images, matching "total proposed area".
-     The per-image ratio is in the CSV as blind_frac. Control images
-     contribute all of their area, since none of it can cover a point.
+     The per-image ratio is in the CSV as blind_frac. Images marked "no
+     contact" contribute all of their area, since none of it can cover a
+     point.
 
 Everything is reported per image as well, in evaluation.csv.
 """
@@ -116,9 +117,9 @@ def gt_disc_mask(shape, points, radius):
 def evaluate_one(region, points, shape, gt_radius, denom_px=None):
     """Cluster-level numbers for a single image.
 
-    Returns the per-image record. `points` may be empty, which is the
-    "no contact" control: every cluster is then a false positive and the
-    point-based metrics are undefined rather than zero.
+    Returns the per-image record. `points` may be empty — the image was marked
+    "no contact" — and then every cluster is a false positive and the
+    point-based metrics are UNDEFINED rather than zero.
 
     `denom_px` is the area a_i is a share OF. It defaults to the whole image,
     which is right when the whole image could have been predicted. It must be
@@ -355,27 +356,27 @@ def main():
         points = ann["points"] if ann["status"] != "none" else []
         rec, lab, hitting = evaluate_one(region, points, bgr.shape[:2], gt_radius)
         rec["rel_image"] = rel
-        rec["is_control"] = int(ann["status"] == "none")
+        rec["no_contact"] = int(ann["status"] == "none")
         rows.append(rec)
 
         if not args.no_images:
             img = render(bgr, region, lab, hitting, points, gt_radius, rec)
             sens = rec["sensitivity"]
-            head = ("CONTROL - marked 'no contact'" if rec["is_control"]
+            head = ("marked 'no contact'" if rec["no_contact"]
                     else f"sensitivity {sens:.0%}  ({rec['n_covered']}/{rec['n_points']})")
             img = banner(img, [
                 (f"{os.path.basename(rel)}   {head}",
-                 (150, 30, 30) if rec["is_control"] else
+                 (150, 30, 30) if rec["no_contact"] else
                  ((25, 110, 40) if sens >= .8 else (170, 60, 25))),
                 (f"clusters {rec['n_clusters']}  false-positive {rec['n_fp_clusters']}"
                  f"   a_i {rec['a_i']:.2%}"
-                 + ("" if rec["is_control"] else f"   lift {rec['lift']:.0f}x"),
+                 + ("" if rec["no_contact"] else f"   lift {rec['lift']:.0f}x"),
                  (80, 80, 80)),
                 (f"hit quality {rec['hit_quality']:.2f}"
                  f"   (GT discs r={gt_radius}px, {rec['gt_disc_px']}px total)"
                  if np.isfinite(rec["hit_quality"]) else
                  "hit quality: no covered points", (80, 80, 80))])
-            tag = "ctrl" if rec["is_control"] else f"{int(round(sens * 100)):03d}"
+            tag = "none" if rec["no_contact"] else f"{int(round(sens * 100)):03d}"
             cv2.imwrite(os.path.join(out_dir, f"{tag}_{os.path.basename(rel)}"),
                         cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
@@ -383,9 +384,13 @@ def main():
         raise SystemExit("nothing evaluated - run precompute_masks.py first")
 
     # ---- aggregate ----------------------------------------------------------
+    # Every non-skip crop is in `rows` and every metric below is computed over
+    # all of them. Crops marked "no contact" are not a separate arm: they carry
+    # no GT points, so they contribute nothing to the point-weighted metrics by
+    # arithmetic rather than by exclusion, and their area and clusters count
+    # towards a-bar, FPPI and blind area like any other crop's.
     n_img = len(rows)
-    scored = [r for r in rows if not r["is_control"]]
-    ctrl = [r for r in rows if r["is_control"]]
+    n_none = sum(r["no_contact"] for r in rows)
 
     tot_pts = sum(r["n_points"] for r in rows)
     tot_cov = sum(r["n_covered"] for r in rows)
@@ -421,8 +426,7 @@ def main():
     print(f"  {args.reading} at dilate_px={args.dilate_px}"
           + (f", depth gate {args.depth_gate} <= {args.depth_tol}"
              if args.depth_tol is not None else ", no depth gate"))
-    print(f"  {n_img} images ({len(scored)} annotated, {len(ctrl)} controls), "
-          f"{tot_pts} GT points")
+    print(f"  {n_img} images ({n_none} marked 'no contact'), {tot_pts} GT points")
     print(f"  masks: {source_label}")
     print(f"{'=' * 62}\n")
     print(f"  1  Sensitivity   {sensitivity:>9.3f}   {tot_cov}/{tot_pts} points covered")
@@ -433,17 +437,6 @@ def main():
           f"(r={gt_radius}px)")
     print(f"  6  Blind area    {blind_frac:>9.3f}   {tot_blind}/{tot_area} px in "
           "clusters covering no GT")
-
-    if ctrl:
-        c_fp = sum(r["n_fp_clusters"] for r in ctrl)
-        s_fp = sum(r["n_fp_clusters"] for r in scored)
-        print(f"\n  FPPI split: {s_fp / max(len(scored), 1):.3f} on annotated "
-              f"images, {c_fp / len(ctrl):.3f} on the 'no contact' controls")
-        print("  The control figure is every cluster they have, since none can "
-              "cover a point;")
-        print("  it measures firing when it should not fire at all, which is a "
-              "different fault")
-        print("  from firing in the wrong place.")
 
     if np.isfinite(blind_frac):
         print(f"\n  Blind area {blind_frac:.1%} of everything predicted sits in "
@@ -465,7 +458,7 @@ def main():
               "which improves FPPI by construction. Report that alongside it.")
 
     per = os.path.join(out_dir, "evaluation.csv")
-    keys = ["rel_image", "is_control", "n_points", "n_covered", "sensitivity",
+    keys = ["rel_image", "no_contact", "n_points", "n_covered", "sensitivity",
             "n_clusters", "n_fp_clusters", "area_px", "a_i", "lift",
             "hit_quality", "gt_disc_px", "blind_area_px", "blind_frac"]
     with open(per, "w", newline="") as f:
@@ -481,7 +474,7 @@ def main():
                "depth_tol": args.depth_tol,
                "depth_gate": args.depth_gate if args.depth_tol is not None else None,
                "min_cluster_px": args.min_cluster_px,
-               "n_images": n_img, "n_controls": len(ctrl), "n_points": tot_pts,
+               "n_images": n_img, "n_no_contact": n_none, "n_points": tot_pts,
                "sensitivity": sensitivity, "fppi": fppi, "a_bar": a_bar,
                "lift": lift, "hit_quality": hit_q,
                "blind_area_frac": blind_frac,

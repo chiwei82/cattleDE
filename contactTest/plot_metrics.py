@@ -26,28 +26,31 @@ PANELS
     2  a_i, violin + strip           proposed area as a share of the crop
     3  Lift, violin on a log axis    a ratio, so it is read multiplicatively;
                                      1.0 is chance and is drawn
-    4  Blind area, violin + strip    share of prediction covering no GT point;
-                                     controls drawn apart, see below
+    4  Blind area, violin + strip    share of prediction covering no GT point
     5  Hit quality, violin + strip   cluster area over GT disc area; 1.0 drawn
 
 The strip is every image drawn individually next to its violin, because a violin
 is a smoothed estimate and with 81 crops the smoothing can invent shapes the
 data does not have. The points are the data.
 
-CONTROL IMAGES
+CROPS MARKED "NO CONTACT"
 
-Crops annotated "no contact" have no GT points, so sensitivity, lift and hit
-quality are undefined for them — not zero. They are excluded from those panels
-and counted in the caption.
+They are not a control group and are not held apart. A "no contact" mark is the
+annotator's finding about that one image, so those images are counted with the
+rest everywhere they have a value.
 
-a_i includes them: how much area the method predicts on a crop with no contact
-is a real measurement.
+Panels 2 and 4 include them. Panels 1, 3 and 5 do not, and that is arithmetic
+rather than a choice: sensitivity is covered/0, lift divides by it and hit
+quality averages over covered points, so all three are UNDEFINED without GT
+points — not zero. A NaN cannot be plotted.
 
-Blind area draws them separately, as crosses. With no GT points every cluster is
-blind, so their value is 1.0 BY DEFINITION; putting them in the violin would
-invent a bimodal distribution out of a tautology. Any annotated crop sitting at
-1.0 in that violin is a genuine total miss, and is the same image that shows up
-at 0 in panel 1.
+In panel 4 they sit at 1.0, because with no GT points every cluster is blind by
+construction. An annotated crop sitting at 1.0 there is something else entirely —
+a genuine total miss — and it is the same image that appears at 0 in panel 1.
+The caption gives the count so the two can be told apart.
+
+Crops marked "skip" during annotation are not-well-cropped and never reach this
+file: evaluate_contact drops them before anything is computed.
 """
 
 import argparse
@@ -72,7 +75,7 @@ def read_csv(path):
     if not rows:
         raise SystemExit(f"{path} has no rows")
     for k in ("sensitivity", "a_i", "lift", "blind_frac", "hit_quality",
-              "is_control"):
+              "no_contact"):
         vals = []
         for r in rows:
             v = r.get(k, "")
@@ -205,26 +208,19 @@ def main():
     ax.set_title("3  Lift = Sensitivity / a$_i$   (log axis)", fontsize=10)
     ax.set_ylabel("x chance", fontsize=8)
 
-    # 4 — blind area. Controls are excluded from the violin: with no GT points
-    # every cluster is blind, so their value is 1.0 by definition and including
-    # them makes the distribution look bimodal for a reason that is a tautology
-    # rather than a property of the method. They are drawn separately instead.
+    # 4 — blind area, every image in one distribution. Crops marked "no contact"
+    # are not a separate arm and are not drawn apart; they do sit at 1.0 by
+    # construction, which is said in the annotation rather than by splitting the
+    # data.
     ax = axes[1][0]
-    scored = [r["blind_frac"][~(r["is_control"] == 1)] for r in runs]
-    violin_strip(ax, scored, labels)
-    rng4 = np.random.default_rng(1)
-    n_at_one = 0
-    for k, r in enumerate(runs):
-        cv = finite(r["blind_frac"][r["is_control"] == 1])
-        n_at_one += len(cv)
-        if len(cv):
-            ax.scatter(k + rng4.normal(0, 0.05, len(cv)), cv, s=11, marker="x",
-                       color="0.5", alpha=0.7, linewidths=0.8)
+    violin_strip(ax, [r["blind_frac"] for r in runs], labels)
     ax.set_title("4  Blind area — prediction covering no GT point", fontsize=10)
     ax.set_ylabel("share of proposed pixels", fontsize=8)
+    n_at_one = sum(int(np.nansum(r["no_contact"] == 1)) for r in runs)
     if n_at_one:
-        ax.annotate("x = controls, 1.0 by construction\n(no GT points, so every "
-                    "cluster is blind)\nexcluded from the violin",
+        ax.annotate(f"{n_at_one} image(s) marked 'no contact' sit at 1.0:\n"
+                    "with no GT points every cluster is blind.\n"
+                    "Included here, as in every other number",
                     (0.03, 0.97), xycoords="axes fraction", fontsize=7,
                     color="0.4", va="top")
 
@@ -235,15 +231,16 @@ def main():
     ax.set_title("5  Hit quality — cluster area / GT disc area", fontsize=10)
     ax.set_ylabel("x", fontsize=8)
 
-    n_ctrl = [int(np.nansum(r["is_control"] == 1)) for r in runs]
+    n_ctrl = [int(np.nansum(r["no_contact"] == 1)) for r in runs]
     for a in used:
         a.grid(alpha=0.18, linewidth=0.6)
         a.tick_params(labelsize=8)
-    note = ("Controls (crops annotated 'no contact') have no GT points, so "
-            "sensitivity, lift and hit quality are UNDEFINED there and those "
-            "panels exclude them; a_i includes them, and panel 4 draws them "
-            "separately because their value there is 1.0 by definition. "
-            + ", ".join(f"{l}: {c} control(s) of {r['n']}"
+    note = ("Crops marked 'no contact' have no GT points, so sensitivity, lift "
+            "and hit quality are UNDEFINED for them and cannot be plotted in "
+            "panels 1, 3 and 5; panels 2 and 4 include them, at 1.0 in panel 4 "
+            "by construction. Crops marked 'skip' are not-well-cropped and were "
+            "dropped before any number was computed. "
+            + ", ".join(f"{l}: {c} of {r['n']} marked 'no contact'"
                         for l, c, r in zip(labels, n_ctrl, runs)))
     fig.text(0.5, 0.012, note, ha="center", fontsize=7.5, color="0.3", wrap=True)
     fig.tight_layout(rect=[0, 0.035, 1, 0.96])
@@ -258,7 +255,7 @@ def main():
     for l, r in zip(labels, runs):
         s, a = finite(r["sensitivity"]), finite(r["a_i"])
         print(f"\n[plot] {l}: {r['n']} images"
-              f"  ({int(np.nansum(r['is_control'] == 1))} controls)")
+              f"  ({int(np.nansum(r['no_contact'] == 1))} marked 'no contact')")
         if len(s):
             print(f"        sensitivity  median {np.median(s):.3f}   "
                   f"at 0: {np.mean(s == 0):.0%}   at 1: {np.mean(s == 1):.0%}")
