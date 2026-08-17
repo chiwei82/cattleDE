@@ -44,6 +44,7 @@ LAYOUT
 """
 
 import argparse
+import collections
 import colorsys
 import os
 import sys
@@ -233,26 +234,38 @@ def main():
     if not src.index:
         raise SystemExit(f"no videos under {args.video_root}")
 
-    from contactTest.precompute_masks import _SAM3Text
-    seg = _SAM3Text(args.weights, args.text, args.conf)
+    from contactTest.sam3 import Sam3
+    seg = Sam3(args.weights, args.text, args.conf)
 
     out_dir = os.path.join(CONTACT_ROOT, "log", "wholeframe_vis", args.split)
     os.makedirs(out_dir, exist_ok=True)
 
     made = 0
     tally = {"formed": 0, "outrange": 0, "merged": 0, "unsegmented": 0}
+
+    # Sequential decoding, as everywhere else: seeking addresses the decoder's
+    # position rather than the read counter prep stored, and on this HEVC
+    # footage it also returns pictures rebuilt from references it never decoded.
+    by_video = collections.defaultdict(list)
+    for t in items:
+        by_video[t[2]["source_video"]].append(t)
+    decoded = {}
+    for video, ts in by_video.items():
+        want = sorted({int(t[2]["frame_number"]) for t in ts})
+        for fno, fr in src.frames_for(video, want):
+            decoded[(video, fno)] = fr
+
     for rel, ann, rec in sorted(items, key=lambda t: t[0]):
         if made >= args.limit:
             break
-        frame, err = src.get(rec["source_video"], int(rec["frame_number"]))
+        frame = decoded.get((rec["source_video"], int(rec["frame_number"])))
         if frame is None:
-            print(f"[wfv] {rel}: {err}")
+            print(f"[wfv] {rel}: frame not reached by a sequential read")
             continue
         H, W = frame.shape[:2]
-        inst = seg.instances(frame)
+        inst, boxes3, _ = seg.detect(frame)   # SAM 3's own boxes
         if not inst:
             continue
-        boxes3 = [mask_box(m) for m in inst]
         keep = [k for k, b in enumerate(boxes3) if b is not None]
         inst = [inst[k] for k in keep]
         boxes3 = [boxes3[k] for k in keep]

@@ -1,30 +1,27 @@
-"""Cache SAM instance masks for every labelled pair crop.
+"""Cache SAM 3 instance masks for every labelled pair crop.
 
 Usage (from the repository root):
 
-    python -m contactTest.precompute_masks                # all splits
     python -m contactTest.precompute_masks --split train
-    python -m contactTest.precompute_masks --overwrite
+    python -m contactTest.precompute_masks --split train --overwrite
 
 Writes one .npz per pair under contactTest/log/mask_cache/, mirroring the crop's
 relative path, holding uint8 arrays 'mi' and 'mj' at the crop's own resolution.
 
-Why SAM and not a classical segmenter: both animals are black-and-white
-Holsteins whose colour statistics are identical, and the two boxes overlap by
-construction (the pair filter keeps IoU > 0.1). GrabCut initialised from either
-box therefore returns one animal and an empty mask for the other — measured on
-this dataset, so the contact band came out empty. SAM separates touching
-instances of the same class because it keys on learned objectness rather than
-colour, which is exactly the property needed here.
+Prompting is by CONCEPT: `--text cow`. Both animals are black-and-white
+Holsteins whose colour statistics are identical and whose boxes overlap by
+construction, so nothing keyed on colour or on box geometry separates them. The
+class-agnostic SAM 1 backends this file used to carry answered a box with
+whichever region best fitted it, and on this footage a uniform patch of pen
+floor fits a slightly loose box better than a high-contrast animal does; every
+prompt trick here — a centre point, extra points, depth-derived negative points
+— existed to steer around that. Asking for the concept removes the premise, so
+those backends were deleted rather than kept as a baseline nothing measures.
 
-Prompts are a box PLUS a positive point at its centre, matching panel 2 of
-visualize_sam_confusion exactly — SAM has no concept of "cow" and a box alone is
-routinely answered with a coherent patch of floor, while the point forces the
-mask to contain that pixel. Use --no-point only to reproduce the box-only
-behaviour for comparison.
-
-Ultralytics is already a dependency of the repository, so its SAM wrapper is
-tried first; the reference segment-anything package is the fallback.
+`--backend sam3_text` goes through transformers and returns per-pixel
+probabilities, SAM 3's own pred_boxes and the query scores. `--backend sam3`
+drives the same checkpoint with box and point prompts through ultralytics, so
+the prompt type can be varied without changing the weights.
 """
 
 import argparse
@@ -36,6 +33,7 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from contactTest.sam3 import Sam3
 from contactTest.sam_contact_region import load_depth
 from contactTest.src.data import load_records, relative_boxes, split_records
 from contactTest.src.utils import load_config
@@ -73,249 +71,6 @@ class _UltralyticsSAM:
             out.append(m)
         return out
 
-
-class _SAM3Text:
-    """SAM 3 concept prompting: segment the noun phrase, then match to the boxes.
-
-    This is a different kind of prompt from everything else in this file, and it
-    addresses the failure the others work around rather than the symptom. SAM 1
-    and SAM 2 are class-agnostic: given a box they return whichever coherent
-    region best fits it, and on this footage a uniform patch of pen floor is a
-    more coherent region than a high-contrast Holstein, so a slightly loose box
-    is answered with the ground. Positive points, negative points and depth
-    prompts are all ways of steering that. SAM 3 accepts the concept itself, so
-    the floor is not a candidate answer in the first place.
-
-    Promptable concept segmentation returns EVERY instance of the concept with
-    its own identity, in no particular order, rather than one mask per prompt.
-    Nothing in that output says which instance belongs to bbox1 and which to
-    bbox2, so the returned instances are assigned to the two detector boxes by
-    mask/box IoU and a pair is rejected if either box finds nothing. That is the
-    whole reason the assignment exists: identity, not filtering.
-
-    The assignment is greedy WITHOUT replacement because the pair filter keeps
-    only boxes overlapping by IoU > 0.1. The two boxes therefore always overlap,
-    and picking the best instance for each independently could hand the same
-    animal to both.
-
-    This step is the one piece here with no counterpart in the box-prompted
-    path, and it is where this backend can go wrong: check a sample with
-    compare_masks.py before trusting a whole cache of it.
-    """
-
-    DEFAULT_MODEL_ID = "facebook/sam3"
-
-    def __init__(self, weights=None, text="cow", conf=0.25, device=None):
-        import torch
-        from transformers import Sam3Model, Sam3Processor
-
-        # `weights` may be a Hugging Face id or a local snapshot DIRECTORY. It
-        # may not be an ultralytics .pt: that is a different serialisation of
-        # the same model and Sam3Model.from_pretrained cannot read it. Saying so
-        # beats loading the default and letting the run look as though the
-        # requested checkpoint was used.
-        model_id = self.DEFAULT_MODEL_ID
-        if weights:
-            if os.path.isdir(weights) or "/" in str(weights) and not str(
-                    weights).endswith((".pt", ".pth", ".safetensors")):
-                model_id = weights
-            elif str(weights).endswith((".pt", ".pth")):
-                print(f"[mask] NOTE: {weights} is an ultralytics checkpoint; the "
-                      "transformers path needs the Hugging Face layout "
-                      "(config.json + safetensors). Loading "
-                      f"{self.DEFAULT_MODEL_ID} instead — pass a local snapshot "
-                      "directory to --weights to use one on disk.")
-            else:
-                model_id = weights
-
-        # No device_map: that routes through accelerate, which is an extra
-        # dependency and is meant for sharding a model across several GPUs. One
-        # explicit .to() is enough here and fails more clearly when it fails.
-        self.torch = torch
-        self.text = text
-        self.conf = conf
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = Sam3Model.from_pretrained(model_id).to(self.device).eval()
-        self.processor = Sam3Processor.from_pretrained(model_id)
-        print(f"[mask] SAM 3 concept prompting via transformers ({model_id}) "
-              f"on {self.device}, text={text!r}, conf={conf}")
-
-    def _raw(self, bgr):
-        """Per-query mask probabilities and scores, at the crop's resolution.
-
-        transformers rather than ultralytics deliberately. Ultralytics' wrapper
-        ends its postprocess with
-
-            masks = masks > self.model.mask_threshold   # to bool
-
-        so the per-pixel score is gone before anything can read it, and the
-        uncertainty panels cannot be built from what it returns. The model emits
-        `pred_masks` as floats; sigmoid turns them into probabilities and nothing
-        thresholds them here. `post_process_instance_segmentation` would also
-        binarise, so it is not used either.
-
-        Query scores follow the documented form
-        `pred_logits.sigmoid() * presence_logits.sigmoid()`: the presence head is
-        what separates "this query found something" from "this query is one of
-        the 200 that matched nothing".
-        """
-        from PIL import Image
-
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        inputs = self.processor(images=Image.fromarray(rgb), text=self.text,
-                                return_tensors="pt").to(self.device)
-        with self.torch.no_grad():
-            out = self.model(**inputs)
-
-        scores = out.pred_logits.sigmoid()[0]
-        if getattr(out, "presence_logits", None) is not None:
-            scores = scores * out.presence_logits.sigmoid()[0]
-        probs = self.torch.sigmoid(out.pred_masks)          # (1, Q, H, W)
-        probs = self.torch.nn.functional.interpolate(
-            probs.float(), size=bgr.shape[:2], mode="bilinear",
-            align_corners=False)[0]
-        return probs, scores.reshape(-1)
-
-    @staticmethod
-    def _iou_with_box(mask, box):
-        x1, y1, x2, y2 = (int(max(0, box[0])), int(max(0, box[1])),
-                          int(min(mask.shape[1], box[2])),
-                          int(min(mask.shape[0], box[3])))
-        if x2 <= x1 or y2 <= y1:
-            return 0.0
-        inter = float(mask[y1:y2, x1:x2].sum())
-        union = float(mask.sum()) + (x2 - x1) * (y2 - y1) - inter
-        return inter / max(union, 1.0)
-
-    def instances(self, bgr, path=None, binary=True):
-        """Every instance of the concept in the image, unassigned.
-
-        Split out from __call__ because the whole-frame control needs the raw
-        instances — it has no detector boxes to assign them to, that being the
-        point of it.
-
-        `binary=False` returns the probabilities untouched, for the uncertainty
-        panels. The default thresholds, because everything else here wants a
-        mask; that threshold is applied HERE and visibly, rather than buried in
-        a wrapper's postprocess where it silently removes the only quantity
-        those panels need.
-        """
-        probs, scores = self._raw(bgr)
-        keep = (scores >= self.conf).nonzero().reshape(-1).tolist()
-        inst = []
-        for q in keep:
-            a = probs[q].cpu().numpy().astype(np.float32)
-            inst.append((a > 0.5).astype(np.uint8) if binary else a)
-        return inst
-
-    def __call__(self, bgr, boxes, use_point=True, prompts=None, path=None,
-                 binary=True):
-        # Assignment is done on thresholded masks because it ranks by IoU, which
-        # wants areas; what is RETURNED follows `binary`, so a caller that needs
-        # per-pixel scores gets them for the same instances the assignment chose.
-        probs, qscores = self._raw(bgr)
-        keep = (qscores >= self.conf).nonzero().reshape(-1).tolist()
-        if not keep:
-            return None
-        soft = [probs[q].cpu().numpy().astype(np.float32) for q in keep]
-        inst = [(a > 0.5).astype(np.uint8) for a in soft]
-        want = inst if binary else soft
-
-        # Greedy assignment over the full IoU matrix: take the best box/instance
-        # pair, remove both, repeat. With two boxes this is optimal.
-        scores = [[self._iou_with_box(a, b) for a in inst] for b in boxes]
-        out = [None] * len(boxes)
-        taken = set()
-        for _ in range(len(boxes)):
-            best, bk, bi = 0.0, None, None
-            for k in range(len(boxes)):
-                if out[k] is not None:
-                    continue
-                for i in range(len(inst)):
-                    if i in taken:
-                        continue
-                    if scores[k][i] > best:
-                        best, bk, bi = scores[k][i], k, i
-            if bk is None or best <= 0.0:
-                break
-            out[bk] = want[bi]
-            taken.add(bi)
-        return None if any(o is None for o in out) else out
-
-
-class _ReferenceSAM:
-    """Box-prompted SAM via the reference segment-anything package."""
-
-    def __init__(self, weights, model_type="vit_b"):
-        import torch
-        from segment_anything import SamPredictor, sam_model_registry
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        sam = sam_model_registry[model_type](checkpoint=weights).to(device)
-        self.predictor = SamPredictor(sam)
-
-    def __call__(self, bgr, boxes, use_point=True, prompts=None):
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        self.predictor.set_image(rgb)
-        out = []
-        for k, b in enumerate(boxes):
-            x1, y1, x2, y2 = map(float, b)
-            kw = {"box": np.array([x1, y1, x2, y2], np.float32)[None],
-                  "multimask_output": False}
-            if prompts is not None:
-                pts, lab = prompts[k]
-                kw["point_coords"] = np.asarray(pts, np.float32)
-                kw["point_labels"] = np.asarray(lab, np.int32)
-            elif use_point:
-                kw["point_coords"] = np.array([[(x1 + x2) / 2, (y1 + y2) / 2]],
-                                              np.float32)
-                kw["point_labels"] = np.array([1], np.int32)
-            masks, _, _ = self.predictor.predict(**kw)
-            out.append(masks[0].astype(np.uint8))
-        return out
-
-
-def build_segmenter(cfg, backend="auto", model_type="vit_b", text="cow",
-                    conf=0.25):
-    """Pick a SAM backend.
-
-    The two are not interchangeable: they wrap different checkpoints and
-    post-processing, so the masks differ. That matters because the green band in
-    panel 3 of visualize_sam_confusion comes from the reference package, and
-    scoring it against masks cached from ultralytics would score a different
-    band. Use backend="reference" to keep the two identical.
-    """
-    weights = cfg["data"].get("sam_weights", "sam_b.pt")
-    if backend == "sam3_text":
-        # sam3.pt is gated: request access at huggingface.co/facebook/sam3 and
-        # place the file where sam_weights points, or pass --weights.
-        return _SAM3Text(weights, text, conf)
-    if backend == "sam3":
-        # SAM 3 driven with the SAM 2 style box/point interface, so depth
-        # prompts still apply and the only variable is the checkpoint.
-        seg = _UltralyticsSAM(weights)
-        print(f"[mask] SAM 3 with box/point prompts ({weights})")
-        return seg
-    if backend == "reference":
-        seg = _ReferenceSAM(weights, model_type)
-        print(f"[mask] using segment-anything ({weights}, {model_type})")
-        return seg
-    if backend == "ultralytics":
-        seg = _UltralyticsSAM(weights)
-        print(f"[mask] using ultralytics SAM ({weights})")
-        return seg
-    try:
-        seg = _UltralyticsSAM(weights)
-        print(f"[mask] using ultralytics SAM ({weights})")
-        print("[mask] NOTE: visualize_sam_confusion uses segment-anything, so "
-              "these masks are not the ones its panels were drawn from. Pass "
-              "--backend reference to make them match.")
-        return seg
-    except Exception as err:                       # noqa: BLE001 - report and fall back
-        print(f"[mask] ultralytics SAM unavailable ({err}); trying segment-anything")
-    seg = _ReferenceSAM(weights, model_type)
-    print(f"[mask] using segment-anything ({weights}, {model_type})")
-    return seg
 
 
 def _sample(region, n, rng, erode=5):
@@ -446,14 +201,11 @@ def main():
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default=None, choices=["train", "val", "test"])
     ap.add_argument("--overwrite", action="store_true")
-    ap.add_argument("--backend", default="auto",
-                    choices=["auto", "reference", "ultralytics", "sam3",
-                             "sam3_text"],
-                    help="which SAM wrapper to use. 'reference' matches "
-                         "visualize_sam_confusion exactly, so the cached masks "
-                         "are the ones its panels were drawn from")
-    ap.add_argument("--model-type", default="vit_b",
-                    help="checkpoint variant for the reference backend")
+    ap.add_argument("--backend", default="sam3_text",
+                    choices=["sam3", "sam3_text"],
+                    help="sam3_text: concept prompting through transformers. "
+                         "sam3: the same checkpoint with box/point prompts "
+                         "through ultralytics")
     ap.add_argument("--weights", default=None,
                     help="overrides data.sam_weights; use it to point at sam3.pt")
     ap.add_argument("--text", default="cow",
@@ -462,11 +214,6 @@ def main():
                          "candidate answer the way it is for a bare box")
     ap.add_argument("--conf", type=float, default=0.25,
                     help="confidence floor for SAM 3 concept segmentation")
-    ap.add_argument("--no-point", action="store_true",
-                    help="box prompt only. The default adds a positive point at "
-                         "the box centre, which is what stops SAM answering with "
-                         "the floor; visualize_sam_confusion uses the same rule, "
-                         "so the cached masks match what its panel 2 showed")
     ap.add_argument("--limit", type=int, default=None,
                     help="process only the first N pairs, for a quick quality check")
     ap.add_argument("--prompt-source", default="rgb",
@@ -503,8 +250,7 @@ def main():
         raise SystemExit("no labelled rows to process")
     print(f"[mask] segmenting {len(records)} pairs -> {cache_root}")
 
-    seg = build_segmenter(cfg, args.backend, args.model_type, args.text,
-                          args.conf)
+    seg = build_segmenter(cfg, args.backend, None, args.text, args.conf)
     print(f"[mask] prompt source: {args.prompt_source}")
     done = skipped = failed = no_depth = 0
     n_split = n_boxes = 0
@@ -540,7 +286,7 @@ def main():
                 image = depth_as_image(depth, inverse)
 
         try:
-            kw = {"use_point": not args.no_point, "prompts": prompts}
+            kw = {"prompts": prompts}
             if args.backend == "sam3_text":
                 kw = {"path": record["image_path"]}
             masks = seg(image, boxes, **kw)

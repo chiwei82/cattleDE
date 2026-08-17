@@ -6,13 +6,14 @@ Usage (from the repository root):
     python -m contactTest.evaluate_contact --split train --weights sam3.pt \\
         --depth-tol 0.10 --depth-gate pair
     python -m contactTest.evaluate_contact --split train --source cache \\
-        --mask-dir log/mask_cache          # the SAM 1 baseline, for comparison
+        --mask-dir log/mask_cache          # a prebuilt cache, without re-running
 
 Runs the SAM 3 pipeline itself by default — concept prompt `--text cow`, then
 the returned instances assigned to the two detector boxes — so no mask cache has
 to exist first and there is no way to measure one segmenter while believing it
-is another. `--source cache` reads a prebuilt cache instead, which is how the
-SAM 1 baseline is put through exactly the same metrics.
+is another. `--source cache` reads a prebuilt cache instead — whatever
+precompute_masks wrote — which avoids re-running the model when only the
+downstream settings are being varied.
 
 Writes to contactTest/log/evaluate/<split>/ only: one image per crop, a
 per-image CSV, and a summary JSON. The aggregate numbers are printed.
@@ -85,7 +86,7 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from contactTest.precompute_masks import _SAM3Text
+from contactTest.sam3 import Sam3
 from contactTest.sam_contact_region import (contact_readings, depth_stats,
                                             load_depth, load_masks)
 from contactTest.score_contact import read_gt
@@ -112,12 +113,18 @@ def gt_disc_mask(shape, points, radius):
     return m
 
 
-def evaluate_one(region, points, shape, gt_radius):
+def evaluate_one(region, points, shape, gt_radius, denom_px=None):
     """Cluster-level numbers for a single image.
 
     Returns the per-image record. `points` may be empty, which is the
     "no contact" control: every cluster is then a false positive and the
     point-based metrics are undefined rather than zero.
+
+    `denom_px` is the area a_i is a share OF. It defaults to the whole image,
+    which is right when the whole image could have been predicted. It must be
+    overridden when the prediction was restricted to part of the image, because
+    otherwise a_i is diluted by territory the method was never allowed to use —
+    and Lift, being Sensitivity / a_i, is inflated by exactly that factor.
     """
     h, w = shape
     n_lab, lab = cv2.connectedComponents(region.astype(np.uint8))
@@ -136,7 +143,7 @@ def evaluate_one(region, points, shape, gt_radius):
     fp_clusters = n_clusters - len(hitting)
 
     area = float(region.sum())
-    a_i = area / float(h * w)
+    a_i = area / float(denom_px if denom_px else (h * w))
 
     # Metric 6. Area of the clusters covering no GT point at all. FPPI counts
     # how MANY places are wrongly proposed; this is how much of the prediction
@@ -264,7 +271,7 @@ def main():
 
     seg = None
     if args.source == "sam3_text":
-        seg = _SAM3Text(args.weights, args.text, args.conf)
+        seg = Sam3(args.weights, args.text, args.conf)
         source_label = f"SAM 3 concept prompt, text={args.text!r}"
     elif args.source == "sam3_boxes":
         from contactTest.visualize_sam3_confusion import Sam3Boxes
@@ -303,7 +310,7 @@ def main():
             masks = load_masks(record, bgr.shape[:2])
         else:
             try:
-                got = (seg(bgr, boxes, path=record["image_path"])
+                got = (seg.assign_to_boxes(bgr, boxes)
                        if args.source == "sam3_text" else seg(bgr, boxes)[0])
                 masks = ([(np.asarray(g) > 0.5).astype(np.uint8) for g in got]
                          if got is not None else None)

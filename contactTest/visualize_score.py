@@ -11,8 +11,8 @@ The numbers from score_contact say 77% of clicks land inside the band at
 dilate_px 22; this shows which 77%. Files are named by hit rate, so the crops
 the band gets wrong sort to the top and can be looked at rather than guessed at.
 
-The region is drawn FILLED, not only outlined. Panel 3 of visualize_sam_confusion
-outlines it with RETR_EXTERNAL, which does not draw holes — a pixel inside a hole
+The region is drawn FILLED, not only outlined. Outlining with RETR_EXTERNAL
+does not draw holes — a pixel inside a hole
 looks enclosed but scores as a miss. Here what is shaded is exactly the array the
 scorer indexes, so a point that reads as a miss can be seen to be one.
 

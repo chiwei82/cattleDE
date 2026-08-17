@@ -181,106 +181,120 @@ def main():
     out_root = os.path.join(CONTACT_ROOT, args.out_dir)
     os.makedirs(out_root, exist_ok=True)
 
-    from contactTest.precompute_masks import _SAM3Text
-    seg = _SAM3Text(args.weights, args.text, args.conf)
+    from contactTest.sam3 import Sam3
+    seg = Sam3(args.weights, args.text, args.conf)
 
     rows, gt_rows = [], []
     n_frames = n_pairs = 0
     matched = unmatched = 0
     pts_carried = pts_lost = 0
 
-    for (video, fno), items in sorted(wanted.items()):
-        if args.limit and n_frames >= args.limit:
+    # Sequential decoding, grouped by video, exactly as interaction_prep read the
+    # files: it counted successful cap.read() calls and stored that counter, so
+    # reproducing the count reproduces the frame. Seeking addresses the decoder's
+    # position instead, and on this HEVC footage it also hands back pictures
+    # rebuilt from references it never decoded, with cap.read() still returning
+    # True. This dataset must be cut from the same frames prep cut from.
+    by_video = collections.defaultdict(list)
+    for (video, fno) in wanted:
+        by_video[video].append(fno)
+
+    stop = False
+    for video in sorted(by_video):
+        if stop:
             break
-        frame, err = src.get(video, fno)
-        if frame is None:
-            print(f"[prep3] {video} {fno}: {err}")
-            continue
-        H, W = frame.shape[:2]
         video_stem = os.path.splitext(video)[0].replace(" ", "_")
+        for fno, frame in src.frames_for(video, sorted(by_video[video])):
+            if args.limit and n_frames >= args.limit:
+                stop = True
+                break
+            items = wanted[(video, fno)]
+            H, W = frame.shape[:2]
 
-        inst = seg.instances(frame)
-        boxes = []
-        for m in inst:
-            b = mask_box(m)
-            if b is None:
+            # SAM 3's own pred_boxes and query scores. interaction_prep read
+            # YOLO's box.xyxy and its conf; the substitute detector supplies the
+            # same two quantities, so what the downstream consumes is unchanged
+            # in kind. Deriving a box from the mask instead would insert a step
+            # present in neither pipeline and make this a comparison between
+            # YOLO and a post-processing choice of mine.
+            inst, pboxes, pscores = seg.detect(frame)
+            boxes = []
+            for m, b, sc in zip(inst, pboxes, pscores):
+                if b is None:
+                    continue
+                boxes.append((int(b[0]), int(b[1]), int(b[2]), int(b[3]),
+                              float(sc)))
+            if len(boxes) < 2:
                 continue
-            # Integer xyxy plus a confidence slot, so the tuple layout matches
-            # what _extract_boxes produced for YOLO. SAM 3's concept output has
-            # no per-instance score exposed here, so it is recorded as 1.0
-            # rather than invented.
-            boxes.append((int(b[0]), int(b[1]), int(b[2]), int(b[3]), 1.0))
-        if len(boxes) < 2:
-            continue
-        n_frames += 1
+            n_frames += 1
 
-        crops_dir = os.path.join(out_root, args.split, "crops", video_stem)
-        os.makedirs(crops_dir, exist_ok=True)
+            crops_dir = os.path.join(out_root, args.split, "crops", video_stem)
+            os.makedirs(crops_dir, exist_ok=True)
 
-        made_here = []
-        for pair_idx, (i, j) in enumerate(combinations(range(len(boxes)), 2)):
-            bbox1, bbox2 = boxes[i], boxes[j]
-            iou = compute_iou(bbox1, bbox2)
-            if not (args.iou_low < iou < args.iou_high):
-                continue
-            if is_nested(bbox1, bbox2, args.nested_thresh):
-                continue
-            merged = union_bbox(bbox1, bbox2)
-            merged_crop = safe_crop_bgr(frame, merged)
-            if merged_crop.size == 0:
-                continue
+            made_here = []
+            for pair_idx, (i, j) in enumerate(combinations(range(len(boxes)), 2)):
+                bbox1, bbox2 = boxes[i], boxes[j]
+                iou = compute_iou(bbox1, bbox2)
+                if not (args.iou_low < iou < args.iou_high):
+                    continue
+                if is_nested(bbox1, bbox2, args.nested_thresh):
+                    continue
+                merged = union_bbox(bbox1, bbox2)
+                merged_crop = safe_crop_bgr(frame, merged)
+                if merged_crop.size == 0:
+                    continue
 
-            stem = f"frame_{fno:08d}_pair_{pair_idx:02d}"
-            crop_abs = os.path.join(crops_dir, f"{stem}.jpg")
-            cv2.imwrite(crop_abs, merged_crop)
-            rel_new = os.path.relpath(crop_abs, REPO_ROOT)
-            rows.append({
-                "image_path": rel_new,
-                "bbox1_xyxy": fmt_bbox(bbox1), "bbox2_xyxy": fmt_bbox(bbox2),
-                "merged_bbox_xyxy": fmt_bbox(merged),
-                "bbox_confs": f"{bbox1[4]:.4f} {bbox2[4]:.4f}",
-                "pose_path_1": "", "pose_path_2": "",
-                "label_v1": "", "label_v2": "",
-                "source_video": video, "frame_number": fno, "split": args.split,
-            })
-            made_here.append((rel_new, merged))
-            n_pairs += 1
+                stem = f"frame_{fno:08d}_pair_{pair_idx:02d}"
+                crop_abs = os.path.join(crops_dir, f"{stem}.jpg")
+                cv2.imwrite(crop_abs, merged_crop)
+                rel_new = os.path.relpath(crop_abs, REPO_ROOT)
+                rows.append({
+                    "image_path": rel_new,
+                    "bbox1_xyxy": fmt_bbox(bbox1), "bbox2_xyxy": fmt_bbox(bbox2),
+                    "merged_bbox_xyxy": fmt_bbox(merged),
+                    "bbox_confs": f"{bbox1[4]:.4f} {bbox2[4]:.4f}",
+                    "pose_path_1": "", "pose_path_2": "",
+                    "label_v1": "", "label_v2": "",
+                    "source_video": video, "frame_number": fno, "split": args.split,
+                })
+                made_here.append((rel_new, merged))
+                n_pairs += 1
 
-        # Carry each annotated pair's clicks into whichever new pair corresponds
-        # to it, matched on merged-box overlap.
-        for rel, ann, rec in items:
-            old_m = rec["merged"]
-            best, best_iou = None, 0.0
-            for rel_new, new_m in made_here:
-                v = compute_iou(old_m, new_m)
-                if v > best_iou:
-                    best, best_iou = (rel_new, new_m), v
-            if best is None or best_iou < args.match_iou:
-                unmatched += 1
-                pts_lost += len(ann["points"])
-                continue
-            matched += 1
-            rel_new, new_m = best
-            ox_o, oy_o = max(0, int(old_m[0])), max(0, int(old_m[1]))
-            ox_n, oy_n = max(0, int(new_m[0])), max(0, int(new_m[1]))
-            ch = min(H, int(new_m[3])) - oy_n
-            cw = min(W, int(new_m[2])) - ox_n
-            if ann["status"] == "none":
-                gt_rows.append({"rel_image": rel_new, "status": "none",
-                                "x": "", "y": ""})
-                continue
-            for (x, y) in ann["points"]:
-                fx, fy = x + ox_o, y + oy_o          # crop -> frame
-                nx, ny = fx - ox_n, fy - oy_n        # frame -> new crop
-                if 0 <= nx < cw and 0 <= ny < ch:
-                    gt_rows.append({"rel_image": rel_new, "status": "point",
-                                    "x": int(nx), "y": int(ny)})
-                    pts_carried += 1
-                else:
-                    # The click landed outside the new merged box. Dropping it
-                    # silently would flatter the new dataset by removing the
-                    # very points its boxes failed to enclose.
-                    pts_lost += 1
+            # Carry each annotated pair's clicks into whichever new pair corresponds
+            # to it, matched on merged-box overlap.
+            for rel, ann, rec in items:
+                old_m = rec["merged"]
+                best, best_iou = None, 0.0
+                for rel_new, new_m in made_here:
+                    v = compute_iou(old_m, new_m)
+                    if v > best_iou:
+                        best, best_iou = (rel_new, new_m), v
+                if best is None or best_iou < args.match_iou:
+                    unmatched += 1
+                    pts_lost += len(ann["points"])
+                    continue
+                matched += 1
+                rel_new, new_m = best
+                ox_o, oy_o = max(0, int(old_m[0])), max(0, int(old_m[1]))
+                ox_n, oy_n = max(0, int(new_m[0])), max(0, int(new_m[1]))
+                ch = min(H, int(new_m[3])) - oy_n
+                cw = min(W, int(new_m[2])) - ox_n
+                if ann["status"] == "none":
+                    gt_rows.append({"rel_image": rel_new, "status": "none",
+                                    "x": "", "y": ""})
+                    continue
+                for (x, y) in ann["points"]:
+                    fx, fy = x + ox_o, y + oy_o          # crop -> frame
+                    nx, ny = fx - ox_n, fy - oy_n        # frame -> new crop
+                    if 0 <= nx < cw and 0 <= ny < ch:
+                        gt_rows.append({"rel_image": rel_new, "status": "point",
+                                        "x": int(nx), "y": int(ny)})
+                        pts_carried += 1
+                    else:
+                        # The click landed outside the new merged box. Dropping it
+                        # silently would flatter the new dataset by removing the
+                        # very points its boxes failed to enclose.
+                        pts_lost += 1
 
     if not rows:
         raise SystemExit("no pairs produced")

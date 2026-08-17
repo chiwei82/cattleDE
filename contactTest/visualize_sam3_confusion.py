@@ -1,4 +1,4 @@
-"""The five-panel figure of visualize_sam_confusion.py, with SAM 3 in place of SAM 1.
+"""Three-panel figure: SAM 3 instance masks and their uncertainty.
 
 Usage (from the repository root):
 
@@ -11,8 +11,8 @@ Usage (from the repository root):
 
 Writes to contactTest/log/sam3_confusion/<split>/ only.
 
-Same layout, same sampling and the same green band as the SAM 1 version, so the
-two are read side by side. `--limit` and the seed pick the same crops in both.
+Sampling is seeded, so repeated runs draw the same crops and two settings can be
+compared on identical images.
 
 WHAT CHANGES WITH SAM 3, AND WHAT CANNOT BE CARRIED OVER
 
@@ -59,8 +59,9 @@ is used. Queries are kept by the documented score
 `--prompt-mode boxes` reaches for the same scores below the high-level
 ultralytics API. If it cannot get them the run stops rather than drawing
 something else: an earlier version substituted the binary mask overlap into
-these panels when the scores were missing, which changed what panel 3 MEANS between runs. For a figure built to be read beside the SAM 1 one, a panel whose
-meaning varies is worse than a panel that is absent.
+these panels when the scores were missing, which changed what panel 3 MEANS
+between runs. For a figure whose point is comparing settings on identical crops,
+a panel whose meaning varies is worse than a panel that is absent.
 
 Promptable Concept Segmentation (PCS) takes such prompts and returns 
 segmentation masks and unique identities for all matching object instances
@@ -101,15 +102,94 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from contactTest.precompute_masks import _SAM3Text, depth_prompts
+from contactTest.precompute_masks import depth_prompts
+from contactTest.sam3 import Sam3
 from contactTest.sam_contact_region import depth_stats, load_depth
 from contactTest.src.data import load_records, relative_boxes, split_records
 from contactTest.src.utils import load_config
-from contactTest.visualize_sam_confusion import (_mask_tile, _map_tile,
-                                                 contact_band)
+from contactTest.sam_contact_region import contact_readings
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 C_I, C_J = (214, 120, 42), (52, 104, 235)
+
+
+# Drawing helpers, moved here when the SAM 1 figure was removed. They are
+# presentation only — no model, no measurement — so they live with the
+# figure that uses them rather than in a module about geometry.
+
+def _heat(img_rgb, m):
+    heat = cv2.cvtColor(cv2.applyColorMap((np.clip(m, 0, 1) * 255).astype(np.uint8),
+                                          cv2.COLORMAP_INFERNO), cv2.COLOR_BGR2RGB)
+    w = np.clip(m, 0, 1)[..., None] * 0.85
+    return (img_rgb * (1 - w) + heat * w).astype(np.uint8)
+
+def _mask_tile(img_rgb, mi, mj, points=None):
+    """Masks overlaid, with the prompt points drawn on top.
+
+    The point is what forces the mask to contain a given pixel, so when a mask
+    comes back looking wrong the first thing to check is where its point landed.
+    Showing it removes the guesswork.
+    """
+    out = img_rgb.astype(np.float32).copy()
+    for m, c in ((mi, C_I), (mj, C_J)):
+        sel = m > 0
+        out[sel] = out[sel] * 0.45 + np.asarray(c, np.float32) * 0.55
+    out = out.astype(np.uint8)
+    for p, c in zip(points or [], (C_I, C_J)):
+        px, py = int(round(p[0])), int(round(p[1]))
+        cv2.drawMarker(out, (px, py), (0, 0, 0), cv2.MARKER_CROSS, 15, 4,
+                       line_type=cv2.LINE_AA)
+        cv2.drawMarker(out, (px, py), c, cv2.MARKER_CROSS, 13, 2,
+                       line_type=cv2.LINE_AA)
+    return out
+
+def _map_tile(img_rgb, m, band=None, cut=None):
+    tile = _heat(img_rgb, m)
+    if cut is not None and cut.any():
+        # What the depth gate took out, outlined before the kept band so the
+        # green line stays on top where the two touch.
+        cnt, _ = cv2.findContours(cut.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                  cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(tile, cnt, -1, (190, 130, 240), 1)
+    if band is not None and band.any():
+        cnt, _ = cv2.findContours(band.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                  cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(tile, cnt, -1, (120, 255, 120), 1)
+    peak_src = np.where(band, m, -1) if band is not None and band.any() else m
+    py, px = np.unravel_index(int(peak_src.argmax()), m.shape)
+    cv2.circle(tile, (px, py), 9, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+    cv2.circle(tile, (px, py), 9, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+    return tile
+
+
+def panel(rgb, boxes, mi, mj, strict, band, cut=None, points=None):
+    """The three-tile row: crop with boxes, the masks, the uncertainty + band.
+
+    Exposed so anything producing (mi, mj, strict, band) can draw the same
+    figure. wholeframe_pairs.py builds those from a whole frame rather than a
+    crop, and the picture has to mean the same thing in both or they cannot be
+    read against each other.
+    """
+    tiles = [rgb.copy()]
+    for b, c in zip(boxes, (C_I, C_J)):
+        cv2.rectangle(tiles[0], (int(b[0]), int(b[1])), (int(b[2]), int(b[3])),
+                      c, 2)
+    pts = points if points is not None else [
+        ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes]
+    tiles.append(_mask_tile(rgb, mi, mj, pts))
+    tiles.append(_map_tile(rgb, strict, band, cut))
+    gap = np.full((rgb.shape[0], 6, 3), 250, np.uint8)
+    return np.hstack([t for pr in zip(tiles, [gap] * len(tiles))
+                      for t in pr][:-1])
+
+
+def uncertainty(pi, pj):
+    """strict(p) = u_i(p) * u_j(p), with u_x = 4 p (1 - p).
+
+    Peaks where BOTH masks are undecided, which is where the evidence for
+    telling the two animals apart runs out.
+    """
+    return (4.0 * pi * (1.0 - pi)) * (4.0 * pj * (1.0 - pj))
 
 
 class Sam3Boxes:
@@ -241,7 +321,7 @@ def main():
 
     try:
         if args.prompt_mode == "text":
-            seg = _SAM3Text(args.weights, args.text, args.conf)
+            seg = Sam3(args.weights, args.text, args.conf)
         else:
             seg = Sam3Boxes(args.weights)
     except Exception as err:                       # noqa: BLE001
@@ -300,7 +380,8 @@ def main():
             failed += 1
             continue
 
-        band = contact_band(mi, mj, args.dilate_px)
+        band = contact_readings(mi, mj, args.touch_px, args.dilate_px,
+                                    args.strip_px)["dilated"]
         cut = None
         if args.depth_tol is not None:
             dep = load_depth(record, (h, w))
@@ -320,9 +401,7 @@ def main():
 
         # Panel 3: the same uncertainty product the SAM 1 script draws. One
         # definition, always.
-        ui = 4.0 * whole_masks[0] * (1.0 - whole_masks[0])
-        uj = 4.0 * whole_masks[1] * (1.0 - whole_masks[1])
-        strict = ui * uj
+        strict = uncertainty(whole_masks[0], whole_masks[1])
 
         report.append({
             "rel_image": record["rel_image"],
@@ -337,16 +416,7 @@ def main():
 
         if not args.no_images:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            tiles = [rgb.copy()]
-            for b, c in zip(boxes, (C_I, C_J)):
-                cv2.rectangle(tiles[0], (b[0], b[1]), (b[2], b[3]), c, 2)
-            pts = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes]
-            tiles.append(_mask_tile(rgb, mi, mj, pts))
-            tiles.append(_map_tile(rgb, strict, band, cut))
-
-            gap = np.full((h, 6, 3), 250, np.uint8)
-            row = np.hstack([t for pair in zip(tiles, [gap] * len(tiles))
-                             for t in pair][:-1])
+            row = panel(rgb, boxes, mi, mj, strict, band, cut)
             name = f"{i:03d}_{report[-1]['annotation'].replace(' ', '-')}_" \
                    f"{os.path.basename(record['rel_image'])}"
             cv2.imwrite(os.path.join(out_dir, name),
@@ -389,8 +459,8 @@ def main():
     print("[sam3] green outline = the contact band; "
           + ("purple = what the depth gate removed"
              if args.depth_tol is not None else "no depth gate applied"))
-    print("[sam3] to compare against SAM 1, run visualize_sam_confusion with the "
-          "same --limit and --balance: the seed makes it draw the same crops")
+    print("[sam3] --limit and --balance are seeded, so repeated runs draw the "
+          "same crops and settings can be compared on identical images")
 
 
 if __name__ == "__main__":
