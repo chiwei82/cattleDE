@@ -214,13 +214,31 @@ class Sam3Boxes:
         return ([[(b[0] + b[2]) / 2, (b[1] + b[3]) / 2] for b in boxes],
                 [1] * len(boxes))
 
+    def _predictor(self, bgr):
+        """The predictor, built if ultralytics has not built it yet.
+
+        `SAM.predictor` is created lazily, on the first predict() call. Reaching
+        for it before that returns None, which is the whole of the
+        "'NoneType' object has no attribute 'set_image'" failure — inference was
+        never attempted, so it said nothing about whether the logits are
+        reachable.
+        """
+        if getattr(self.model, "predictor", None) is None:
+            h, w = bgr.shape[:2]
+            # One real call whose output is thrown away, purely to construct the
+            # predictor. A single centre point keeps it off the "segment
+            # everything" path, which would run the full grid for nothing.
+            self.model.predict(bgr, points=[[w / 2.0, h / 2.0]], labels=[1],
+                               verbose=False)
+        return self.model.predictor
+
     def _logits(self, bgr, boxes, prompts):
         """
         Raw mask logits
         """
         from ultralytics.utils import ops
 
-        p = self.model.predictor
+        p = self._predictor(bgr)
         p.set_image(bgr)
         im = getattr(p, "im", None)
         if im is None:
@@ -250,10 +268,15 @@ class Sam3Boxes:
             got = self._logits(bgr, boxes, prompts)
         except Exception as err:                       # noqa: BLE001
             raise RuntimeError(
-                f"SAM 3 box mode could not produce per-pixel scores ({err}). "
-                "Panel 3 is built from them, so there is nothing "
-                "meaningful to draw. Use --prompt-mode text, whose backend "
-                "returns pred_masks as floats by construction.") from err
+                f"SAM 3 box mode raised {type(err).__name__}: {err}\n"
+                "Panel 3 is built from per-pixel scores, so there is nothing "
+                "meaningful to draw without them. Note this does NOT establish "
+                "that the scores are unreachable — it is whatever went wrong, "
+                "reported verbatim. Read it before switching backends.\n"
+                "--prompt-mode text is the alternative: it goes through "
+                "transformers, where pred_masks is a float tensor by "
+                "construction and nothing has to be reached for past a "
+                "high-level API.") from err
         if got is None or len(got) < len(boxes):
             raise RuntimeError(
                 "SAM 3 box mode returned no per-pixel scores; see --prompt-mode "
