@@ -236,24 +236,35 @@ class Sam3Boxes:
         """
         Raw mask logits
         """
+        import torch
         from ultralytics.utils import ops
 
-        p = self._predictor(bgr)
-        p.set_image(bgr)
-        im = getattr(p, "im", None)
-        if im is None:
-            return None
-        pts, labs = self._prompt_args(boxes, prompts)
-        pred, _ = p.inference(
-            im,
-            bboxes=np.asarray([list(map(float, b)) for b in boxes], np.float32),
-            points=np.asarray(pts, np.float32),
-            labels=np.asarray(labs, np.int32),
-            multimask_output=False)
-        # Decoder resolution -> the crop's own grid, the same rescaling the
-        # thresholded path applies before it binarises.
-        out = ops.scale_masks(pred[None].float(), bgr.shape[:2])[0]
-        return [out[k].cpu().numpy().astype(np.float32) for k in range(len(boxes))]
+        # inference_mode, not bare predict. Calling p.inference() directly walks
+        # past predictor.__call__, which is where ultralytics puts its
+        # @smart_inference_mode decorator — so without this the autograd graph
+        # for a 1036x1036 ViT is kept alive for every crop and the GPU fills up
+        # within a handful of pairs. The text backend has had `no_grad` since it
+        # was written; this path silently had nothing.
+        with torch.inference_mode():
+            p = self._predictor(bgr)
+            p.set_image(bgr)
+            im = getattr(p, "im", None)
+            if im is None:
+                return None
+            pts, labs = self._prompt_args(boxes, prompts)
+            pred, _ = p.inference(
+                im,
+                bboxes=np.asarray([list(map(float, b)) for b in boxes], np.float32),
+                points=np.asarray(pts, np.float32),
+                labels=np.asarray(labs, np.int32),
+                multimask_output=False)
+            # Decoder resolution -> the crop's own grid, the same rescaling the
+            # thresholded path applies before it binarises.
+            out = ops.scale_masks(pred[None].float(), bgr.shape[:2])[0]
+            # Copied to host inside the block so nothing on the device outlives
+            # it; the caller only ever sees numpy.
+            return [out[k].cpu().numpy().astype(np.float32)
+                    for k in range(len(boxes))]
 
     def __call__(self, bgr, boxes, prompts=None, binary=False):
         """Per-pixel probabilities for each box.
@@ -267,6 +278,16 @@ class Sam3Boxes:
         try:
             got = self._logits(bgr, boxes, prompts)
         except Exception as err:                       # noqa: BLE001
+            # An OOM leaves the caching allocator full, so without this the
+            # SECOND pair onwards fails for a reason that has nothing to do with
+            # it — which is how one failure came to look like every pair
+            # failing.
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:                          # noqa: BLE001
+                pass
             raise RuntimeError(
                 f"SAM 3 box mode raised {type(err).__name__}: {err}\n"
                 "Panel 3 is built from per-pixel scores, so there is nothing "
