@@ -108,7 +108,7 @@ def main():
     ap.add_argument("--weights", default=None,
                     help="Hugging Face id or a local snapshot DIRECTORY")
     ap.add_argument("--text", default="cow")
-    ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--conf", type=float, default=0.85)
     ap.add_argument("--iou-low", type=float, default=None,
                     help="default: data.pair_iou_low, mirroring what prep used")
     ap.add_argument("--iou-high", type=float, default=None)
