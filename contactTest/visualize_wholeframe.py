@@ -58,7 +58,7 @@ from contactTest.evaluate_wholeframe import (FrameSource, box_iou, crop_to_frame
                                              mask_box)
 from contactTest.sam_contact_region import contact_readings
 from contactTest.score_contact import read_gt
-from contactTest.src.data import load_records, split_records
+from contactTest.src.data import load_records, records_for
 from contactTest.src.utils import load_config
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -180,7 +180,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
-    ap.add_argument("--split", default="train", choices=["train", "val", "test"])
+    ap.add_argument("--split", default="train",
+                    choices=["train", "val", "test", "all", "known_interact"],
+                    help="which ground-truth set to read. 'all' and "
+                         "'known_interact' are the sets annotate_contact "
+                         "now builds; they are not CSV splits, so the row "
+                         "index spans everything and the GT decides "
+                         "membership")
     ap.add_argument("--video-root", default=None)
     ap.add_argument("--weights", default=None,
                     help="Hugging Face id or a local snapshot DIRECTORY")
@@ -224,7 +230,7 @@ def main():
         raise SystemExit(f"no ground truth at {gt_path}")
     gt = read_gt(gt_path)
     by_rel = {r["rel_image"]: r
-              for r in split_records(load_records(cfg, require_label=False))[args.split]}
+              for r in records_for(load_records(cfg, require_label=False), args.split)}
 
     items = []
     for rel, ann in gt.items():

@@ -72,7 +72,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from contactTest.evaluate_wholeframe import FrameSource
 from contactTest.sam3 import Sam3, box_iou
 from contactTest.sam_contact_region import dilated_band
-from contactTest.src.data import load_records, split_records
+from contactTest.src.data import load_records, records_for
 from contactTest.src.utils import load_config
 from contactTest.visualize_sam3_confusion import panel, uncertainty
 
@@ -102,7 +102,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
-    ap.add_argument("--split", default="train", choices=["train", "val", "test"])
+    ap.add_argument("--split", default="train",
+                    choices=["train", "val", "test", "all", "known_interact"],
+                    help="which ground-truth set to read. 'all' and "
+                         "'known_interact' are the sets annotate_contact "
+                         "now builds; they are not CSV splits, so the row "
+                         "index spans everything and the GT decides "
+                         "membership")
     ap.add_argument("--video-root", default=None,
                     help="default: data.video_dir from config.yaml")
     ap.add_argument("--weights", default=None,
@@ -136,7 +142,7 @@ def main():
     if args.iou_high is None:
         args.iou_high = float(cfg["data"].get("pair_iou_high", 0.8))
 
-    records = split_records(load_records(cfg, require_label=False))[args.split]
+    records = records_for(load_records(cfg, require_label=False), args.split)
     if not records:
         raise SystemExit(f"no rows in split '{args.split}'")
     by_video = collections.defaultdict(set)

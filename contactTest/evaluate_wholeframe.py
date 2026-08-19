@@ -63,7 +63,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from contactTest.evaluate_contact import evaluate_one, render, banner
 from contactTest.sam_contact_region import contact_readings, depth_stats, load_depth
 from contactTest.score_contact import read_gt
-from contactTest.src.data import load_records, split_records
+from contactTest.src.data import load_records, records_for
 from contactTest.src.utils import load_config
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -284,7 +284,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
-    ap.add_argument("--split", default="train", choices=["train", "val", "test"])
+    ap.add_argument("--split", default="train",
+                    choices=["train", "val", "test", "all", "known_interact"],
+                    help="which ground-truth set to read. 'all' and "
+                         "'known_interact' are the sets annotate_contact "
+                         "now builds; they are not CSV splits, so the row "
+                         "index spans everything and the GT decides "
+                         "membership")
     ap.add_argument("--video-root", default=None,
                     help="default: data.video_dir from config.yaml, which "
                          "mirrors interaction_prep.video_dir of "
@@ -376,7 +382,7 @@ def main():
         raise SystemExit(f"no ground truth at {gt_path}")
     gt = read_gt(gt_path)
     by_rel = {r["rel_image"]: r
-              for r in split_records(load_records(cfg, require_label=False))[args.split]}
+              for r in records_for(load_records(cfg, require_label=False), args.split)}
 
     # Annotated crops grouped by the frame they came from: one SAM 3 pass per
     # frame serves every pair annotated in it.

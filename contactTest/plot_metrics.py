@@ -12,17 +12,9 @@ Writes to contactTest/log/metric_plots/ only. Reads the per-image CSV that
 evaluate_contact.py (or evaluate_wholeframe.py) already wrote — it runs no
 model and needs no GPU.
 
-WHY PER IMAGE
-
-The printed summary gives one pooled number per metric. A pooled 0.88
-sensitivity is consistent with every crop scoring about 0.88, and equally
-consistent with four fifths scoring 1.0 and the rest scoring 0. Those are
-different results and they call for different next steps, and only the
-distribution separates them.
-
 PANELS
 
-    1  Sensitivity, histogram        piles at 0 and 1 are the thing to look for
+    1  Point coverage, histogram        piles at 0 and 1 are the thing to look for
     2  a_i, violin + strip           proposed area as a share of the crop
     3  Lift, violin on a log axis    a ratio, so it is read multiplicatively;
                                      1.0 is chance and is drawn
@@ -40,7 +32,7 @@ annotator's finding about that one image, so those images are counted with the
 rest everywhere they have a value.
 
 Panels 2 and 4 include them. Panels 1, 3 and 5 do not, and that is arithmetic
-rather than a choice: sensitivity is covered/0, lift divides by it and hit
+rather than a choice: Point coverage is covered/0, lift divides by it and hit
 quality averages over covered points, so all three are UNDEFINED without GT
 points — not zero. A NaN cannot be plotted.
 
@@ -190,7 +182,7 @@ def main():
         v = finite(r["sensitivity"])
         ax.hist(v, bins=bins, alpha=0.55, color=C_SERIES[k % len(C_SERIES)],
                 label=f"{labels[k]}  n={len(v)}", edgecolor="white", linewidth=0.4)
-    ax.set_title("1  Sensitivity (per image)", fontsize=10)
+    ax.set_title("1  Point coverage (per image)", fontsize=10)
     ax.set_xlabel("covered GT points / GT points", fontsize=8)
     ax.set_ylabel("images", fontsize=8)
     ax.legend(fontsize=7.5)
@@ -204,46 +196,26 @@ def main():
     # 3 — lift, log axis
     ax = axes[0][2]
     violin_strip(ax, [r["lift"] for r in runs], labels, log=True,
-                 ref=1.0, ref_label="chance")
-    ax.set_title("3  Lift = Sensitivity / a$_i$   (log axis)", fontsize=10)
+                 ref=1.0)
+    ax.set_title("3  Lift = Point coverage / a$_i$   (log axis)", fontsize=10)
     ax.set_ylabel("x chance", fontsize=8)
 
-    # 4 — blind area, every image in one distribution. Crops marked "no contact"
-    # are not a separate arm and are not drawn apart; they do sit at 1.0 by
-    # construction, which is said in the annotation rather than by splitting the
-    # data.
+    # 4 — blind area, every image in one distribution.
     ax = axes[1][0]
     violin_strip(ax, [r["blind_frac"] for r in runs], labels)
     ax.set_title("4  Blind area — prediction covering no GT point", fontsize=10)
     ax.set_ylabel("share of proposed pixels", fontsize=8)
-    n_at_one = sum(int(np.nansum(r["no_contact"] == 1)) for r in runs)
-    if n_at_one:
-        ax.annotate(f"{n_at_one} image(s) marked 'no contact' sit at 1.0:\n"
-                    "with no GT points every cluster is blind.\n"
-                    "Included here, as in every other number",
-                    (0.03, 0.97), xycoords="axes fraction", fontsize=7,
-                    color="0.4", va="top")
 
     # 5 — hit quality
     ax = axes[1][1]
-    violin_strip(ax, [r["hit_quality"] for r in runs], labels, ref=1.0,
-                 ref_label="cluster = GT discs")
+    violin_strip(ax, [r["hit_quality"] for r in runs], labels, ref=1.0)
     ax.set_title("5  Hit quality — cluster area / GT disc area", fontsize=10)
     ax.set_ylabel("x", fontsize=8)
 
-    n_ctrl = [int(np.nansum(r["no_contact"] == 1)) for r in runs]
     for a in used:
         a.grid(alpha=0.18, linewidth=0.6)
         a.tick_params(labelsize=8)
-    note = ("Crops marked 'no contact' have no GT points, so sensitivity, lift "
-            "and hit quality are UNDEFINED for them and cannot be plotted in "
-            "panels 1, 3 and 5; panels 2 and 4 include them, at 1.0 in panel 4 "
-            "by construction. Crops marked 'skip' are not-well-cropped and were "
-            "dropped before any number was computed. "
-            + ", ".join(f"{l}: {c} of {r['n']} marked 'no contact'"
-                        for l, c, r in zip(labels, n_ctrl, runs)))
-    fig.text(0.5, 0.012, note, ha="center", fontsize=7.5, color="0.3", wrap=True)
-    fig.tight_layout(rect=[0, 0.035, 1, 0.96])
+    fig.tight_layout(rect=[0, 0.01, 1, 0.96])
 
     out_dir = os.path.join(CONTACT_ROOT, "log", "metric_plots")
     os.makedirs(out_dir, exist_ok=True)
@@ -259,9 +231,6 @@ def main():
         if len(s):
             print(f"        sensitivity  median {np.median(s):.3f}   "
                   f"at 0: {np.mean(s == 0):.0%}   at 1: {np.mean(s == 1):.0%}")
-            if np.mean(s == 0) + np.mean(s == 1) > 0.5:
-                print("        -> more than half the images are at one extreme, so")
-                print("           the pooled mean describes almost none of them")
         if len(a):
             print(f"        a_i          median {np.median(a):.4f}   "
                   f"p90 {np.percentile(a, 90):.4f}")
