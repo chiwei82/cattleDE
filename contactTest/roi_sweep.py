@@ -13,7 +13,7 @@ WHY A CURVE
 
 This is a PROPOSAL task, not a prediction task. The question is whether a region
 can be proposed that carries the contact in less area than simply taking the
-detector's boxes. Recall and area are then two ends of one trade-off, not two
+detector's boxes. Point coverage and area are then two ends of one trade-off, not two
 independent scores, and a single operating point cannot express a trade-off —
 `dilate_px = 22` picks one point on a curve nobody has drawn.
 
@@ -25,7 +25,7 @@ justified.
 THE FAMILIES, AND WHAT EACH ONE WOULD PROVE
 
     merged box        the whole crop. What the pipeline hands downstream today,
-                      so it is the incumbent: recall 1.0 at area 1.0 by
+                      so it is the incumbent: coverage 1.0 at area 1.0 by
                       definition, and every other row is measured against it.
 
     box intersection  where the two detector boxes overlap, scaled about its
@@ -44,16 +44,17 @@ THE FAMILIES, AND WHAT EACH ONE WOULD PROVE
     SAM 3 dilated     dilate(mask_i, r) AND dilate(mask_j, r), r swept. The
                       method under test.
 
-RECALL IS OVER POINTS, AREA IS OVER IMAGES
+POINT COVERAGE IS OVER POINTS, AREA IS OVER IMAGES
 
 Matching evaluate_contact, so the numbers here are readable against it:
-recall = covered clicks / all clicks, a-bar = mean over images of area/crop.
+point coverage = covered clicks / all clicks; a-bar = mean over images of
+area/crop.
 
-Images marked "no contact" are excluded: recall is undefined without clicks, so
+Images marked "no contact" are excluded: coverage is undefined without clicks, so
 they can only dilute the area axis. Their cost is real and is printed
 separately, not folded into the curve.
 
-An image where the region comes out EMPTY stays in, contributing 0 recall and 0
+An image where the region comes out EMPTY stays in, contributing 0 coverage and 0
 area. In a proposal task "proposed nothing" is a failure, not a perfectly small
 region, and dropping those images would flatter whichever family produced them.
 """
@@ -75,8 +76,38 @@ from contactTest.src.utils import load_config
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
+# Sparse defaults for a single --split run. The values are round numbers on a
+# roughly geometric ladder with 22 forced in so the incumbent operating point
+# lands on the curve; there is no deeper justification, which is why
+# --all-compare uses the dense grids below instead.
 RADII = [4, 8, 12, 16, 22, 30, 40, 55]
 SCALES = [0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0]
+
+# --all-compare. Dense enough that the sampling grid stops being a choice worth
+# defending: every radius is visited, and the scale axis is log-spaced because
+# the plot's x axis is.
+DENSE_RADII = list(range(1, 51))
+DENSE_SCALES = list(np.geomspace(0.001, 1.0, 100))
+
+COMPARE_ORDER = ["all", "train", "known_interact"]
+MAPPING = {
+    "all": "random",
+    "train": "fixed_lighting",
+    "known_interact": "interaction",
+}
+
+FAM_ORDER = ["merged box", "box intersection", "inscribed ellipse",
+             "midpoint disc", "SAM 3 overlap", "SAM 3 dilated"]
+# Families with no parameter, drawn as a single marker rather than a line.
+SINGLE_POINT = {"merged box", "SAM 3 overlap"}
+STYLE = {
+    "merged box":        ("0.35",             "s"),
+    "box intersection":  ((0.85, 0.42, 0.16), "o"),
+    "inscribed ellipse": ((0.90, 0.62, 0.20), "^"),
+    "midpoint disc":     ((0.55, 0.55, 0.55), "v"),
+    "SAM 3 overlap":     ((0.20, 0.47, 0.75), "D"),
+    "SAM 3 dilated":     ((0.15, 0.40, 0.70), "o"),
+}
 
 
 def scaled_rect(b, factor, h, w):
@@ -126,46 +157,16 @@ def covered(region, points):
         n += bool(region[yy, xx])
     return n
 
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
-    ap.add_argument("--split", default="all",
-                    choices=["train", "val", "test", "all", "known_interact"])
-    ap.add_argument("--source", default="sam3_text", choices=["sam3_text", "cache"])
-    ap.add_argument("--baselines-only", action="store_true",
-                    help="skip every SAM 3 family; needs no model and no GPU")
-    ap.add_argument("--weights", default=None)
-    ap.add_argument("--text", default="cow")
-    ap.add_argument("--conf", type=float, default=None)
-    ap.add_argument("--radii", default=",".join(str(r) for r in RADII))
-    ap.add_argument("--scales", default=",".join(str(s) for s in SCALES))
-    ap.add_argument("--gt", default=None)
-    ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--no-plot", action="store_true")
-    args = ap.parse_args()
-
-    radii = [int(v) for v in args.radii.split(",") if v.strip()]
-    scales = [float(v) for v in args.scales.split(",") if v.strip()]
-
-    cfg = load_config(args.config)
-    if args.conf is None:
-        args.conf = float(cfg["data"].get("sam3_conf", 0.6))
-    gt_path = args.gt or os.path.join(CONTACT_ROOT, "log", "annotate", args.split,
+def sweep(split, cfg, seg, radii, scales, gt_path=None, limit=0):
+    """Every family on one split. Returns (rows, n_images, n_points)."""
+    gt_path = gt_path or os.path.join(CONTACT_ROOT, "log", "annotate", split,
                                       "contact_gt.csv")
     if not os.path.exists(gt_path):
         raise SystemExit(f"no ground truth at {gt_path}")
     gt = read_gt(gt_path)
     by_rel = {r["rel_image"]: r for r in
-              records_for(load_records(cfg, require_label=False), args.split)}
+              records_for(load_records(cfg, require_label=False), split)}
 
-    seg = None
-    if not args.baselines_only and args.source == "sam3_text":
-        from contactTest.sam3 import Sam3
-        seg = Sam3(args.weights, args.text, args.conf)
-
-    # (family, param) -> [covered points, total points, sum of area fractions]
     acc, n_img = {}, 0
     no_contact_area, n_no_contact, no_mask = [], 0, 0
 
@@ -185,7 +186,7 @@ def main():
         pts = ann["points"]
 
         masks = None
-        if not args.baselines_only:
+        if seg is not False:
             try:
                 masks = (load_masks(rec, shape) if seg is None
                          else seg.assign_to_boxes(bgr, [b1, b2]))
@@ -194,24 +195,27 @@ def main():
                 masks = None
             if masks is None or len(masks) < 2:
                 no_mask += 1
-                # Not skipped: a proposal method that produces nothing on an
-                # image has failed there, and excluding it would hide that.
+                # Kept, not skipped: producing nothing on an image is a failure
+                # of the proposal, and dropping it would hide that.
                 masks = [np.zeros(shape, np.uint8), np.zeros(shape, np.uint8)]
             masks = [np.asarray(m).astype(np.uint8) for m in masks]
 
-        regions = {}
         it = (max(b1[0], b2[0]), max(b1[1], b2[1]),
               min(b1[2], b2[2]), min(b1[3], b2[3]))
         mid = ((b1[0] + b1[2] + b2[0] + b2[2]) / 4.0,
                (b1[1] + b1[3] + b2[1] + b2[3]) / 4.0)
-        regions[("merged box", 1.0)] = np.ones(shape, bool)
+
+        regions = {("merged box", 1.0): np.ones(shape, bool)}
         for s in scales:
             r = scaled_rect(it, s, h, w)
-            regions[("box intersection", s)] = rect_mask(shape, r)
-            regions[("inscribed ellipse", s)] = ellipse_mask(shape, r)
+            regions[("box intersection", float(s))] = rect_mask(shape, r)
+            regions[("inscribed ellipse", float(s))] = ellipse_mask(shape, r)
         for r in radii:
             regions[("midpoint disc", float(r))] = disc_mask(shape, mid, r)
         if masks is not None:
+            # r = 0 IS the plain mask intersection, so it is the same family's
+            # left-hand end, not a separate method. It is named apart only so
+            # the figure can mark it.
             regions[("SAM 3 overlap", 0.0)] = (masks[0] > 0) & (masks[1] > 0)
             for r in radii:
                 regions[("SAM 3 dilated", float(r))] = band(masks[0], masks[1], r)
@@ -227,92 +231,183 @@ def main():
             c, t, a = acc.get(k, (0, 0, 0.0))
             acc[k] = (c + covered(reg, pts), t + len(pts),
                       a + float(reg.sum()) / crop_px)
-        if args.limit and n_img >= args.limit:
+        if limit and n_img >= limit:
             break
 
     if not acc:
-        raise SystemExit("nothing scored")
+        raise SystemExit(f"nothing scored for split '{split}'")
 
     rows = []
     for (fam, param), (c, t, a) in acc.items():
         a_bar = a / n_img
-        rows.append({"family": fam, "param": param, "recall": c / t,
-                     "a_bar": a_bar, "recall_per_area": (c / t) / a_bar
-                     if a_bar > 0 else float("nan"),
+        rows.append({"family": fam, "param": param, "point_coverage": c / t,
+                     "a_bar": a_bar,
+                     "coverage_per_area": (c / t) / a_bar if a_bar > 0 else float("nan"),
                      "covered": c, "points": t, "n_images": n_img})
     rows.sort(key=lambda r: (r["family"], r["param"]))
+    n_pts = rows[0]["points"]
+    print(f"[roi] {split}: {n_img} images with clicks, {n_pts} clicks, "
+          f"{n_no_contact} marked 'no contact' (excluded from the curve)"
+          + (f", {no_mask} with no usable mask pair" if no_mask else ""))
+    return rows, n_img, n_pts
 
-    print(f"\n[roi] {n_img} images with clicks, {rows[0]['points']} clicks, "
-          f"{n_no_contact} images marked 'no contact' (excluded from the curve)")
-    if no_mask:
-        print(f"[roi] SAM 3 produced no usable pair on {no_mask} image(s); "
-              "scored as an empty region, not skipped")
-    fam_order = ["merged box", "box intersection", "inscribed ellipse",
-                 "midpoint disc", "SAM 3 overlap", "SAM 3 dilated"]
-    print(f"\n{'family':<20}{'param':>7}{'a-bar':>9}{'recall':>9}{'recall/area':>13}")
-    for fam in fam_order:
-        for r in [x for x in rows if x["family"] == fam]:
-            star = "  <-" if fam == "SAM 3 dilated" and r["param"] == 22.0 else ""
-            print(f"{fam:<20}{r['param']:>7.2f}{r['a_bar']:>9.4f}"
-                  f"{r['recall']:>9.3f}{r['recall_per_area']:>13.1f}{star}")
 
-    if no_contact_area:
-        print(f"\n[roi] area proposed on the {n_no_contact} 'no contact' images, "
-              "which the curve above excludes:")
-        for fam in fam_order:
-            v = [d[k] for d in no_contact_area for k in d if k[0] == fam]
-            if v:
-                print(f"    {fam:<20} mean a_i {float(np.mean(v)):.4f}")
-
-    out_dir = os.path.join(CONTACT_ROOT, "log", "roi_sweep", args.split)
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "roi_sweep.csv")
+def write_csv(rows, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="") as f:
         wtr = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         wtr.writeheader()
         wtr.writerows(rows)
-    print(f"\n[roi] wrote {path}")
+    return path
 
+
+def draw_panel(ax, rows, title, n_img, n_pts, mark_r=22.0, legend=False):
+    """One panel. Dense families are drawn as lines with no per-point markers;
+    only the r = mark_r operating point and the two single-point families get
+    a marker, so the curve stays readable at 50-100 samples."""
+    by = {}
+    for r in rows:
+        by.setdefault(r["family"], []).append(r)
+    for v in by.values():
+        v.sort(key=lambda r: r["a_bar"])
+
+    for fam in FAM_ORDER:
+        r = by.get(fam)
+        if not r:
+            continue
+        col, mk = STYLE[fam]
+        if fam in SINGLE_POINT:
+            ax.plot([r[0]["a_bar"]], [r[0]["point_coverage"]], marker=mk, color=col,
+                    ms=8, lw=0, label=fam, alpha=0.95)
+        else:
+            ax.plot([x["a_bar"] for x in r], [x["point_coverage"] for x in r],
+                    color=col, lw=1.9, label=fam, alpha=0.9)
+
+    for fam in ("SAM 3 dilated", "midpoint disc"):
+        hit = [x for x in by.get(fam, []) if x["param"] == mark_r]
+        if not hit:
+            continue
+        ax.scatter([hit[0]["a_bar"]], [hit[0]["point_coverage"]], s=120,
+                   facecolors="none", edgecolors="black", linewidths=1.5, zorder=6)
+        ax.annotate(f"r={int(mark_r)}", (hit[0]["a_bar"], hit[0]["point_coverage"]),
+                    textcoords="offset points", xytext=(7, -12), fontsize=8)
+    zero = by.get("SAM 3 overlap")
+    if zero:
+        ax.annotate("r=0", (zero[0]["a_bar"], zero[0]["point_coverage"]),
+                    textcoords="offset points", xytext=(6, 6), fontsize=8,
+                    color=STYLE["SAM 3 overlap"][0])
+
+    ax.set_xscale("log")
+    ax.set_xlabel("a-bar — mean proposed area as a share of the crop (log)",
+                  fontsize=9)
+    ax.set_title(f"{title}  ({n_img} images, {n_pts} clicks)", fontsize=11)
+    ax.grid(alpha=0.2)
+    if legend:
+        ax.legend(fontsize=8.5, loc="lower right")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
+    ap.add_argument("--split", default="all",
+                    choices=["train", "val", "test", "all", "known_interact"])
+    ap.add_argument("--all-compare", action="store_true",
+                    help="sweep all, train and known_interact on the dense "
+                         "grids and draw them as three panels side by side. "
+                         "Ignores --split, --radii and --scales")
+    ap.add_argument("--source", default="sam3_text", choices=["sam3_text", "cache"])
+    ap.add_argument("--baselines-only", action="store_true",
+                    help="skip every SAM 3 family; needs no model and no GPU")
+    ap.add_argument("--weights", default=None)
+    ap.add_argument("--text", default="cow")
+    ap.add_argument("--conf", type=float, default=None)
+    ap.add_argument("--radii", default=",".join(str(r) for r in RADII))
+    ap.add_argument("--scales", default=",".join(str(s) for s in SCALES))
+    ap.add_argument("--mark-r", type=float, default=22.0,
+                    help="operating point circled on the radius-parameterised "
+                         "curves")
+    ap.add_argument("--gt", default=None)
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--no-plot", action="store_true")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    if args.conf is None:
+        args.conf = float(cfg["data"].get("sam3_conf", 0.6))
+
+    seg = False if args.baselines_only else None
+    if seg is not False and args.source == "sam3_text":
+        from contactTest.sam3 import Sam3
+        seg = Sam3(args.weights, args.text, args.conf)
+
+    if args.all_compare:
+        radii = DENSE_RADII
+        scales = DENSE_SCALES
+        print(f"[roi] all-compare: r = {radii[0]}..{radii[-1]} step 1 "
+              f"({len(radii)} values), scale = {scales[0]:g}..{scales[-1]:g} "
+              f"log-spaced ({len(scales)} values)")
+        runs = {}
+        for split in COMPARE_ORDER:
+            rows, n_img, n_pts = sweep(split, cfg, seg, radii, scales,
+                                       limit=args.limit)
+            write_csv(rows, os.path.join(CONTACT_ROOT, "log", "roi_sweep",
+                                         split, "roi_sweep_dense.csv"))
+            runs[split] = (rows, n_img, n_pts)
+        out_dir = os.path.join(CONTACT_ROOT, "log", "roi_sweep")
+        for split in COMPARE_ORDER:
+            print(f"[roi] wrote {os.path.join(out_dir, split, 'roi_sweep_dense.csv')}")
+        if args.no_plot:
+            return
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, len(COMPARE_ORDER),
+                                 figsize=(6.0 * len(COMPARE_ORDER), 5.4),
+                                 sharey=True)
+        axes = np.atleast_1d(axes)
+        for ax, split in zip(axes, COMPARE_ORDER):
+            rows, n_img, n_pts = runs[split]
+            draw_panel(ax, rows, MAPPING[split], n_img, n_pts,
+                       mark_r=args.mark_r, legend=(ax is axes[-1]))
+        axes[0].set_ylabel(
+            "point coverage — share of clicked contact points inside the region",
+            fontsize=9)
+        fig.suptitle("ROI proposal: point coverage against area", fontsize=13)
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        png = os.path.join(out_dir, "roi_sweep_compare.png")
+        fig.savefig(png, dpi=150, bbox_inches="tight")
+        print(f"[roi] wrote {png}")
+        return
+
+    radii = [int(v) for v in args.radii.split(",") if v.strip()]
+    scales = [float(v) for v in args.scales.split(",") if v.strip()]
+    rows, n_img, n_pts = sweep(args.split, cfg, seg, radii, scales,
+                               gt_path=args.gt, limit=args.limit)
+
+    print(f"\n{'family':<20}{'param':>8}{'a-bar':>9}{'coverage':>9}{'cov/area':>13}")
+    for fam in FAM_ORDER:
+        for r in [x for x in rows if x["family"] == fam]:
+            star = "  <-" if fam == "SAM 3 dilated" and r["param"] == args.mark_r else ""
+            print(f"{fam:<20}{r['param']:>8.3f}{r['a_bar']:>9.4f}"
+                  f"{r['point_coverage']:>9.3f}{r['coverage_per_area']:>13.1f}{star}")
+
+    out_dir = os.path.join(CONTACT_ROOT, "log", "roi_sweep", args.split)
+    print(f"\n[roi] wrote {write_csv(rows, os.path.join(out_dir, 'roi_sweep.csv'))}")
     if args.no_plot:
         return
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
     fig, ax = plt.subplots(figsize=(8.2, 6.0))
-    style = {"merged box": ("0.35", "s"), "box intersection": ((0.85,0.42,0.16), "o"),
-             "inscribed ellipse": ((0.90,0.62,0.20), "^"),
-             "midpoint disc": ((0.55,0.55,0.55), "v"),
-             "SAM 3 overlap": ((0.20,0.47,0.75), "D"),
-             "SAM 3 dilated": ((0.15,0.40,0.70), "o")}
-    for fam in fam_order:
-        r = sorted([x for x in rows if x["family"] == fam], key=lambda x: x["a_bar"])
-        if not r:
-            continue
-        col, mk = style[fam]
-        ax.plot([x["a_bar"] for x in r], [x["recall"] for x in r],
-                marker=mk, color=col, lw=1.6 if len(r) > 1 else 0,
-                ms=6, label=fam, alpha=0.9)
-    star = [x for x in rows if x["family"] == "SAM 3 dilated" and x["param"] == 22.0]
-    if star:
-        ax.scatter([star[0]["a_bar"]], [star[0]["recall"]], s=160,
-                   facecolors="none", edgecolors="black", linewidths=1.6, zorder=5)
-        ax.annotate("r = 22", (star[0]["a_bar"], star[0]["recall"]),
-                    textcoords="offset points", xytext=(10, -12), fontsize=9)
-    ax.set_xscale("log")
-    ax.set_xlabel("a-bar — mean proposed area as a share of the crop (log)")
-    ax.set_ylabel("recall — share of clicked contact points inside the region")
-    ax.set_title(f"ROI proposal: recall against area — {args.split} "
-                 f"({n_img} images, {rows[0]['points']} clicks)", fontsize=11)
-    ax.grid(alpha=0.2)
-    ax.legend(fontsize=8.5, loc="lower right")
-    png = os.path.join(out_dir, "roi_sweep.png")
+    draw_panel(ax, rows, MAPPING.get(args.split, args.split), n_img, n_pts,
+               mark_r=args.mark_r, legend=True)
+    ax.set_ylabel("point coverage — share of clicked contact points inside the region",
+                  fontsize=9)
     fig.tight_layout()
+    png = os.path.join(out_dir, "roi_sweep.png")
     fig.savefig(png, dpi=150)
     print(f"[roi] wrote {png}")
-    print("[roi] a family whose curve lies ABOVE another reaches the same recall "
-          "in less area; where curves cross, the choice of parameter decides "
-          "which is better and has to be argued")
 
 
 if __name__ == "__main__":
