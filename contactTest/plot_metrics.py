@@ -148,8 +148,18 @@ def main():
 
     paths = args.csv or [os.path.join("log", "evaluate", args.split,
                                       "evaluation.csv")]
-    labels = args.label or ([os.path.basename(os.path.dirname(p)) for p in paths]
-                            if len(paths) > 1 else [args.split])
+    mapping = {
+    "all": "random",
+    "train": "fixed_lighting",
+    "known_interact": "interaction",
+    }
+
+    labels = args.label or (
+        [mapping[os.path.basename(os.path.dirname(p))] for p in paths]
+        if len(paths) > 1
+        else [mapping[args.split]]
+    )
+
     if len(labels) != len(paths):
         raise SystemExit(f"{len(paths)} --csv but {len(labels)} --label")
 
