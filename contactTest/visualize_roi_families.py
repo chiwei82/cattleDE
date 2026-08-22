@@ -45,7 +45,7 @@ import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from contactTest.roi_sweep import (band, disc_mask, ellipse_mask, rect_mask,
-                                   scaled_rect, FAM_ORDER, MAPPING, STYLE)
+                                   scaled_rect, FAM_ORDER, MAPPING)
 from contactTest.sam_contact_region import load_masks
 from contactTest.score_contact import read_gt
 from contactTest.src.data import load_records, records_for, relative_boxes
@@ -54,6 +54,18 @@ from contactTest.src.utils import load_config
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
 C_HIT, C_MISS = (80, 240, 110), (245, 85, 75)
+
+# Region colours. Taken from roi_sweep's curve palette so the two figures agree,
+# except merged box, which is red here: it is the incumbent being replaced and
+# should read as the thing to beat rather than as neutral grey.
+COLOUR = {
+    "merged box":        (220, 50, 50),
+    "box intersection":  (217, 107, 41),
+    "inscribed ellipse": (230, 158, 51),
+    "midpoint disc":     (140, 140, 140),
+    "SAM 3 overlap":     (51, 120, 191),
+    "SAM 3 dilated":     (38, 102, 178),
+}
 PARAM_UNIT = {"box intersection": "s", "inscribed ellipse": "s",
               "midpoint disc": "r", "SAM 3 dilated": "r"}
 
@@ -121,7 +133,11 @@ def main():
                     help="substring of the crop path, e.g. frame_00002950_pair_00")
     ap.add_argument("--target", type=float, default=0.8,
                     help="split-level point coverage each parameterised family "
-                         "is set to")
+                         "is set to. SAM 3 dilated is exempt — see --sam3-r")
+    ap.add_argument("--sam3-r", type=float, default=22.0,
+                    help="SAM 3 dilated is drawn at this fixed radius rather "
+                         "than solved off the curve, so the figure shows the "
+                         "operating point the rest of the work reports at")
     ap.add_argument("--sweep-csv", default=None,
                     help="curve to read the parameters off; default is the "
                          "roi_sweep output for --split")
@@ -208,7 +224,10 @@ def main():
             if fam not in curves:
                 print(f"[fam] {fam}: not in the sweep CSV, skipped")
                 continue
-            p, reached = param_for(curves[fam], args.target)
+            if fam == "SAM 3 dilated":
+                p, reached = args.sam3_r, True
+            else:
+                p, reached = param_for(curves[fam], args.target)
             unit = PARAM_UNIT[fam]
             if fam in ("box intersection", "inscribed ellipse"):
                 region = (rect_mask if fam == "box intersection" else ellipse_mask)(
@@ -221,9 +240,12 @@ def main():
                 region = band(masks[0], masks[1], max(1, int(round(p))))
                 label = f"{unit} = {int(round(p))} px"
             if not reached:
-                note = f" — never reaches {args.target:.2f}; drawn at its maximum"
+                note = " — never reaches the target; drawn at its maximum"
         cov = sum(1 for (x, y) in pts
                   if region[int(np.clip(y, 0, h - 1)), int(np.clip(x, 0, w - 1))])
+        # All of this is kept: `region` is what gets drawn, and the rest is
+        # printed to the terminal. What the FIGURE shows is decided further
+        # down, where the only thing put on a panel is the family name.
         panels.append({
             "family": fam, "label": label, "note": note, "region": region,
             "a_i": float(region.sum()) / float(h * w),
@@ -245,22 +267,23 @@ def main():
     fig, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 4.4 * nrow))
     axes = np.atleast_1d(axes).ravel()
     for ax, p in zip(axes, panels):
-        col = STYLE[p["family"]][0]
-        rgbc = (tuple(int(c * 255) for c in col) if isinstance(col, tuple)
-                else (90, 90, 90))
-        ax.imshow(overlay(bgr, p["region"], pts, rgbc))
-        ax.set_title(f"{p['family']}   {p['label']}\n"
-                     f"a_i {p['a_i']:.3f}   covered {p['cov']}/{p['n']}"
-                     + ("\n" + p["note"].strip(" —") if p["note"] else ""),
-                     fontsize=9.5)
+        ax.imshow(overlay(bgr, p["region"], pts, COLOUR[p["family"]]))
+        # The method goes UNDER the picture, and nothing else does: a_i and the
+        # covered count are printed to the terminal instead, so the figure
+        # carries no number that could be mistaken for a result.
+        ax.set_xlabel(f"{p['family']}"
+                    #   + ("\n" + p["note"].strip(" —") if p["note"] else "")
+                      ,fontsize=10.5, labelpad=8
+                      )
         ax.set_xticks([]); ax.set_yticks([])
     for ax in axes[len(panels):]:
         ax.axis("off")
-    fig.suptitle(f"{MAPPING.get(args.split, args.split)} — {os.path.basename(rel)}"
-                 f"   (parameters set where each family reaches "
-                 f"{args.target:.2f} point coverage on the whole split)",
-                 fontsize=12)
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    # fig.suptitle(f"{MAPPING.get(args.split, args.split)} — {os.path.basename(rel)}"
+    #              f"   (parameters set where each family reaches "
+    #              f"{args.target:.2f} point coverage on the whole split)",
+    #              fontsize=12)
+    # fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.tight_layout()
     out = args.out or os.path.join(CONTACT_ROOT, "log", "roi_families", args.split,
                                    f"{os.path.splitext(os.path.basename(rel))[0]}.png")
     os.makedirs(os.path.dirname(out), exist_ok=True)
