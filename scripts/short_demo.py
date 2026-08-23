@@ -57,8 +57,22 @@ def load_action_classification_model(model_path, device):
     return model
 
 def load_interaction_model(model_path, device):
-    """Load the interaction classification model from a checkpoint."""
-    model = LitHybridStreamFusion.load_from_checkpoint(model_path, map_location=device)
+    """Load the interaction classification model from a checkpoint.
+
+    main_loss_cfg / pre_fusion_loss_cfg were excluded by save_hyperparameters,
+    so load_from_checkpoint can't rebuild __init__ without them. They don't
+    affect the forward pass (only the loss criteria), but the constructor
+    validates that pre_fusion's name matches the saved pre_fusion_loss_weight,
+    so we read that weight and build a consistent pre_fusion config."""
+    from omegaconf import OmegaConf
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+    w = ckpt.get("hyper_parameters", {}).get("pre_fusion_loss_weight", 0.0) or 0.0
+    pre = ({"name": "infonce", "temperature": 0.07} if w > 0
+           else {"name": "none"})
+    model = LitHybridStreamFusion.load_from_checkpoint(
+        model_path, map_location=device,
+        main_loss_cfg=OmegaConf.create({"name": "cross_entropy"}),
+        pre_fusion_loss_cfg=OmegaConf.create(pre))
     model.to(device)
     model.eval()
     return model
@@ -121,10 +135,76 @@ def calculate_iou(box1, box2):
     return inter_area / union_area if union_area > 0 else 0.0
 
 # ==============================================================================
+# 1b. Action k-NN classification — EXTRA STEP (metric-learning encoder only)
+# ==============================================================================
+# NOTE: The reference short_demo used a CLASSIFIER action model (softmax -> argmax
+# gives the class directly). In this repo the action model is a METRIC-LEARNING
+# ENCODER (train/action_with_image.py outputs an embedding, not class logits), so
+# a cow crop cannot be classified by softmax. The two functions below are the
+# EXTRA operation that makes classification possible for an encoder: build a
+# gallery of labelled action embeddings, then classify each crop by nearest
+# neighbour in that space. Delete this block and go back to
+# run_classification_inference if you revert the action model to a classifier.
+
+def build_action_gallery(action_model, device, max_per_class=50):
+    """[EXTRA] L2-normalized embedding gallery from labelled action crops
+    (data/action/train/crops/<label>/*.jpg). Returns (embeddings, labels)."""
+    import glob
+    preprocess = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    action_dir = _resolve(_CFG["action_prep"]["output_dir"])
+    labels = _CFG["action_prep"]["labels"]
+    embs, lbls = [], []
+    for cls_id, name in enumerate(labels):
+        paths = sorted(glob.glob(os.path.join(
+            action_dir, "train", "crops", name, "*.jpg")))[:max_per_class]
+        for p in paths:
+            try:
+                img = Image.open(p).convert("RGB")
+            except (OSError, ValueError):
+                continue
+            t = preprocess(img).unsqueeze(0).to(device)
+            with torch.no_grad():
+                e = F.normalize(action_model(t), p=2, dim=1)
+            embs.append(e.cpu()); lbls.append(cls_id)
+    if not embs:
+        raise RuntimeError(
+            "Empty action gallery — need labelled crops under "
+            f"{action_dir}/train/crops/<label>/. Run prep/action_prep.py first.")
+    print(f"[action gallery] {len(embs)} reference embeddings, "
+          f"{len(set(lbls))} classes.")
+    return torch.cat(embs, dim=0), torch.tensor(lbls)
+
+
+def run_action_knn(action_model, image, device, gallery_emb, gallery_lbl,
+                   class_names, k=5):
+    """[EXTRA] Classify one cow crop by k-NN against the action embedding gallery.
+    Confidence = fraction of the k nearest neighbours that agree with the vote."""
+    preprocess = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    t = preprocess(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        e = F.normalize(action_model(t), p=2, dim=1).cpu()   # (1, D)
+    dist = torch.cdist(e, gallery_emb, p=2)[0]               # (N,)
+    kk = min(k, dist.numel())
+    nn_idx = torch.topk(dist, kk, largest=False).indices
+    vote = torch.bincount(gallery_lbl[nn_idx], minlength=len(class_names))
+    pred = int(torch.argmax(vote))
+    conf = float(vote[pred]) / kk
+    return class_names.get(pred, "Unknown"), conf
+
+
+# ==============================================================================
 # 2. Single-frame processing
 # ==============================================================================
 
-def process_single_frame(frame, yolo_model, action_model, interaction_model, device, action_class_names, interaction_class_names, yolo_conf, yolo_imgsz):
+def process_single_frame(frame, yolo_model, action_model, interaction_model, device, action_class_names, interaction_class_names, yolo_conf, yolo_imgsz, action_gallery_emb, action_gallery_lbl):
     """Detect, classify per-cow action and pairwise interaction, and draw on one frame."""
     detection_results = yolo_model.predict(
         source=frame, verbose=False, iou=0.5, conf=yolo_conf, imgsz=yolo_imgsz
@@ -141,11 +221,15 @@ def process_single_frame(frame, yolo_model, action_model, interaction_model, dev
 
     num_boxes = len(all_coords)
 
-    # Per-cow action inference and drawing
+    # Per-cow action inference and drawing.
+    # EXTRA STEP: action is a metric encoder, so classify by k-NN against the
+    # gallery (a classifier would use run_classification_inference here instead).
     for coords in all_coords:
         bbox_image = crop_image_from_frame(frame, coords)
         if bbox_image.width > 0 and bbox_image.height > 0:
-            action_label, _ = run_classification_inference(action_model, bbox_image, action_class_names, device)
+            action_label, _ = run_action_knn(
+                action_model, bbox_image, device,
+                action_gallery_emb, action_gallery_lbl, action_class_names)
             x1, y1, x2, y2 = map(int, coords)
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), action_color, 2)
             (w, h), _ = cv2.getTextSize(action_label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
@@ -222,6 +306,10 @@ def create_processed_video(input_video_path, output_video_path, center_frame_num
     interaction_model = load_interaction_model(interaction_model_path, DEVICE)
     print("All models loaded successfully.")
 
+    # EXTRA STEP (metric-learning action model only): build the action embedding
+    # gallery once, so per-cow action can be classified by k-NN below.
+    action_gallery_emb, action_gallery_lbl = build_action_gallery(action_model, DEVICE)
+
     # --- 2. Video I/O setup ---
     cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
@@ -258,7 +346,8 @@ def create_processed_video(input_video_path, output_video_path, center_frame_num
         print(f"  - Processing frame: {frame_idx}")
         processed_frame = process_single_frame(
             frame, yolo_model, action_model, interaction_model, DEVICE,
-            action_class_names, interaction_class_names, yolo_conf, yolo_imgsz
+            action_class_names, interaction_class_names, yolo_conf, yolo_imgsz,
+            action_gallery_emb, action_gallery_lbl
         )
         writer.write(processed_frame)
 
