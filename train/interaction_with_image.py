@@ -80,6 +80,7 @@ class LitHybridStreamFusion(pl.LightningModule):
         pre_fusion_loss_cfg: DictConfig,
         pooling_type: str,
         pre_fusion_loss_weight: float,
+        imagenet_pretrained: bool = True,
     ):
         super().__init__()
 
@@ -116,11 +117,15 @@ class LitHybridStreamFusion(pl.LightningModule):
 
         self.save_hyperparameters(ignore=["main_loss_cfg", "pre_fusion_loss_cfg"])
 
+        is_load_pretrained = bool(vit_ckpt_path) and os.path.exists(vit_ckpt_path)
+        # The action checkpoint (if loaded) fully overrides the backbone, so the
+        # ImageNet-vs-random choice only affects the no-action-space runs.
         self.backbone_vit = timm.create_model(
-            "vit_base_patch16_224", pretrained=False, num_classes=0
+            "vit_base_patch16_224",
+            pretrained=(imagenet_pretrained and not is_load_pretrained),
+            num_classes=0,
         )
 
-        is_load_pretrained = bool(vit_ckpt_path) and os.path.exists(vit_ckpt_path)
         if is_load_pretrained:
             self.load_vit_backbone_from_checkpoint(vit_ckpt_path)
         elif vit_ckpt_path:
@@ -128,7 +133,8 @@ class LitHybridStreamFusion(pl.LightningModule):
                 f"Warning: ViT checkpoint path provided but not found at {vit_ckpt_path}."
             )
         else:
-            print("Info: No ViT checkpoint path provided. Using random weights.")
+            src = "ImageNet" if imagenet_pretrained else "random"
+            print(f"Info: No action checkpoint — backbone uses {src} weights.")
 
         if self.hparams.freeze_vit and is_load_pretrained:
             print("Freezing ViT backbone weights.")
@@ -554,6 +560,15 @@ def main() -> None:
     ap.add_argument("--csv", default="annotated_interaction.csv",
                     help="CSV filename under paths.annotated_dir "
                          "(e.g. annotated_interaction_test.csv).")
+    ap.add_argument("--backbone_init", choices=["action", "imagenet", "random"],
+                    default=None,
+                    help="ViT backbone init for the ablation. 'action' = pre-train "
+                         "with the individual action space (loads paths.action_ckpt); "
+                         "'random' = no pre-training (random weights); 'imagenet' = "
+                         "ImageNet weights. Default: config pretrained_backbone "
+                         "(True->action, False->random). Non-action runs write to "
+                         "log/checkpoint paths suffixed with the init name so they "
+                         "don't overwrite the action run.")
     args = ap.parse_args()
 
     pl.seed_everything(_CFG["random_seed"], workers=True)
@@ -566,9 +581,20 @@ def main() -> None:
     data_module = CattleInteractionDataModule(icfg)
     data_module.setup(stage="fit")
 
-    # Reuse the action model's ViT latent space (both are timm vit_base_patch16_224).
-    vit_ckpt = (os.path.join(_REPO_ROOT, _CFG["paths"]["action_ckpt"])
-                if icfg["pretrained_backbone"] else None)
+    # Backbone init for the "with vs without action-space pre-training" ablation.
+    # Default falls back to the config's pretrained_backbone flag.
+    backbone_init = args.backbone_init or (
+        "action" if icfg["pretrained_backbone"] else "random")
+    if backbone_init == "action":
+        vit_ckpt = os.path.join(_REPO_ROOT, _CFG["paths"]["action_ckpt"])
+        imagenet_pretrained = True          # irrelevant: action ckpt overrides it
+    elif backbone_init == "imagenet":
+        vit_ckpt = None
+        imagenet_pretrained = True
+    else:                                    # random = no pre-training at all
+        vit_ckpt = None
+        imagenet_pretrained = False
+    print(f"[interaction] backbone_init={backbone_init}  (vit_ckpt={vit_ckpt})")
 
     # Build the loss configs (output stays binary; these only shape the objective).
     ml = icfg.get("main_loss", "ldam")
@@ -607,9 +633,13 @@ def main() -> None:
         pre_fusion_loss_cfg=pre_fusion_loss_cfg,
         pooling_type=icfg["pooling_type"],
         pre_fusion_loss_weight=pre_fusion_weight,
+        imagenet_pretrained=imagenet_pretrained,
     )
 
-    run_dir = os.path.join(_REPO_ROOT, icfg["run_dir"])
+    # Non-action runs get a suffixed run_dir / checkpoint so the ablation does not
+    # overwrite the canonical action run's log/checkpoint.
+    tag = "" if backbone_init == "action" else f"_{backbone_init}"
+    run_dir = os.path.join(_REPO_ROOT, icfg["run_dir"] + tag)
     if data_module._val_empty:
         checkpoint_callback = ModelCheckpoint(
             save_last=True, dirpath=os.path.join(run_dir, "ckpt"),
@@ -641,6 +671,9 @@ def main() -> None:
         print("[interaction] test split empty — skipping test.")
 
     out = os.path.join(_REPO_ROOT, _CFG["paths"]["interaction_ckpt"])
+    if tag:
+        base, ext = os.path.splitext(out)
+        out = base + tag + ext
     os.makedirs(os.path.dirname(out), exist_ok=True)
     shutil.copy(best, out)
     print(f"[interaction] checkpoint -> {out}  (from {best})")
