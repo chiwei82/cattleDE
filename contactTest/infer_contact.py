@@ -1,26 +1,3 @@
-"""Predict contact heatmaps and run the annotation-free deletion test.
-
-Usage (from the repository root):
-
-    # overlay heatmaps for the highest-scoring test pairs
-    python -m contactTest.infer_contact --split test --limit 40
-
-    # self-consistency check that needs no contact annotation
-    python -m contactTest.infer_contact --split test --deletion-test
-
-Outputs go to contactTest/log/contact/vis/. Predictions are also written in
-SOURCE-FRAME coordinates so they can be composited back onto the original video
-frames without re-deriving the letterbox transform.
-
-The deletion test asks whether the highlighted region is the evidence the model
-actually uses. For each positive pair the top-k% of the heatmap is blanked and
-the pair is re-scored; the same area is then blanked at a random location and at
-the region's lowest-response location. If the model's own region causes a much
-larger score drop than the controls, the heatmap is pointing at the evidence
-rather than decorating a decision made elsewhere. This is not a substitute for
-ground-truth contact boxes, but it is a real result obtainable with zero extra
-annotation.
-"""
 
 import argparse
 import csv
@@ -53,13 +30,6 @@ def load_checkpoint(path, device):
 
 
 def overlay(canvas_rgb, heat, alpha=0.55):
-    """Blend a colour map of the heatmap over the letterboxed crop.
-
-    Alpha is proportional to the heat rather than gated by a threshold. A fixed
-    threshold hides everything when the model produces a very peaked heatmap —
-    the response is real but occupies too few pixels to clear the cut-off — and
-    a proportional blend lets weak structure fade in instead of vanishing.
-    """
     heat_u8 = np.clip(heat * 255.0, 0, 255).astype(np.uint8)
     colour = cv2.applyColorMap(heat_u8, cv2.COLORMAP_INFERNO)
     colour = cv2.cvtColor(colour, cv2.COLOR_BGR2RGB)
@@ -68,11 +38,6 @@ def overlay(canvas_rgb, heat, alpha=0.55):
 
 
 def to_frame_coords(record, y, x, scale):
-    """Map a canvas pixel back to source-frame coordinates.
-
-    Letterboxing scales by `scale` and pastes at the canvas origin, and the crop
-    itself starts at max(0, merged_x1), max(0, merged_y1) in the frame.
-    """
     merged = record["merged"]
     ox, oy = max(0, int(merged[0])), max(0, int(merged[1]))
     return int(round(x / scale)) + ox, int(round(y / scale)) + oy
@@ -109,9 +74,6 @@ def run_inference(model, dataset, records, device, batch_size, num_workers):
                 "score": float(scores[i]),
                 "peak_canvas_xy": (int(px), int(py)),
                 "peak_frame_xy": (fx, fy),
-                # Magnitude diagnostics: a peak near the -4.0 init floor
-                # (sigmoid(-4) = 0.018) with almost no lit pixels means the
-                # heatmap has collapsed to a point estimate rather than a region.
                 "peak_heat": float(h.max()),
                 "mean_heat_in_region": float(h.sum() / max(region_np.sum(), 1.0)),
                 "lit_px": lit,
@@ -124,7 +86,6 @@ def run_inference(model, dataset, records, device, batch_size, num_workers):
 
 @torch.no_grad()
 def deletion_test(model, dataset, records, device, top_frac=0.2, max_pairs=200, seed=0):
-    """Blank the predicted region and measure the score drop against controls."""
     rng = np.random.default_rng(seed)
     positives = [i for i, r in enumerate(records) if r["label"] == 1][:max_pairs]
     rows = []
@@ -147,8 +108,6 @@ def deletion_test(model, dataset, records, device, top_frac=0.2, max_pairs=200, 
         k = max(1, int(round(top_frac * inside.size)))
         values = heat.ravel()[inside]
 
-        # Three blanking policies over the same number of pixels: the model's own
-        # top-k, its bottom-k, and a random k inside the region.
         picks = {
             "model": inside[np.argsort(-values)[:k]],
             "worst": inside[np.argsort(values)[:k]],
@@ -161,7 +120,6 @@ def deletion_test(model, dataset, records, device, top_frac=0.2, max_pairs=200, 
             mask = torch.zeros(region_np.size, dtype=torch.bool)
             mask[torch.from_numpy(np.asarray(flat_idx))] = True
             mask = mask.reshape(region_np.shape).to(device)
-            # Zero in normalised space == the ImageNet mean colour.
             occluded[0, :, mask] = 0.0
             _, pooled_occ, _ = model(occluded, region, *kp)
             scores[name] = float(torch.sigmoid(pooled_occ.float())[0])
@@ -180,18 +138,12 @@ def deletion_test(model, dataset, records, device, top_frac=0.2, max_pairs=200, 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--checkpoint", default=None,
-                    help="defaults to contactTest/log/contact/contact_mil.pt")
+    ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--split", default="test", choices=["train", "val", "test"])
-    ap.add_argument("--limit", type=int, default=40, help="number of overlays to write")
-    ap.add_argument("--positives-only", action="store_true",
-                    help="visualise only pairs labelled as interaction")
+    ap.add_argument("--limit", type=int, default=40)
+    ap.add_argument("--positives-only", action="store_true")
     ap.add_argument("--deletion-test", action="store_true")
-    ap.add_argument("--raw", action="store_true",
-                    help="draw absolute heat values. By default each heatmap is "
-                         "divided by its own maximum, so the spatial pattern is "
-                         "visible even when the absolute response is tiny; the "
-                         "true magnitudes are always reported in predictions.csv")
+    ap.add_argument("--raw", action="store_true")
     ap.add_argument("--top-frac", type=float, default=0.2)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--num-workers", type=int, default=4)
@@ -231,8 +183,6 @@ def main():
         with open(os.path.join(vis_dir, "deletion_test.json"), "w") as f:
             json.dump(summary, f, indent=2)
         print(json.dumps(summary, indent=2))
-        print("[infer] a mean_drop_model clearly above mean_drop_random means the "
-              "heatmap marks the evidence the classifier relies on")
         return
 
     results = run_inference(model, dataset, records, device, args.batch_size, args.num_workers)
@@ -241,9 +191,6 @@ def main():
     results.sort(key=lambda r: -r["score"])
     results = results[:args.limit]
 
-    # Magnitude report. If the peak sits near the sigmoid(-4) = 0.018 floor the
-    # model never committed to any location; if the peak is high but only a
-    # handful of pixels are lit, it collapsed to a point instead of a region.
     peaks = np.array([r["peak_heat"] for r in results])
     lit = np.array([r["lit_px"] for r in results])
     frac = np.array([r["lit_px"] / max(r["region_px"], 1.0) for r in results])
@@ -251,12 +198,6 @@ def main():
           f"min {peaks.min():.3f}  max {peaks.max():.3f}")
     print(f"[infer] lit pixels  median {np.median(lit):.0f} px  "
           f"({np.median(frac):.2%} of the candidate region)")
-    if np.median(peaks) < 0.05:
-        print("[infer] WARNING: peaks are at the initialisation floor — the model "
-              "did not commit to any location. Lower model.tau_end and retrain.")
-    elif np.median(lit) < 100:
-        print("[infer] WARNING: the response is a point, not a region. Lower "
-              "model.tau_end and loss.lambda_sparsity, then retrain.")
 
     index_rows = []
     for rank, res in enumerate(results):
@@ -266,17 +207,11 @@ def main():
         canvas, nh, nw, _ = letterbox(rgb, cfg["model"]["image_size"], 114)
         heat = res["heat"]
         if not args.raw:
-            # Per-image contrast stretch, so the SHAPE of the response is
-            # visible regardless of its absolute magnitude.
             heat = heat / max(heat.max(), 1e-6)
         blended = overlay(canvas, heat)
         px, py = res["peak_canvas_xy"]
-        # Hollow ring rather than a filled cross: the peak is the pixel the
-        # reader most needs to see, so the marker must circle it, not cover it.
-        # Black under white keeps it legible over both hot and cold colours.
         cv2.circle(blended, (px, py), 9, (0, 0, 0), 3, lineType=cv2.LINE_AA)
         cv2.circle(blended, (px, py), 9, (255, 255, 255), 1, lineType=cv2.LINE_AA)
-        # Drop the letterbox padding bars; they carry no image evidence.
         blended = blended[:nh, :nw]
 
         name = f"{rank:03d}_{record['source_video'].replace('.mp4', '')}_" \

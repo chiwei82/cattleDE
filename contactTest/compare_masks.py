@@ -1,48 +1,3 @@
-"""Compare two mask caches on how much floor they swallowed.
-
-Usage (from the repository root):
-
-    python -m contactTest.compare_masks --a log/mask_cache --b log/mask_depth_pts
-    python -m contactTest.compare_masks --a log/mask_cache --b log/mask_depth_img \\
-        --split train --limit 40
-
-Writes to contactTest/log/mask_compare/<split>/ only.
-
-WHAT THIS MEASURES, AND WHY IT NEEDS NO ANNOTATION
-
-The complaint is that SAM pulls the pen floor into an instance mask, and that
-the boundary comes back ragged. Neither of those is a question about contact, so
-neither needs the clicked ground truth — they are questions about the mask
-itself, and depth can answer them directly:
-
-  floor share    the fraction of the mask lying FURTHER from the lens than the
-                 animal's own depth. A cow is a solid object at one range; any
-                 part of its mask sitting at ground depth is floor that the mask
-                 should not contain. This is the number the depth prompts exist
-                 to reduce, and it is measured, not inferred from the pictures.
-
-  box fill       mask area over box area. A mask that has leaked into the floor
-                 is large for its box; one that has collapsed onto a single coat
-                 patch is small. Reported because floor share alone cannot tell
-                 those apart, and the two failures want opposite fixes.
-
-  ragged         perimeter over the perimeter of a circle of equal area. A clean
-                 silhouette is near 1.5-2.5 for an animal; a mask fragmented
-                 across coat patches runs far higher. This is the "not clean"
-                 part of the complaint, made countable.
-
-  IoU(a, b)      how much the two caches differ at all. Near 1 means the change
-                 did nothing and any difference in the other columns is noise.
-
-Cattle depth is read at the detector box centre — the one pixel the detector
-guarantees is animal — and the floor is whatever lies beyond it. Nothing is
-assumed about what sits NEARER, because on an angled ceiling camera that is
-routinely railings and feed barriers rather than cattle.
-
-The images put the two masks side by side with the floor-depth pixels inside
-each one picked out, so a number that moves can be checked against what actually
-changed.
-"""
 
 import argparse
 import os
@@ -75,7 +30,6 @@ def load_from(cache_root, rel_image, shape):
 
 
 def raggedness(mask):
-    """Perimeter over that of a circle of the same area; 1.0 is a perfect disc."""
     area = float(mask.sum())
     if area < 20:
         return float("nan")
@@ -86,7 +40,6 @@ def raggedness(mask):
 
 
 def measure(masks, boxes, depth, spread, inverse, margin):
-    """floor share, box fill and raggedness for each of the two masks."""
     refs = body_reference(depth, boxes, inverse)
     if refs is None:
         return None
@@ -99,7 +52,6 @@ def measure(masks, boxes, depth, spread, inverse, margin):
                         "ragged": float("nan")})
             continue
         ref = refs[min(k, len(refs) - 1)]
-        # Beyond this animal's own depth by more than the margin: ground.
         floor = f > (farness(np.float32(ref), inverse) + margin * spread)
         box_area = max((b[2] - b[0]) * (b[3] - b[1]), 1)
         out.append({"floor": float((floor & (m > 0)).sum()) / area,
@@ -115,7 +67,7 @@ def tile(rgb, masks, floor_px, title):
         t[sel] = (t[sel] * 0.55 + np.asarray(c, np.float32) * 0.45).astype(np.uint8)
     bad = floor_px & ((masks[0] > 0) | (masks[1] > 0))
     t[bad] = C_FLOOR
-    for text, col in ((title, (255, 255, 255)),):
+    for text, col in ((title, (255, 255, 255))):
         cv2.putText(t, text, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(t, text, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
@@ -138,13 +90,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="train", choices=["train", "val", "test"])
-    ap.add_argument("--a", default="log/mask_cache", help="baseline cache")
-    ap.add_argument("--b", required=True, help="cache to compare against it")
+    ap.add_argument("--a", default="log/mask_cache")
+    ap.add_argument("--b", required=True)
     ap.add_argument("--limit", type=int, default=40)
-    ap.add_argument("--margin", type=float, default=0.05,
-                    help="how far beyond the animal's own depth a pixel must lie "
-                         "before it counts as floor, as a fraction of the crop's "
-                         "depth spread")
+    ap.add_argument("--margin", type=float, default=0.05)
     ap.add_argument("--no-images", action="store_true")
     args = ap.parse_args()
 
@@ -241,19 +190,12 @@ def main():
         print(f"{label:<14}{a:>10{fmt}}{b:>10{fmt}}"
               f"{b - a:>+12{fmt}}   ({better} is better)")
     print(f"\n[compare] mean IoU between the two mask sets: {np.nanmean(col('iou')):.2f}")
-    if np.nanmean(col("iou")) > 0.97:
-        print("[compare] the two caches are nearly identical, so whatever was "
-              "changed had almost no effect on the masks")
 
     d = col("a_floor") - col("b_floor")
     print(f"[compare] floor share fell on {np.mean(d > 0.01):.0%} of pairs, "
           f"rose on {np.mean(d < -0.01):.0%}, unchanged on {np.mean(np.abs(d) <= 0.01):.0%}")
-    print("[compare] 'floor share' is the number the depth prompts exist to move; "
-          "the rest are there to catch a mask that got smaller by collapsing")
     if not args.no_images:
         print(f"[compare] wrote {made} images to {out_dir} (worst improvement first)")
-        print("[compare] red = mask pixels sitting at floor depth, i.e. the "
-              "failure being chased")
 
 
 if __name__ == "__main__":

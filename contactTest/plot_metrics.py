@@ -1,49 +1,3 @@
-"""Per-image distributions of the six metrics, as one figure.
-
-Usage (from the repository root):
-
-    python -m contactTest.plot_metrics --split train
-    python -m contactTest.plot_metrics \\
-        --csv log/evaluate/train/evaluation.csv \\
-        --csv log/wholeframe/train/wholeframe.csv \\
-        --label crop --label "whole frame"
-
-Writes to contactTest/log/metric_plots/ only. Reads the per-image CSV that
-evaluate_contact.py (or evaluate_wholeframe.py) already wrote — it runs no
-model and needs no GPU.
-
-PANELS
-
-    1  Point coverage, histogram        piles at 0 and 1 are the thing to look for
-    2  a_i, violin + strip           proposed area as a share of the crop
-    3  Lift, violin on a log axis    a ratio, so it is read multiplicatively;
-                                     1.0 is chance and is drawn
-    4  Blind area, violin + strip    share of prediction covering no GT point
-    5  Hit quality, violin + strip   cluster area over GT disc area; 1.0 drawn
-
-The strip is every image drawn individually next to its violin, because a violin
-is a smoothed estimate and with 81 crops the smoothing can invent shapes the
-data does not have. The points are the data.
-
-CROPS MARKED "NO CONTACT"
-
-They are not a control group and are not held apart. A "no contact" mark is the
-annotator's finding about that one image, so those images are counted with the
-rest everywhere they have a value.
-
-Panels 2 and 4 include them. Panels 1, 3 and 5 do not, and that is arithmetic
-rather than a choice: Point coverage is covered/0, lift divides by it and hit
-quality averages over covered points, so all three are UNDEFINED without GT
-points — not zero. A NaN cannot be plotted.
-
-In panel 4 they sit at 1.0, because with no GT points every cluster is blind by
-construction. An annotated crop sitting at 1.0 there is something else entirely —
-a genuine total miss — and it is the same image that appears at 0 in panel 1.
-The caption gives the count so the two can be told apart.
-
-Crops marked "skip" during annotation are not-well-cropped and never reach this
-file: evaluate_contact drops them before anything is computed.
-"""
 
 import argparse
 import csv
@@ -60,7 +14,6 @@ C_SERIES = [(0.20, 0.47, 0.75), (0.85, 0.42, 0.16), (0.35, 0.62, 0.35)]
 
 
 def read_csv(path):
-    """Per-image rows as float arrays, keeping NaN rather than dropping it."""
     cols = {}
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
@@ -85,7 +38,6 @@ def finite(v):
 
 
 def violin_strip(ax, series, labels, log=False, ref=None, ref_label=None):
-    """A violin per series with every image drawn beside it."""
     rng = np.random.default_rng(0)
     data, keep = [], []
     for k, v in enumerate(series):
@@ -132,17 +84,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--split", default="all",
-                    choices=["train", "val", "test", "all", "known_interact"],
-                    help="picks the default --csv, log/evaluate/<split>/"
-                         "evaluation.csv. 'all' matches what annotate_contact "
-                         "samples and evaluate_contact writes")
-    ap.add_argument("--csv", action="append", default=None,
-                    help="per-image CSV, relative to contactTest/. Repeat to "
-                         "overlay runs; default is the evaluate_contact output "
-                         "for --split")
-    ap.add_argument("--label", action="append", default=None,
-                    help="name for each --csv, in the same order")
-    ap.add_argument("--out", default=None, help="output png")
+                    choices=["train", "val", "test", "all", "known_interact"])
+    ap.add_argument("--csv", action="append", default=None)
+    ap.add_argument("--label", action="append", default=None)
+    ap.add_argument("--out", default=None)
     ap.add_argument("--title", default=None)
     args = ap.parse_args()
 
@@ -176,8 +121,6 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # Five panels on a 2x3 grid: the sixth cell is removed rather than left
-    # blank, so tight_layout does not reserve space for an axis that is not there.
     fig, axes = plt.subplots(2, 3, figsize=(15.5, 8.6))
     fig.delaxes(axes[1][2])
     used = [axes[0][0], axes[0][1], axes[0][2], axes[1][0], axes[1][1]]
@@ -185,7 +128,6 @@ def main():
                  + ", ".join(f"{l} (n={r['n']})" for l, r in zip(labels, runs)),
                  fontsize=12)
 
-    # 1 — sensitivity histogram
     ax = axes[0][0]
     bins = np.linspace(0, 1, 21)
     for k, r in enumerate(runs):
@@ -197,26 +139,22 @@ def main():
     ax.set_ylabel("images", fontsize=8)
     ax.legend(fontsize=7.5)
 
-    # 2 — a_i
     ax = axes[0][1]
     violin_strip(ax, [r["a_i"] for r in runs], labels)
     ax.set_title("2  a$_i$  — proposed area / image area", fontsize=10)
     ax.set_ylabel("share of the crop", fontsize=8)
 
-    # 3 — lift, log axis
     ax = axes[0][2]
     violin_strip(ax, [r["lift"] for r in runs], labels, log=True,
                  ref=1.0)
     ax.set_title("3  Lift = Point coverage / a$_i$   (log axis)", fontsize=10)
     ax.set_ylabel("x chance", fontsize=8)
 
-    # 4 — blind area, every image in one distribution.
     ax = axes[1][0]
     violin_strip(ax, [r["blind_frac"] for r in runs], labels)
     ax.set_title("4  Blind area — prediction covering no GT point", fontsize=10)
     ax.set_ylabel("share of proposed pixels", fontsize=8)
 
-    # 5 — hit quality
     ax = axes[1][1]
     violin_strip(ax, [r["hit_quality"] for r in runs], labels, ref=1.0)
     ax.set_title("5  Hit quality — cluster area / GT disc area", fontsize=10)

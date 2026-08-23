@@ -1,52 +1,3 @@
-"""Control experiment: SAM 3 on the whole frame, doing YOLO's pairing itself.
-
-Usage (from the repository root):
-
-    python -m contactTest.evaluate_wholeframe --split train --weights sam3.pt
-    python -m contactTest.evaluate_wholeframe --split train --weights sam3.pt \\
-        --scope frame          # unrestricted, and biased - see below
-    python -m contactTest.evaluate_wholeframe --split train --weights sam3.pt \\
-        --depth-tol 0.10 --depth-gate pair
-
-Writes to contactTest/log/wholeframe/<split>/ only.
-
-THE QUESTION
-
-Every result so far measures SAM 3 on a crop that YOLO already chose: detect
-cattle, keep box pairs with 0.1 < IoU < 0.8, cut the merged box out. SAM 3 is
-handed a picture containing two animals and little else. This script removes
-that scaffolding — the uncropped frame goes to SAM 3, `--text cow` finds every
-animal, and the SAME IoU rule is applied to SAM 3's own instances to form pairs.
-If the contact regions come out comparable, the detector stage is not carrying
-the result; if they come out worse, the crop is doing work worth naming.
-
-THE MEASUREMENT PROBLEM, AND WHAT IS DONE ABOUT IT
-
-The clicked ground truth lives in CROP pixel coordinates. A crop is exactly the
-merged box cut from the frame and never resized, so a click maps back by adding
-the merged box origin — the exact inverse of relative_boxes, and clamped the
-same way because ~12% of merged boxes are clipped at the frame border.
-
-The harder problem is that the ground truth is INCOMPLETE at frame level.
-Measured on this dataset: the 99 clicked crops sit in 96 frames, and those
-frames contain 351 detected pairs in total. 72% of the pairs in those frames
-carry no clicks at all. A contact SAM 3 correctly finds on one of those 252
-unannotated pairs is indistinguishable, to any metric here, from a mistake.
-
-So the default `--scope annotated` evaluates only inside the merged boxes of the
-pairs that were actually annotated. Both methods are then judged on identical
-image territory and the comparison isolates the thing in question: given the
-same region, does global context help or hurt? `--scope frame` lifts the
-restriction and is reported too, but it is a LOWER BOUND, not a fair number, and
-is labelled that way in the output.
-
-WHAT IS ALSO REPORTED
-
-Detector agreement — how many animals SAM 3 finds against how many YOLO boxes
-exist in that frame, and how many pairs each rule yields. That is the direct
-evidence for whether the detector stage could be dropped, separately from
-whether the contact region is any good.
-"""
 
 import argparse
 import collections
@@ -78,31 +29,6 @@ def box_iou(a, b):
 
 
 def mask_gap(a, b):
-    """Shortest distance between two masks; 0 when they overlap.
-
-    The pairing measure for a mask-native pipeline. Box IoU exists because a
-    detector only emits boxes; given masks the separation is measurable directly
-    and needs no proxy.
-
-    How much that matters is NOT settled, and the dataset cannot settle it.
-    Synthetic ellipses meeting end-on score IoU 0.007, far under the 0.1 the
-    detector stage used — but real cattle are not ellipses, and their heads and
-    necks interleave when they groom, so the real figure is higher. The recorded
-    pairs cannot arbitrate: interaction_prep wrote only pairs with
-    0.1 < IoU < 0.8, so every category in the CSV has a minimum of exactly 0.100
-    and any contact below the cut was discarded before the file existed. The
-    evidence that would decide it was removed by the selection.
-
-    What the surviving shape hints at: social grooming crowds the cut-off more
-    than non-interacting pairs do — 31% of it below IoU 0.13 against 22%, a
-    factor of 1.4. That is consistent with a distribution truncated at 0.1, and
-    equally consistent with contact pairs simply sitting at lower IoU without
-    extending below it. Suggestive, not conclusive.
-
-    Running this option against --pair-by box_iou on the same frames measures
-    the thing directly: the difference is how many pairs capable of producing a
-    contact region the IoU rule discards.
-    """
     if not a.any() or not b.any():
         return None
     if (a.astype(bool) & b.astype(bool)).any():
@@ -113,27 +39,6 @@ def mask_gap(a, b):
 
 
 def mask_box(m):
-    """Extent of a mask. NOT the box used for pairing — see below.
-
-    Pairing consumes a DETECTOR'S box, because that is what interaction_prep
-    consumed: YOLO's box.xyxy. SAM 3's counterpart is pred_boxes, and that is
-    what the pairing rule is now given. A box measured off the mask is a
-    quantity neither pipeline produced, and substituting it would turn "YOLO
-    against SAM 3" into "YOLO against a post-processing step".
-
-    Whether it runs looser or tighter than pred_boxes is NOT known in advance.
-    That depends on what SAM 3's box head was trained to predict, which is not
-    documented; SAM 3 was trained on its own data engine's output, not on COCO,
-    so nothing can be inferred from familiar annotation conventions either. The
-    diagnostic reports both so the difference is measured rather than assumed.
-
-    What IS established: the 0.085 median IoU an earlier run reported was this
-    quantity, because pairing was mistakenly done on mask extents. It was never
-    a statistic about SAM 3's boxes.
-
-    Retained for inspection and for anything that genuinely wants the mask's
-    own extent rather than the model's box.
-    """
     ys, xs = np.nonzero(m)
     if len(xs) == 0:
         return None
@@ -142,13 +47,6 @@ def mask_box(m):
 
 
 class FrameSource:
-    """Frames decoded from the source videos, with the capture kept open.
-
-    The crops were cut from video, not from stored images, and `frame_number` is
-    the raw frame index the decoder counted, so seeking to it is exact. Frames
-    are requested in file order, which is close to video order, so holding one
-    capture open and seeking within it avoids reopening a video per frame.
-    """
 
     def __init__(self, root):
         self.root = root
@@ -161,22 +59,6 @@ class FrameSource:
                     self.index.setdefault(os.path.splitext(f)[0], os.path.join(dirpath, f))
 
     def frames_for(self, source_video, wanted):
-        """Yield (frame_number, frame) decoding exactly as prep did.
-
-        interaction_prep never seeked. It read the file straight through and
-        counted successful cap.read() calls, storing that counter as
-        `frame_number`. Reproducing it means counting the same way, which makes
-        the mapping exact by construction instead of something to verify.
-
-        cap.set(CAP_PROP_POS_FRAMES, n) addresses a DIFFERENT quantity — the
-        decoder's own position — and the two diverge whenever the container has
-        dropped or reordered frames, quite apart from long-GOP H.264 seeks
-        landing on a neighbouring keyframe. Either way the box then gets drawn
-        over animals that have moved.
-
-        One pass per video serves every frame wanted from it, so this costs a
-        single sequential decode rather than one seek per frame.
-        """
         stem = os.path.splitext(source_video)[0]
         path = self.index.get(stem)
         if path is None:
@@ -198,13 +80,6 @@ class FrameSource:
         cap.release()
 
     def frames_every(self, source_video, step):
-        """Yield (frame_number, frame) for every `step`-th frame, from the start.
-
-        This is prep's own sampling loop: it read the file straight through and
-        acted whenever `frame_idx % frame_step == 0`, where frame_idx counted
-        successful reads. Reproducing the walk reproduces both which frames are
-        chosen AND what number they were given.
-        """
         stem = os.path.splitext(source_video)[0]
         path = self.index.get(stem)
         if path is None:
@@ -223,7 +98,6 @@ class FrameSource:
         cap.release()
 
     def fps(self, source_video):
-        """Source frame rate, for turning a sample_fps into a frame step."""
         stem = os.path.splitext(source_video)[0]
         path = self.index.get(stem)
         if path is None:
@@ -234,22 +108,6 @@ class FrameSource:
         return v or None
 
     def get(self, source_video, frame_number):
-        """Random access by seeking. NOT USED, and not safe on this footage.
-
-        Two separate faults, either of which is enough to avoid it:
-
-        It addresses the decoder's own position, while prep stored a count of
-        successful reads. The two differ whenever the container has dropped or
-        reordered frames.
-
-        And on HEVC it damages what it returns. Seeking lands mid-GOP, so the
-        decoder reconstructs pictures whose references it never decoded —
-        "Error constructing the frame RPS", "Could not find ref with POC n" —
-        and cap.read() returns True anyway, handing back a frame built from
-        missing references. The failure is silent at the Python level.
-
-        Retained only so the contrast with frames_for stays documented.
-        """
         stem = os.path.splitext(source_video)[0]
         path = self.index.get(stem)
         if path is None:
@@ -267,13 +125,6 @@ class FrameSource:
 
 
 def crop_to_frame(points, merged, shape):
-    """Clicked crop coordinates back to frame coordinates.
-
-    The crop is the merged box cut out and never resized, so the offset is the
-    box origin. It is clamped at zero the same way relative_boxes clamps it,
-    because a merged box that ran past the frame border was clipped when the
-    crop was written and its stored coordinates can be negative.
-    """
     ox, oy = max(0, int(merged[0])), max(0, int(merged[1]))
     h, w = shape
     return [(int(np.clip(x + ox, 0, w - 1)), int(np.clip(y + oy, 0, h - 1)))
@@ -285,33 +136,14 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="train",
-                    choices=["train", "val", "test", "all", "known_interact"],
-                    help="which ground-truth set to read. 'all' and "
-                         "'known_interact' are the sets annotate_contact "
-                         "now builds; they are not CSV splits, so the row "
-                         "index spans everything and the GT decides "
-                         "membership")
-    ap.add_argument("--video-root", default=None,
-                    help="default: data.video_dir from config.yaml, which "
-                         "mirrors interaction_prep.video_dir of "
-                         "global_config.yaml. The search is recursive")
-    ap.add_argument("--weights", default=None,
-                    help="Hugging Face id or a local snapshot DIRECTORY")
+                    choices=["train", "val", "test", "all", "known_interact"])
+    ap.add_argument("--video-root", default=None)
+    ap.add_argument("--weights", default=None)
     ap.add_argument("--text", default="cow")
-    ap.add_argument("--conf", type=float, default=None,
-                    help="SAM 3 score floor; default is data.sam3_conf "
-                         "from config.yaml, which mirrors the value the "
-                         "detector stage used")
-    ap.add_argument("--iou-low", type=float, default=None,
-                    help="pairing rule; default is data.pair_iou_low from "
-                         "config.yaml, which mirrors the value prep used")
+    ap.add_argument("--conf", type=float, default=None)
+    ap.add_argument("--iou-low", type=float, default=None)
     ap.add_argument("--iou-high", type=float, default=None)
-    ap.add_argument("--scope", default="annotated", choices=["annotated", "frame"],
-                    help="annotated (default) scores only inside the merged boxes "
-                         "of the annotated pairs, which is the only like-for-like "
-                         "comparison; frame scores the whole image and is a lower "
-                         "bound because 72%% of the pairs in these frames carry "
-                         "no ground truth")
+    ap.add_argument("--scope", default="annotated", choices=["annotated", "frame"])
     ap.add_argument("--reading", default="dilated",
                     choices=["overlap", "gap", "surface", "dilated"])
     ap.add_argument("--dilate-px", type=int, default=22)
@@ -324,50 +156,17 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--gt", default=None)
     ap.add_argument("--pair-by", default="box_iou",
-                    choices=["box_iou", "mask_gap"],
-                    help="how two instances are judged near enough to pair. "
-                         "box_iou reuses the detector stage's rule, which was "
-                         "designed for boxes and rejects touching pairs whose "
-                         "boxes meet end-on. mask_gap uses the shortest distance "
-                         "between the two masks, which is what the rule is a "
-                         "proxy for and needs no proxy once masks exist. "
-                         "Applies to --pairs-from sam3 only")
-    ap.add_argument("--pair-gap-px", type=float, default=44.0,
-                    help="with --pair-by mask_gap, the separation at or below "
-                         "which two instances are paired. Twice the dilation "
-                         "radius by default, since the band is empty beyond that "
-                         "anyway: dilate(a,r) AND dilate(b,r) is non-empty "
-                         "exactly when the gap is at most 2r, so a wider "
-                         "threshold proposes pairs that cannot produce a region")
+                    choices=["box_iou", "mask_gap"])
+    ap.add_argument("--pair-gap-px", type=float, default=44.0)
     ap.add_argument("--pairs-from", default="sam3",
-                    choices=["sam3", "detector", "detector_all"],
-                    help="which pairs get a contact region. THE THREE ARE NOT "
-                         "INTERCHANGEABLE and each has one valid opponent. "
-                         "detector: only the ANNOTATED pairs, so compare it with "
-                         "evaluate_contact, which also sees only those - that "
-                         "pair isolates the crop. detector_all: every pair the "
-                         "detector wrote for the frame, annotated or not, which "
-                         "is the only fair opponent for sam3 because both then "
-                         "propose their full set. sam3: SAM 3 finds and pairs "
-                         "everything itself. Comparing sam3 with detector is "
-                         "invalid: detector is told where the ground truth is "
-                         "and proposes about one pair per frame against sam3's "
-                         "hundred, so its FPPI and blind area are near zero by "
-                         "construction rather than by merit")
-    ap.add_argument("--match-iou", type=float, default=0.3,
-                    help="least IoU between a SAM 3 instance box and a detector "
-                         "box before that animal counts as segmented, for the "
-                         "pair-reconstruction diagnostic only")
+                    choices=["sam3", "detector", "detector_all"])
+    ap.add_argument("--match-iou", type=float, default=0.3)
     ap.add_argument("--no-images", action="store_true")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     if args.conf is None:
         args.conf = float(cfg["data"].get("sam3_conf", 0.6))
-    # Taken from config rather than hardcoded: the path and the pair rule are
-    # recorded in global_config.yaml and mirrored there, so a hand-copied value
-    # in this file is one more thing that can silently fall out of step - which
-    # is exactly how an earlier version ended up pointing at the wrong folder.
     if args.video_root is None:
         args.video_root = cfg["data"].get("video_dir")
         if not args.video_root:
@@ -384,8 +183,6 @@ def main():
     by_rel = {r["rel_image"]: r
               for r in records_for(load_records(cfg, require_label=False), args.split)}
 
-    # Annotated crops grouped by the frame they came from: one SAM 3 pass per
-    # frame serves every pair annotated in it.
     frames = collections.defaultdict(list)
     for rel, ann in gt.items():
         if ann["status"] == "skip":
@@ -397,9 +194,6 @@ def main():
     if not frames:
         raise SystemExit("no annotated crops resolve to a frame")
 
-    # Every pair the detector wrote for these frames, annotated or not. The CSV
-    # holds them all, so the detector's full proposal set is recoverable and can
-    # be put on the same footing as SAM 3's.
     all_pairs = collections.defaultdict(list)
     for rec in by_rel.values():
         key = (rec["source_video"], int(rec["frame_number"]))
@@ -409,8 +203,6 @@ def main():
     gt_radius = (args.gt_dilate_px if args.gt_dilate_px is not None
                  else max(1, int(round(args.gt_dilate_scale * args.dilate_px))))
 
-    # Resolve the videos FIRST. SAM 3's checkpoint is 3.45 GB, so discovering a
-    # bad path after loading it wastes the whole GPU allocation.
     src = FrameSource(args.video_root)
     needed = {os.path.splitext(v)[0] for (v, _) in frames}
     missing = sorted(needed - set(src.index))
@@ -423,17 +215,13 @@ def main():
             + (" ..." if len(missing) > 4 else "") + "\n"
             + (f"  {len(src.index)} video(s) WERE found there, e.g. "
                + ", ".join(found) + "\n" if src.index
-               else "  no video files at all were found there\n")
-            + "The search is recursive, so give the parent directory of the "
-              "batch folders,\n"
-              "e.g. --video-root /user/work/sf24225/data/Full_behav\n"
-              "Quote it if the path contains spaces.")
+               else "  no video files at all were found there\n"))
     print(f"[wf] {len(needed)} videos resolved under {args.video_root}")
 
     try:
         from contactTest.sam3 import Sam3
         seg = Sam3(args.weights, args.text, args.conf)
-    except Exception as err:                       # noqa: BLE001
+    except Exception as err:
         raise SystemExit(f"could not load SAM 3 ({err}). See visualize_sam3_"
                          "confusion.py for the install and access steps.")
 
@@ -443,9 +231,6 @@ def main():
     rows, diag, failed = [], [], 0
     det_yolo, det_sam3, pair_yolo, pair_sam3 = [], [], [], []
 
-    # Grouped by video so each file is decoded ONCE, straight through, exactly
-    # as prep read it. Ordering within a video follows the frame counter, which
-    # is the order the sequential reader emits.
     by_video = collections.defaultdict(list)
     for (video, fno) in frames:
         by_video[video].append(fno)
@@ -466,13 +251,8 @@ def main():
             H, W = frame.shape[:2]
 
             try:
-                # SAM 3's OWN boxes, not the extent of its masks. The pairing
-                # rule downstream is the one interaction_prep applied to YOLO's
-                # box.xyxy, so the substitute detector has to supply the same
-                # kind of quantity or the comparison is no longer between two
-                # detectors.
                 inst, boxes3, qscores = seg.detect(frame)
-            except Exception as err:                   # noqa: BLE001
+            except Exception as err:
                 print(f"[wf] SAM 3 failed on {video} frame {fno}: {err}")
                 failed += 1
                 continue
@@ -484,19 +264,12 @@ def main():
             inst = [inst[k] for k in keep]
             boxes3 = [boxes3[k] for k in keep]
             if not boxes3:
-                # No pred_boxes came back, so there is nothing to pair on that
-                # corresponds to what YOLO supplied. Falling back to mask extents
-                # would silently change the measured quantity.
-                print(f"[wf] {video} frame {fno}: SAM 3 returned no pred_boxes; "
-                      "skipped rather than substituting mask extents")
+                print(f"[wf] {video} frame {fno}: no pred_boxes")
                 failed += 1
                 continue
 
             if args.pairs_from == "sam3":
                 if args.pair_by == "box_iou":
-                    # Exactly the rule the detector stage used. Kept as the default
-                    # so this arm stays comparable with the crop pipeline, but see
-                    # mask_gap(): the rule discards touching pairs.
                     pairs = [(i, j) for i in range(len(inst))
                              for j in range(i + 1, len(inst))
                              if args.iou_low < box_iou(boxes3[i], boxes3[j])
@@ -509,18 +282,6 @@ def main():
                             if g is not None and g <= args.pair_gap_px:
                                 pairs.append((i, j))
             else:
-                # The DETECTOR's pairs, reused verbatim: SAM 3's whole-frame
-                # instances are matched to bbox1 and bbox2 of each pair.
-                # This is the arm that isolates the crop. With `sam3` the two arms of
-                # TODO 1 differ in two ways at once — cropped or not, AND whose boxes
-                # define a pair — so a gap between them cannot be attributed to
-                # either. Here the detector is held fixed and the only remaining
-                # difference from evaluate_contact is whether SAM 3 saw the whole
-                # frame or just the crop.
-                # `detector` takes only the annotated pairs; `detector_all`
-                # takes every pair the detector proposed in this frame. The
-                # difference decides which arm this can honestly be compared
-                # against, so it is a choice and not a detail.
                 src_recs = ([rec for _, _, rec in items]
                             if args.pairs_from == "detector"
                             else all_pairs[(video, fno)])
@@ -539,18 +300,11 @@ def main():
                                      args.strip_px)[args.reading]
                 region |= r
 
-            # How many animals and pairs each route produced, for the same frame.
             n_yolo_pairs = len(items)
             det_sam3.append(len(inst))
             pair_sam3.append(len(pairs))
             pair_yolo.append(n_yolo_pairs)
 
-            # Why a frame scores badly splits three ways, and only a direct check
-            # separates them: SAM 3 never segmented one of the two animals; it did,
-            # but their MASK boxes are tighter than the detector boxes and the IoU
-            # fell outside the pairing rule, so the pair was never proposed; or the
-            # pair was proposed and the band simply missed. Without this the first
-            # two are invisible and the method looks worse than its segmentation is.
             for rel, ann, rec in items:
                 b1, b2 = rec["bbox1"], rec["bbox2"]
                 i1 = max(range(len(boxes3)), key=lambda k: box_iou(boxes3[k], b1))
@@ -559,11 +313,6 @@ def main():
                 matched = (m1 >= args.match_iou and m2 >= args.match_iou and i1 != i2)
                 pair_iou = box_iou(boxes3[i1], boxes3[i2]) if i1 != i2 else 1.0
                 formed = matched and (args.iou_low < pair_iou < args.iou_high)
-                # The same pair measured with the MASK extents as well. Whether
-                # a regressed box is looser or tighter than the mask it belongs
-                # to is a property of how SAM 3's box head was supervised, which
-                # is not documented and is not worth guessing at: both are
-                # recorded and the difference is read off the data.
                 mb1, mb2 = mask_box(inst[i1]), mask_box(inst[i2])
                 mask_iou = (box_iou(mb1, mb2)
                             if (i1 != i2 and mb1 and mb2) else float("nan"))
@@ -573,7 +322,6 @@ def main():
                              "mask_extent_iou": mask_iou,
                              "yolo_pair_iou": box_iou(b1, b2)})
 
-            # GT points, mapped out of every annotated crop in this frame.
             points, scope = [], np.zeros((H, W), bool)
             n_ctrl = 0
             for rel, ann, rec in items:
@@ -591,11 +339,6 @@ def main():
                 region = region & scope
 
             if args.depth_tol is not None:
-                # Depth is cached per CROP, not per frame, so a whole-frame gate
-                # would need a whole-frame depth pass. Rather than resize a crop's
-                # map onto the frame — which would put its values in the wrong
-                # place — the gate is applied per annotated pair, inside that pair's
-                # own box, and pixels outside every annotated box are left ungated.
                 gated = region.copy()
                 for rel, ann, rec in items:
                     merged = rec["merged"]
@@ -610,7 +353,6 @@ def main():
                     sub = region[y1:y2, x1:x2]
                     if not sub.any():
                         continue
-                    # Instance masks restricted to this box, for the pair readings.
                     loc = [m[y1:y2, x1:x2] for m in inst]
                     areas = sorted(range(len(loc)), key=lambda k: -loc[k].sum())[:2]
                     if len(areas) < 2 or loc[areas[1]].sum() == 0:
@@ -629,12 +371,6 @@ def main():
                         gated[y1:y2, x1:x2] = sub & keepm
                 region = gated
 
-            # a_i must be a share of what the method was ALLOWED to predict.
-            # With scope=annotated the region is clipped to the annotated boxes,
-            # so dividing by the whole frame understates it by the ratio of the
-            # two — measured at about 10x on this data — and inflates Lift by
-            # the same factor, which would make the whole-frame arm look far
-            # better than the crop arm for a purely bookkeeping reason.
             denom = float(scope.sum()) if args.scope == "annotated" else None
             rec_m, lab, hitting = evaluate_one(region, points, (H, W), gt_radius,
                                                denom_px=denom)
@@ -669,13 +405,7 @@ def main():
                             cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
         if seen < len(wanted):
-            # The reader stopped before reaching every wanted index, which means
-            # the file has fewer decodable frames than prep counted. Reported
-            # rather than absorbed into `failed`, because it is a property of
-            # the video and not of anything this script did.
             short = len(wanted) - seen
-            print(f"[wf] {video}: {short} of {len(wanted)} wanted frames were "
-                  "never reached by a sequential read")
             failed += short
 
     if not rows:
@@ -705,21 +435,6 @@ def main():
     print(f"  {n_img} frames, {tot_pts} GT points, scope={args.scope}, "
           f"pairs from {args.pairs_from}"
           + (f" by {args.pair_by}" if args.pairs_from == "sam3" else ""))
-    if args.pairs_from == "sam3":
-        print("  Valid opponent: --pairs-from detector_all, which lets the")
-        print("  detector propose its full pair set too. Comparing this with")
-        print("  evaluate_contact changes the detector AND the cropping at once;")
-        print("  comparing it with --pairs-from detector is worse still, since")
-        print("  that arm is told where the ground truth is.")
-    elif args.pairs_from == "detector":
-        print("  Only the ANNOTATED pairs were given a region, so this arm is")
-        print("  comparable with evaluate_contact and with nothing else. Its")
-        print("  FPPI and blind area are near zero by construction - it was")
-        print("  never asked about any other pair - so do not read them as a")
-        print("  precision advantage over the sam3 arm.")
-    else:
-        print("  Every pair the detector proposed was given a region, annotated")
-        print("  or not, so this is the fair opponent for --pairs-from sam3.")
     print(f"{'=' * 66}\n")
     print(f"  1  Sensitivity   {sensitivity:>9.3f}   {tot_cov}/{tot_pts} points covered")
     print(f"  2  FPPI          {fppi:>9.3f}   {tot_fp} empty clusters / {n_img} frames")
@@ -732,10 +447,6 @@ def main():
 
     if diag:
         n = len(diag)
-        # Order matters. A cow SAM 3 never segmented leaves its box matching
-        # whatever else is nearest, which is often the other cow's instance, so
-        # testing "same instance" first would file a missed animal as a merge.
-        # Poor match quality is therefore checked before anything else.
         def _cls(d):
             if min(d["match_iou_1"], d["match_iou_2"]) < args.match_iou:
                 return "unsegmented"
@@ -747,8 +458,7 @@ def main():
         outrange = kinds.count("outrange")
         same = kinds.count("merged")
         nomatch = kinds.count("unsegmented")
-        print(f"\n  Could SAM 3 have reproduced the annotated pair at all?"
-              f"   ({n} annotated pairs)")
+        print(f"   ({n} annotated pairs)")
         print(f"    pair formed by the same rule   {formed:>4}  {formed / n:>5.0%}")
         print(f"    both animals found, IoU outside {args.iou_low}-{args.iou_high}"
               f"   {outrange:>3}  {outrange / n:>5.0%}")
@@ -765,44 +475,13 @@ def main():
         if mi_.size:
             print(f"    median pair IoU, MASK extents        {np.median(mi_):.3f}"
                   "   (not used for pairing; shown to size the difference)")
-            if np.median(pi) > np.median(mi_) * 1.05:
-                print("    SAM 3's own box is LOOSER than its mask here.")
-            elif np.median(pi) < np.median(mi_) * 0.95:
-                print("    SAM 3's own box is TIGHTER than its mask here.")
-            else:
-                print("    The two agree closely, so which one is used barely")
-                print("    matters on this footage.")
-        if np.median(pi) < np.median(yi):
-            print("    SAM 3's boxes overlap less than the detector's did, so the")
-            print("    0.1 threshold — chosen against detector-box statistics —")
-            print("    rejects pairs the detector accepted.")
-        elif np.median(pi) > np.median(yi):
-            print("    SAM 3's boxes overlap MORE than the detector's did, so the")
-            print("    0.8 upper bound is the one at risk, not the lower.")
 
-    print(f"\n  Detector stage, same frames:")
     print(f"    SAM 3 found  {np.mean(det_sam3):.1f} cattle per frame "
           f"-> {np.mean(pair_sam3):.1f} pairs at {args.iou_low}-{args.iou_high} IoU")
     print(f"    YOLO left    {np.mean(pair_yolo):.1f} annotated pair(s) per frame")
-    print("    These are not the same quantity: the YOLO figure is pairs that")
-    print("    were ANNOTATED, not pairs it found, so it is a floor. Read the")
-    print("    two as 'does SAM 3 propose at least as many candidates', not as")
-    print("    a precision comparison.")
 
-    if args.scope == "frame":
-        print("\n  SCOPE = frame. 72% of the pairs in these frames carry no")
-        print("  clicks, so contacts correctly found there are counted as false")
-        print("  positives. FPPI and blind area here are LOWER BOUNDS on the")
-        print("  method, not estimates of it. Use --scope annotated to compare")
-        print("  against evaluate_contact.py.")
-    else:
-        print("\n  SCOPE = annotated: only the merged boxes of annotated pairs were")
-        print("  scored, so this is directly comparable with evaluate_contact.py")
-        print("  on the same crops. The difference between the two is what the")
-        print("  crop is worth, with everything else held fixed.")
     if failed:
-        print(f"\n  {failed} frames skipped (video or SAM 3 failure); excluded "
-              "from every number above")
+        print(f"\n  {failed} frames skipped (video or SAM 3 failure)")
 
     keys = ["rel_image", "no_contact", "n_points", "n_covered", "sensitivity",
             "n_clusters", "n_fp_clusters", "area_px", "a_i", "lift",

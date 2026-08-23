@@ -1,39 +1,3 @@
-"""
-prepare_interaction_dataset.py
-
-Processes videos to generate data/annotated/annotated_interaction.csv for interaction
-detection training.
-
-Pipeline per video:
-  1. Sample frames at --sample_fps (default 1).
-  2. Run YOLO to detect cattle bounding boxes.
-  3. Find pairs where iou_low < IoU(B1, B2) < iou_high (candidate interactions).
-  4. For each pair:
-     a. Save the union (merged) crop as the context image.
-     b. Run HRNet on each individual cattle crop → keypoints in frame-space.
-     c. Save both poses as .npy.
-  5. Write annotated_interaction.csv; label_v1 / label_v2 are left blank for human annotation.
-
-Output layout (split assigned per source video, 6:2:2 train:val:test, so pairs
-from the same video never leak across splits):
-  data/interaction/{split}/crops/{video_stem}/frame_XXXXXXXX_pair_XX.jpg
-  data/interaction/{split}/poses/{video_stem}/frame_XXXXXXXX_pair_XX_{1,2}.npy
-  data/annotated/annotated_interaction.csv
-
-Supports incremental runs — already-processed videos are skipped unless
---overwrite is passed.
-
-Usage (from CattleAct root):
-  python scripts/prepare_interaction_dataset.py \\
-      --video_dir "/user/work/sf24225/data/Full_behav/Videos to process batch 1 - social contacts" \\
-      --output_dir data/interaction \\
-      --yolo_ckpt  checkpoints/yolo.pt \\
-      --hrnet_ckpt checkpoints/hrnet_w32_ap10k_256x256-18aac840_20211029.pth \\
-      [--sample_fps 1] [--iou_low 0.2] [--iou_high 0.7] \\
-      [--yolo_conf 0.3] [--yolo_imgsz 1280] [--device cuda] \\
-      [--nested_thresh 0.85]
-"""
-
 import argparse
 import csv
 import os

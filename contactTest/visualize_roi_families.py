@@ -1,39 +1,3 @@
-"""One crop, six proposal families, each drawn at a matched operating point.
-
-Usage (from the repository root):
-
-    python -m contactTest.visualize_roi_families \
-        --split known_interact --image frame_00002950_pair_00
-    python -m contactTest.visualize_roi_families --split all \
-        --image frame_00002950_pair_00 --target 0.9 --source cache
-
-Writes one PNG to contactTest/log/roi_families/<split>/.
-
-WHY A MATCHED OPERATING POINT
-
-Drawing every family at its own default would compare regions of wildly
-different size, and the biggest one would look best. Instead each
-parameterised family is set to the parameter at which it reaches
-`--target` point coverage ON THE WHOLE SPLIT, read off the sweep curve that
-roi_sweep.py already wrote. The families are then all delivering the same
-coverage across the set, and the picture shows what that costs each of them in
-area on this particular crop.
-
-Two families have no parameter and are drawn as they are:
-
-    merged box     the crop itself, coverage 1.0 and area 1.0 by construction
-    SAM 3 overlap  mask_i AND mask_j, which is the r = 0 end of SAM 3 dilated
-
-A family whose curve never reaches the target is drawn at its largest parameter
-instead, and the caption says so rather than implying it got there.
-
-WHAT IS ON EACH PANEL
-
-The crop, the region shaded and outlined, and the clicked ground-truth points —
-filled where the region covers them, hollow where it misses. The header gives
-the parameter, this crop's own area fraction and this crop's own coverage, which
-is not the split-level target and will differ from it.
-"""
 
 import argparse
 import os
@@ -55,9 +19,6 @@ CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
 C_HIT, C_MISS = (80, 240, 110), (245, 85, 75)
 
-# Region colours. Taken from roi_sweep's curve palette so the two figures agree,
-# except merged box, which is red here: it is the incumbent being replaced and
-# should read as the thing to beat rather than as neutral grey.
 COLOUR = {
     "merged box":        (220, 50, 50),
     "box intersection":  (217, 107, 41),
@@ -71,7 +32,6 @@ PARAM_UNIT = {"box intersection": "s", "inscribed ellipse": "s",
 
 
 def read_sweep(path, coverage_key=None):
-    """The sweep curve as {family: (params, coverages)} sorted by parameter."""
     import csv
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
@@ -88,16 +48,9 @@ def read_sweep(path, coverage_key=None):
 
 
 def param_for(curve, target):
-    """Smallest parameter reaching `target`, or (max, False) if it never does.
-
-    Interpolated on the parameter axis, which is why the sweep should be dense:
-    on the 8-point grid this lands between samples and is an estimate.
-    """
     p, c = curve
     if c.max() < target:
         return float(p[-1]), False
-    # np.interp needs an increasing x; coverage is monotone in the parameter for
-    # every family here, but ties are possible, so take the first crossing.
     k = int(np.argmax(c >= target))
     if k == 0:
         return float(p[0]), True
@@ -129,18 +82,10 @@ def main():
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="known_interact",
                     choices=["train", "val", "test", "all", "known_interact"])
-    ap.add_argument("--image", required=True,
-                    help="substring of the crop path, e.g. frame_00002950_pair_00")
-    ap.add_argument("--target", type=float, default=0.8,
-                    help="split-level point coverage each parameterised family "
-                         "is set to. SAM 3 dilated is exempt — see --sam3-r")
-    ap.add_argument("--sam3-r", type=float, default=22.0,
-                    help="SAM 3 dilated is drawn at this fixed radius rather "
-                         "than solved off the curve, so the figure shows the "
-                         "operating point the rest of the work reports at")
-    ap.add_argument("--sweep-csv", default=None,
-                    help="curve to read the parameters off; default is the "
-                         "roi_sweep output for --split")
+    ap.add_argument("--image", required=True)
+    ap.add_argument("--target", type=float, default=0.8)
+    ap.add_argument("--sam3-r", type=float, default=22.0)
+    ap.add_argument("--sweep-csv", default=None)
     ap.add_argument("--source", default="sam3_text", choices=["sam3_text", "cache"])
     ap.add_argument("--weights", default=None)
     ap.add_argument("--text", default="cow")
@@ -152,9 +97,6 @@ def main():
     if args.conf is None:
         args.conf = float(cfg["data"].get("sam3_conf", 0.6))
 
-    # Prefer a curve that actually contains the SAM 3 families: a
-    # --baselines-only sweep has none, and picking it would silently drop the
-    # two panels the figure exists for.
     candidates = ([args.sweep_csv] if args.sweep_csv else [
         os.path.join(CONTACT_ROOT, "log", "roi_sweep", args.split,
                      "roi_sweep_dense.csv"),
@@ -243,9 +185,6 @@ def main():
                 note = " — never reaches the target; drawn at its maximum"
         cov = sum(1 for (x, y) in pts
                   if region[int(np.clip(y, 0, h - 1)), int(np.clip(x, 0, w - 1))])
-        # All of this is kept: `region` is what gets drawn, and the rest is
-        # printed to the terminal. What the FIGURE shows is decided further
-        # down, where the only thing put on a panel is the family name.
         panels.append({
             "family": fam, "label": label, "note": note, "region": region,
             "a_i": float(region.sum()) / float(h * w),
@@ -268,21 +207,12 @@ def main():
     axes = np.atleast_1d(axes).ravel()
     for ax, p in zip(axes, panels):
         ax.imshow(overlay(bgr, p["region"], pts, COLOUR[p["family"]]))
-        # The method goes UNDER the picture, and nothing else does: a_i and the
-        # covered count are printed to the terminal instead, so the figure
-        # carries no number that could be mistaken for a result.
         ax.set_xlabel(f"{p['family']}"
-                    #   + ("\n" + p["note"].strip(" —") if p["note"] else "")
                       ,fontsize=10.5, labelpad=8
                       )
         ax.set_xticks([]); ax.set_yticks([])
     for ax in axes[len(panels):]:
         ax.axis("off")
-    # fig.suptitle(f"{MAPPING.get(args.split, args.split)} — {os.path.basename(rel)}"
-    #              f"   (parameters set where each family reaches "
-    #              f"{args.target:.2f} point coverage on the whole split)",
-    #              fontsize=12)
-    # fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.tight_layout()
     out = args.out or os.path.join(CONTACT_ROOT, "log", "roi_families", args.split,
                                    f"{os.path.splitext(os.path.basename(rel))[0]}.png")

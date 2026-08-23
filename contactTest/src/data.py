@@ -1,25 +1,3 @@
-"""Dataset for weakly-supervised contact localisation on cattle pair crops.
-
-Data contract (produced by prep/interaction_prep.py, labelled via Label Studio):
-
-  image_path         repo-root-relative path to the pair crop
-  bbox1_xyxy         "[x1 y1 x2 y2]" of cow 1, in SOURCE FRAME coordinates
-  bbox2_xyxy         "[x1 y1 x2 y2]" of cow 2, in SOURCE FRAME coordinates
-  merged_bbox_xyxy   "[x1 y1 x2 y2]" union box; the crop is this region
-  label_v1           interaction | no_interaction | not well-cropped | blank
-  label_v2           social grooming | interest | sniffing | mount | ...
-  source_video       used as the split group; splits are already video-disjoint
-  split              train | val | test
-
-The crop is the merged box cut out of the frame WITHOUT resizing, and
-prep.safe_crop_bgr clips it at the frame border. The crop origin is therefore
-(max(0, mx1), max(0, my1)) and the crop can be SMALLER than the merged box when
-the pair sits against an image edge (~12% of rows), so relative boxes are
-clamped to the real crop size rather than trusted blindly.
-
-Each sample returns the letterboxed crop, the binary interaction label, and the
-contact-candidate region R used as the MIL bag.
-"""
 
 import os
 import re
@@ -27,32 +5,26 @@ import re
 import cv2
 import numpy as np
 
-# torch is imported lazily so that the CSV/geometry helpers below — and with them
-# diagnostics/geometry_baseline.py, the gate that decides whether training is
-# worth running — stay usable in a plain numpy environment with no GPU stack.
 try:
     import torch
     from torch.utils.data import Dataset
 
     TORCH_AVAILABLE = True
-except ImportError:  # pragma: no cover - exercised only on numpy-only machines
+except ImportError:
     torch = None
     Dataset = object
     TORCH_AVAILABLE = False
 
-# Repository root = two levels up from contactTest/src/.
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 CONTACT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# Letterbox padding value; matches the grey used by the YOLO stage.
 PAD_VALUE = 114
 
 
 def parse_bbox(text):
-    """Parse "[x1 y1 x2 y2]" (space-, comma- or quote-separated) into an int array."""
     nums = re.findall(r"-?\d+", str(text))
     if len(nums) != 4:
         raise ValueError(f"expected 4 bbox values, got {text!r}")
@@ -60,12 +32,6 @@ def parse_bbox(text):
 
 
 def letterbox(img, size, pad_value=0):
-    """Scale the longest side to `size` and pad, preserving the aspect ratio.
-
-    Returned alongside the canvas are the occupied height/width and the scale
-    factor, so that boxes and predictions can be mapped in and out of the canvas.
-    Padding must be excluded from the MIL bag; it carries no image evidence.
-    """
     h, w = img.shape[:2]
     scale = size / max(h, w)
     nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
@@ -79,13 +45,6 @@ def letterbox(img, size, pad_value=0):
 
 
 def binary_label(row, no_names, exclude_names, exclude_positive_v2):
-    """Map a CSV row to 0 / 1, or None when the row must be dropped.
-
-    Follows the same rule as train/interaction_with_image.py so that this
-    experiment sees exactly the rows the stage-2 classifier is trained on, with
-    one extra hook: label_v2 values listed in `exclude_positive_v2` are removed
-    from the positive class (see README.md on 'interest').
-    """
     v1 = str(row.get("label_v1") or "").strip().lower()
     if not v1 or v1 in exclude_names:
         return None
@@ -98,17 +57,6 @@ def binary_label(row, no_names, exclude_names, exclude_positive_v2):
 
 
 def load_records(cfg, splits=None, require_label=True):
-    """Read the annotation CSV into a list of per-pair records.
-
-    Paths are resolved against the repository root; the CSV itself is never
-    modified. Rows whose crop file is missing are skipped with a warning.
-
-    require_label=True (the default) keeps only rows carrying a usable
-    interaction annotation - what training and the label-based diagnostics need.
-    Set it to False for measurements that must not depend on the annotation at
-    all; those rows come back with label = -1, and the caller must not treat -1
-    as a class.
-    """
     import csv
 
     csv_path = os.path.join(REPO_ROOT, cfg["data"]["csv"])
@@ -117,8 +65,6 @@ def load_records(cfg, splits=None, require_label=True):
     exclude_names = {str(x).strip().lower() for x in lab.get("exclude_names", [])}
     exclude_v2 = {str(x).strip().lower() for x in lab.get("exclude_positive_v2", [])}
 
-    # Resolved under contactTest/, like the pose cache, so nothing is written
-    # outside this folder.
     mask_dir = cfg["data"].get("mask_dir")
     mask_root = os.path.join(CONTACT_ROOT, mask_dir) if mask_dir else None
     depth_dir = (cfg.get("depth") or {}).get("cache_dir")
@@ -129,11 +75,6 @@ def load_records(cfg, splits=None, require_label=True):
         for row in csv.DictReader(f):
             label = binary_label(row, no_names, exclude_names, exclude_v2)
             if label is None:
-                # Unannotated, or a crop a human marked unusable. Training must
-                # skip these, but a label-free measurement must not: dropping
-                # them would silently restrict the sample to the rows somebody
-                # chose to annotate and judged well cropped, which is a
-                # human-selection effect, not a property of the imagery.
                 if require_label:
                     continue
                 label = -1
@@ -170,10 +111,6 @@ def load_records(cfg, splits=None, require_label=True):
                 "bbox2": parse_bbox(row["bbox2_xyxy"]),
                 "merged": parse_bbox(row["merged_bbox_xyxy"]),
                 "label": label,
-                # Kept raw as well as mapped. `label` collapses "never
-                # annotated" and "annotated as a bad crop" into -1 when
-                # require_label is False, and telling those apart is the whole
-                # basis on which annotate_contact chooses its sample.
                 "label_v1": str(row.get("label_v1") or "").strip().lower(),
                 "label_v2": str(row.get("label_v2") or "").strip().lower(),
                 "split": split,
@@ -190,11 +127,6 @@ def load_records(cfg, splits=None, require_label=True):
 
 
 def relative_boxes(record, crop_h, crop_w):
-    """Convert the two frame-space boxes into crop-space boxes, clamped in range.
-
-    The crop origin is max(0, merged_x1), max(0, merged_y1) because
-    prep.safe_crop_bgr clips the merged box against the frame border.
-    """
     merged = record["merged"]
     ox, oy = max(0, int(merged[0])), max(0, int(merged[1]))
     out = []
@@ -216,19 +148,6 @@ def _box_mask(box, h, w):
 
 
 class ContactPairDataset(Dataset):
-    """Pair crops with a binary interaction label and a contact-candidate region.
-
-    The region R is the intersection of the two dilated cow supports, restricted
-    to the non-padded part of the canvas. It is the MIL bag: the model may only
-    place contact evidence inside it, which is what stops the classifier from
-    solving the task with background or global-layout shortcuts.
-
-    Cow support comes from instance masks when `mask_dir` is configured and a
-    mask file exists, otherwise from the detector boxes. Boxes are coarser — for
-    two axis-aligned rectangles the dilated intersection is itself a rectangle —
-    but the sparsity and TV terms still have to concentrate mass inside it, and
-    prep guarantees IoU > 0.1 so the intersection is never empty.
-    """
 
     def __init__(self, records, cfg, train=False):
         if not TORCH_AVAILABLE:
@@ -243,10 +162,6 @@ class ContactPairDataset(Dataset):
         k = 2 * self.dilate_px + 1
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
 
-        # Pose. When enabled the MIL bag becomes the keypoints instead of the
-        # ~17.6k pixels of R, which is the point: 34 slots cannot hold a
-        # memorised copy of 2064 crops, and a joint means the same anatomy in
-        # every video whereas a pixel coordinate does not.
         pcfg = cfg.get("pose", {})
         self.use_pose = bool(pcfg.get("use_in_model", False))
         self.pose_cache = os.path.join(
@@ -257,11 +172,6 @@ class ContactPairDataset(Dataset):
         self.kp_proximity = float(pcfg.get("proximity_px", 60))
         self.num_joints = int(pcfg.get("num_joints", 17))
 
-        # Extra input planes derived from the instance masks. RGB alone never
-        # tells the network which pixels belong to which animal, so it has to
-        # infer the instance boundary from 240 positives; these planes hand it
-        # over directly. The proximity plane in particular is the quantity that
-        # separates contact from mere closeness.
         self.mask_channels = bool(cfg["data"].get("mask_channels", False))
         self.gap_scale = float(cfg["data"].get("gap_scale_px", 15.0))
 
@@ -273,13 +183,12 @@ class ContactPairDataset(Dataset):
         self.prior_conf_weighting = bool(prior.get("conf_weighting", True))
 
     def _load_keypoints(self, record, crop_h, crop_w):
-        """Cached keypoints in crop pixels, or None when absent."""
         path = os.path.join(self.pose_cache,
                             os.path.splitext(record["rel_image"])[0] + ".npz")
         if not os.path.exists(path):
             return None
         data = np.load(path)
-        keypoints = data["keypoints"].astype(np.float32)      # (2, J, 3)
+        keypoints = data["keypoints"].astype(np.float32)
         cached_h, cached_w = [int(v) for v in data["crop_hw"]]
         if (cached_h, cached_w) != (crop_h, crop_w) and cached_h > 0 and cached_w > 0:
             keypoints[..., 0] *= crop_w / cached_w
@@ -287,12 +196,6 @@ class ContactPairDataset(Dataset):
         return keypoints
 
     def _gate_keypoints(self, keypoints, boxes):
-        """Mark the joints eligible to enter the MIL bag.
-
-        A joint qualifies when the pose model is confident about it AND it lies
-        near the OTHER animal — a joint on the far flank cannot be a contact
-        site, so admitting it would only widen the search for no reason.
-        """
         valid = keypoints[..., 2] >= self.kp_min_conf
         for i in range(keypoints.shape[0]):
             ox1, oy1, ox2, oy2 = boxes[1 - i]
@@ -304,40 +207,11 @@ class ContactPairDataset(Dataset):
         return valid
 
     def _proximity(self, support_i, support_j):
-        """How close the two animals' surfaces are at each pixel, in [0, 1].
-
-            gap(u)       = dist(u, surface of i) + dist(u, surface of j)
-            proximity(u) = exp(-gap(u) / gap_scale)
-
-        The sum of the two distance transforms is the local separation between
-        the animals: it is 0 where they touch or overlap and grows with the
-        width of the gap between them. Exponentiating bounds it and puts the
-        peak exactly on the contact band.
-
-        This is a strong feature but NOT the answer, which is why it is an input
-        and not a label: in an overhead projection one animal standing behind
-        another reads as zero gap without touching at all, so telling occlusion
-        from contact is still something the network has to learn.
-        """
         di = cv2.distanceTransform((support_i == 0).astype(np.uint8), cv2.DIST_L2, 3)
         dj = cv2.distanceTransform((support_j == 0).astype(np.uint8), cv2.DIST_L2, 3)
         return np.exp(-(di + dj) / max(self.gap_scale, 1e-3)).astype(np.float32)
 
     def _prior_target(self, keypoints, size):
-        """A soft target blob at the estimated contact site, plus its weight.
-
-        Contact in this dataset is head-initiated (380 of 384 positives), so the
-        shortest head-to-body link is a usable guess at where contact happens.
-        The blob is Gaussian and its spread scales with the link length, which
-        makes the target encode its own uncertainty: a short, confident link
-        produces a tight blob, a long one a broad and therefore weak hint.
-
-        The weight scales with the pose confidence at both endpoints, so an
-        unreliable keypoint contributes proportionally little. That matters here
-        because only a third to a half of head joints clear the threshold.
-
-        Returns (blob HxW float32, weight in [0,1]) or (None, 0.0).
-        """
         from .pose import closest_head_link, HEAD_JOINTS
 
         link = closest_head_link(keypoints, self.kp_min_conf)
@@ -356,8 +230,6 @@ class ContactPairDataset(Dataset):
 
         weight = 1.0
         if self.prior_conf_weighting:
-            # Geometric mean of the two endpoint confidences, referenced to
-            # twice the acceptance threshold so a marginal joint counts little.
             conf = keypoints[..., 2]
             best = float(np.sqrt(max(conf[:, HEAD_JOINTS].max(), 1e-6) *
                                  max(conf.max(), 1e-6)))
@@ -365,7 +237,6 @@ class ContactPairDataset(Dataset):
         return blob.astype(np.float32), weight
 
     def _pose_region(self, keypoints, valid, size):
-        """Union of disks around the eligible joints, or None if there are none."""
         if not valid.any():
             return None
         region = np.zeros((size, size), np.uint8)
@@ -384,7 +255,6 @@ class ContactPairDataset(Dataset):
         return len(self.records)
 
     def _supports(self, record, img):
-        """Return the two per-cow support masks at crop resolution."""
         h, w = img.shape[:2]
         if record["mask_path"] is not None:
             data = np.load(record["mask_path"])
@@ -400,8 +270,6 @@ class ContactPairDataset(Dataset):
         record = self.records[idx]
         bgr = cv2.imread(record["image_path"])
         if bgr is None:
-            # Corrupt file: fall through to the next record rather than crash the
-            # epoch, matching the behaviour of src/dataset.py.
             return self[(idx + 1) % len(self)]
         img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
@@ -414,8 +282,6 @@ class ContactPairDataset(Dataset):
             img = np.ascontiguousarray(img[:, ::-1])
             support_i = np.ascontiguousarray(support_i[:, ::-1])
             support_j = np.ascontiguousarray(support_j[:, ::-1])
-            # Boxes and keypoints must be mirrored alongside the image, or the
-            # proximity gate would compare flipped joints with unflipped boxes.
             boxes = [(crop_w - 1 - x2, y1, crop_w - 1 - x1, y2)
                      for (x1, y1, x2, y2) in boxes]
             if keypoints is not None:
@@ -427,7 +293,6 @@ class ContactPairDataset(Dataset):
         support_i, _, _, _ = letterbox(support_i, self.size, 0)
         support_j, _, _, _ = letterbox(support_j, self.size, 0)
 
-        # Padding is not image evidence and must never enter the MIL bag.
         valid = np.zeros((self.size, self.size), dtype=np.uint8)
         valid[:nh, :nw] = 1
 
@@ -435,12 +300,8 @@ class ContactPairDataset(Dataset):
         dj = cv2.dilate(support_j, self.kernel)
         region = ((di > 0) & (dj > 0) & (valid > 0)).astype(np.float32)
         if region.sum() < self.min_area:
-            # Degenerate overlap (rare; only when the crop is heavily clipped).
-            # Fall back to the union so the pooling always has something to pool.
             region = (((di > 0) | (dj > 0)) & (valid > 0)).astype(np.float32)
 
-        # Keypoints follow the same letterbox transform as the image: scaled by
-        # `scale`, no offset, because letterbox pastes at the canvas origin.
         kp_xy = np.zeros((2, self.num_joints, 2), np.float32)
         kp_valid = np.zeros((2, self.num_joints), bool)
         prior_blob = np.zeros((self.size, self.size), np.float32)
@@ -454,9 +315,6 @@ class ContactPairDataset(Dataset):
                          (keypoints[..., 1] >= 0) & (keypoints[..., 1] < self.size))
             kp_xy = keypoints[..., :2].astype(np.float32)
 
-            # The prior is only a training hint for POSITIVES: a negative pair
-            # has no contact site to point at, and the binary label already
-            # supplies everything the negative can teach.
             if self.prior_enabled and record["label"] == 1:
                 blob, w = self._prior_target(keypoints, self.size)
                 if blob is not None:
@@ -464,8 +322,6 @@ class ContactPairDataset(Dataset):
 
             pose_region = self._pose_region(keypoints, kp_valid, self.size)
             if pose_region is not None:
-                # Intersect with the box region so the keypoint disks stay inside
-                # the physically plausible area and off the letterbox padding.
                 combined = pose_region * region
                 if combined.sum() >= self.min_area:
                     region = combined
@@ -476,8 +332,6 @@ class ContactPairDataset(Dataset):
         image = torch.from_numpy(x).permute(2, 0, 1).contiguous()
 
         if self.mask_channels:
-            # Appended AFTER the flip, so the planes always agree with the image
-            # they describe.
             extra = np.stack([support_i.astype(np.float32),
                               support_j.astype(np.float32),
                               self._proximity(support_i, support_j)], axis=0)
@@ -488,23 +342,16 @@ class ContactPairDataset(Dataset):
             "region": torch.from_numpy(region)[None],
             "label": torch.tensor(float(record["label"])),
             "index": torch.tensor(idx),
-            "kp_xy": torch.from_numpy(kp_xy.reshape(-1, 2)),        # (2J, 2)
-            "kp_valid": torch.from_numpy(kp_valid.reshape(-1)),     # (2J,)
-            "prior": torch.from_numpy(prior_blob)[None],            # (1, H, W)
+            "kp_xy": torch.from_numpy(kp_xy.reshape(-1, 2)),
+            "kp_valid": torch.from_numpy(kp_valid.reshape(-1)),
+            "prior": torch.from_numpy(prior_blob)[None],
             "prior_weight": torch.tensor(np.float32(prior_weight)),
-            # Kept for mapping predictions back to the source frame.
             "scale": torch.tensor(np.float32(scale)),
             "valid_hw": torch.tensor([nh, nw], dtype=torch.long),
         }
 
 
 def split_records(records):
-    """Group records by the CSV split column.
-
-    interaction_prep assigns whole videos to a split (assign_videos_622), so the
-    splits are already video-disjoint and no additional grouping is required.
-    diagnostics/split_leakage.py verifies this rather than assuming it.
-    """
     buckets = {"train": [], "val": [], "test": []}
     for r in records:
         buckets.get(r["split"], buckets["train"]).append(r)
@@ -512,25 +359,13 @@ def split_records(records):
 
 
 def records_for(records, split):
-    """Rows of one split, or every row when split == "all".
-
-    "all" exists for the post-processing measurements. Stage 2 fits nothing, so
-    train/val/test carry no meaning there — a held-out set protects against
-    having learned the answer, and nothing here learns. Restricting the ground
-    truth to one split would only shrink it.
-    """
     b = split_records(records)
     if split in ("all", "known_interact"):
-        # known_interact is not a CSV split. It names a ground-truth SET, and
-        # which rows belong to it is decided by that set's contact_gt.csv, not
-        # here; this call only builds the rel_image -> record index the scorers
-        # look rows up in, so it has to span everything.
         return b["train"] + b["val"] + b["test"]
     return b[split]
 
 
 def describe(buckets):
-    """Print per-split class counts and the label_v2 make-up of the positives."""
     for split in ("train", "val", "test"):
         rows = buckets[split]
         n_pos = sum(1 for r in rows if r["label"] == 1)

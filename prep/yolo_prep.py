@@ -1,33 +1,3 @@
-"""
-Spec:
-- model training: YOLOv11
-- trackingidentifiers and movement trajectories: ByteTrack
-- training, validating and testing using a 6:2:2 split
-- without considering class balance
-
-Convert multi-camera tracklets.json files to YOLO OBB dataset format.
-
-Expected directory structure (set DATA_ROOT below):
-  camera128/
-    128_20250529T062356_20250529T064453/
-      tracklets.json
-    128_20250529T062356_20250529T064453.mp4
-  camera133/
-    ...
-  camera26/
-    ...
-
-Output:
-  data/object/
-    train/images/  train/labels/
-    val/images/    val/labels/
-    test/images/   test/labels/
-    object.yaml
-
-YOLO OBB label format per line:
-  0 x1 y1 x2 y2 x3 y3 x4 y4   (class_id + 4 corners, normalized 0-1)
-"""
-
 import json
 import os
 import random

@@ -1,20 +1,3 @@
-"""HRNet-W32 / AP-10K pose estimation for cattle pair crops.
-
-Reuses the network definition and decoding conventions already in
-prep/interaction_prep.py so that keypoints produced here are identical to the
-ones that script would have written had use_pose been enabled. Nothing outside
-contactTest is modified; the checkpoint and prep/src/hrnet.py are read only.
-
-Keypoints are computed FROM THE PAIR CROP, not from the source video. The crop
-is the merged box cut out of the frame, and relative_boxes() gives each animal's
-box inside it, so each cow can be re-cropped and posed without touching the
-original footage.
-
-AP-10K uses 17 quadruped joints. Their layout matters for this project: 380 of
-the 384 positive pairs are head-initiated (grooming is head-to-head, interest is
-head-to-body, sniffing is head-led; only the 4 mount pairs are not), so the
-nose / eye / neck joints are where contact evidence is expected to sit.
-"""
 
 import importlib.util
 import os
@@ -26,7 +9,6 @@ from PIL import Image
 
 from .data import REPO_ROOT, relative_boxes
 
-# AP-10K joint order, as produced by the mmpose 0.x checkpoint.
 KEYPOINT_NAMES = [
     "left_eye", "right_eye", "nose", "neck", "root_of_tail",
     "left_shoulder", "left_elbow", "left_front_paw",
@@ -35,8 +17,6 @@ KEYPOINT_NAMES = [
     "right_hip", "right_knee", "right_back_paw",
 ]
 
-# Joints that make up the head. Contact in this dataset is overwhelmingly
-# head-initiated, so these are the ones worth trusting a prior on.
 HEAD_JOINTS = [0, 1, 2, 3]
 
 SKELETON = [
@@ -47,14 +27,10 @@ SKELETON = [
     (4, 14), (14, 15), (15, 16),
 ]
 
-# Left/right joints must swap identity under a horizontal flip. Mirroring the
-# coordinates alone would label the animal's left legs as its right ones and
-# scramble the anatomy the keypoint output space depends on.
 FLIP_PAIRS = [(0, 1), (5, 8), (6, 9), (7, 10), (11, 14), (12, 15), (13, 16)]
 
 
 def flip_keypoints(keypoints, width):
-    """Mirror keypoints about a vertical axis and swap the left/right joints."""
     out = keypoints.copy()
     out[..., 0] = (width - 1) - out[..., 0]
     for a, b in FLIP_PAIRS:
@@ -63,12 +39,6 @@ def flip_keypoints(keypoints, width):
 
 
 def _load_hrnet_class():
-    """Import prep/src/hrnet.py by path.
-
-    The repository has two different `src` packages (repo-root and prep/), so a
-    plain import would be ambiguous; loading by file path sidesteps the clash
-    without mutating sys.path.
-    """
     path = os.path.join(REPO_ROOT, "prep", "src", "hrnet.py")
     if not os.path.exists(path):
         raise FileNotFoundError(f"HRNet definition not found at {path}")
@@ -88,7 +58,6 @@ class _KeypointHead(torch.nn.Module):
 
 
 class HRNetPose(torch.nn.Module):
-    """Backbone + keypoint head, matching prep/interaction_prep.py exactly."""
 
     def __init__(self, num_joints=17):
         super().__init__()
@@ -100,7 +69,6 @@ class HRNetPose(torch.nn.Module):
 
 
 def load_pose_model(cfg, device):
-    """Load the AP-10K checkpoint; the state dict is stripped of DDP prefixes."""
     pcfg = cfg["pose"]
     ckpt_path = os.path.join(REPO_ROOT, pcfg["hrnet_ckpt"])
     if not os.path.exists(ckpt_path):
@@ -135,10 +103,6 @@ def build_transform(cfg):
 
 
 def decode_heatmaps(heatmaps):
-    """(N, J, H, W) -> (N, J, 3) as [x, y, conf], with the +/-0.25 px shift.
-
-    Identical to prep/interaction_prep.decode_heatmaps, vectorised over joints.
-    """
     n, j, h, w = heatmaps.shape
     flat = heatmaps.reshape(n, j, -1)
     idx = flat.argmax(axis=2)
@@ -159,10 +123,6 @@ def decode_heatmaps(heatmaps):
 
 @torch.no_grad()
 def pose_for_pair(record, crop_bgr, model, transform, cfg, device):
-    """Keypoints for both cows, in PAIR-CROP pixel coordinates.
-
-    Returns a (2, J, 3) array of [x, y, conf] plus the two relative boxes.
-    """
     import cv2
 
     h, w = crop_bgr.shape[:2]
@@ -181,9 +141,8 @@ def pose_for_pair(record, crop_bgr, model, transform, cfg, device):
 
     batch = torch.stack(tensors).to(device)
     heatmaps = model(batch).cpu().numpy()
-    decoded = decode_heatmaps(heatmaps)                     # (2, J, 3)
+    decoded = decode_heatmaps(heatmaps)
 
-    # Heatmap space -> the animal's own crop -> pair-crop coordinates.
     out = decoded.copy()
     for i, (bw, bh, ox, oy) in enumerate(sizes):
         out[i, :, 0] = out[i, :, 0] * (bw / hmap_size) + ox
@@ -192,14 +151,6 @@ def pose_for_pair(record, crop_bgr, model, transform, cfg, device):
 
 
 def closest_head_link(keypoints, min_conf):
-    """Shortest link from either cow's head joints to any joint of the other.
-
-    A training-free contact estimate: if the pose is reliable and contact really
-    is head-initiated, this segment should already land on the contact site. It
-    is the baseline any learned heatmap has to beat before it is worth using.
-
-    Returns (point_a, point_b, distance, joint_a, joint_b) or None.
-    """
     best = None
     for src, dst in ((0, 1), (1, 0)):
         for ja in HEAD_JOINTS:

@@ -1,18 +1,3 @@
-"""Train the weakly-supervised contact-localisation model.
-
-Usage (from the repository root):
-
-    python -m contactTest.train_contact
-    python -m contactTest.train_contact --config contactTest/config.yaml
-    python -m contactTest.train_contact --epochs 5 --backbone dinov2
-
-Reads data/annotated/annotated_interaction_test.csv and the existing pair crops.
-Writes ONLY inside contactTest/ (checkpoint, CSV log, config snapshot).
-
-The reported val/test AUC measures pair CLASSIFICATION, which is a sanity check,
-not evidence of localisation quality — nothing in this dataset supervises where
-contact happens. Use diagnostics/ plus infer_contact.py --deletion-test for that.
-"""
 
 import argparse
 import csv
@@ -36,18 +21,12 @@ CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
 
 def out_path(cfg, key, *parts):
-    """Resolve an output path under contactTest/ and create the parent folder."""
     path = os.path.join(CONTACT_ROOT, cfg["output"][key], *parts)
     os.makedirs(os.path.dirname(path) if os.path.splitext(path)[1] else path, exist_ok=True)
     return path
 
 
 def model_forward(model, batch, device):
-    """Call the model, passing keypoints only when keypoint pooling is active.
-
-    Returns (z, pooled_logit, joint_scores); joint_scores is None unless the
-    model pools over keypoints.
-    """
     image = batch["image"].to(device, non_blocking=True)
     region = batch["region"].to(device, non_blocking=True)
     if getattr(model, "pooling", "") == "keypoint":
@@ -206,7 +185,7 @@ def main():
             torch.save({"model": model.state_dict(), "config": cfg,
                         "epoch": epoch + 1, "val_auc": val_auc}, ckpt_path)
 
-    if best_auc < 0:  # no usable val split — keep the final weights
+    if best_auc < 0:
         torch.save({"model": model.state_dict(), "config": cfg,
                     "epoch": epochs, "val_auc": float("nan")}, ckpt_path)
     log_file.close()
@@ -229,8 +208,6 @@ def main():
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     print(f"[train] checkpoint {ckpt_path}")
-    print("[train] NOTE: AUC scores pair classification only. Localisation quality "
-          "needs infer_contact.py --deletion-test or a hand-annotated contact set.")
 
 
 if __name__ == "__main__":

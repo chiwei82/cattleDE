@@ -1,80 +1,3 @@
-"""Cluster-level evaluation of the SAM 3 contact region against clicked GT.
-
-Usage (from the repository root):
-
-    python -m contactTest.evaluate_contact --split train --weights sam3.pt
-    python -m contactTest.evaluate_contact --split train --weights sam3.pt \\
-        --depth-tol 0.10 --depth-gate pair
-    python -m contactTest.evaluate_contact --split train --source cache \\
-        --mask-dir log/mask_cache          # a prebuilt cache, without re-running
-
-Runs the SAM 3 pipeline itself by default — concept prompt `--text cow`, then
-the returned instances assigned to the two detector boxes — so no mask cache has
-to exist first and there is no way to measure one segmenter while believing it
-is another. `--source cache` reads a prebuilt cache instead — whatever
-precompute_masks wrote — which avoids re-running the model when only the
-downstream settings are being varied.
-
-Writes to contactTest/log/evaluate/<split>/ only: one image per crop, a
-per-image CSV, and a summary JSON. The aggregate numbers are printed.
-
-The predicted region is split into CONNECTED COMPONENTS, called clusters here.
-That is the difference from score_contact.py, which treats the region as one
-undifferentiated set of pixels: a cluster is a candidate contact site, so a
-region made of one blob on the right animals and four scattered on the railing
-is not the same result as a single blob, even though both have the same hit rate.
-
-THE SIX METRICS
-
-  1  Sensitivity = GT points covered by any cluster / all GT points
-     Pooled over points, not averaged over images, so a crop with 20 clicks
-     counts for more than one with 2. Alone it is maximised by covering
-     everything, which is what 3 and 2 are for.
-
-  2  FPPI = clusters covering no GT point / number of images
-     False positives per image. Counts CLUSTERS, not pixels, so one large
-     wrong blob costs the same as one small wrong blob — this measures how
-     many wrong places are proposed, and metric 3 measures how much they cost.
-     Images marked "no contact" contribute every cluster they have, since
-     none of them can cover a GT point. They are counted in with the rest:
-     a "no contact" mark is the annotator's finding about that image, not a
-     designed negative arm, so there is nothing to report separately.
-
-  3  a-bar = mean over images of (predicted pixels / image pixels)
-     Mean over images as specified, so every crop counts once regardless of
-     size. Alone it is minimised by predicting nothing.
-
-  4  Lift = Sensitivity / a-bar
-     How much more concentrated contact is inside the region than it would be
-     under a region of the same size placed at random. 1.0 is chance.
-
-  5  Hit quality = mean over covered GT points of
-         area(the cluster containing that point) / area(the GT discs)
-     Near 1 means the cluster that found the contact is about the size of the
-     ground truth it found. Large means it was right but grossly oversized —
-     a hit that carries no localisation. This is what separates "in the right
-     place" from "in the right place and no bigger than it needs to be", which
-     Sensitivity alone cannot express.
-
-     The GT discs are each clicked point dilated to a radius of
-     --gt-dilate-scale x dilate_px (0.5 x by default), and the denominator is
-     the area of their UNION within that image, so overlapping clicks are not
-     counted twice. Set --gt-dilate-px to give the radius in pixels instead.
-
-  6  Blind area = pixels in clusters covering no GT point / all predicted pixels
-     The pixel-weighted counterpart of FPPI. FPPI counts how many places are
-     wrongly proposed; this is how much of the prediction they consume. One
-     huge blind blob and ten blind specks score the same FPPI and very
-     different blind area, and they are different problems: the first wastes
-     the budget, the second is noise.
-
-     Pooled over all pixels in all images, matching "total proposed area".
-     The per-image ratio is in the CSV as blind_frac. Images marked "no
-     contact" contribute all of their area, since none of it can cover a
-     point.
-
-Everything is reported per image as well, in evaluation.csv.
-"""
 
 import argparse
 import csv
@@ -99,15 +22,12 @@ CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 C_HIT = (90, 220, 110)
 C_MISS = (235, 90, 80)
 C_GT_DISC = (250, 220, 90)
-# Distinct hues so neighbouring clusters stay tellable apart; a cluster that
-# covers no GT point is drawn in the last colour regardless.
 C_CLUSTER = [(120, 235, 130), (90, 190, 240), (245, 175, 90), (200, 140, 235),
              (140, 220, 210), (240, 210, 120)]
 C_FP = (225, 120, 120)
 
 
 def gt_disc_mask(shape, points, radius):
-    """Union of discs of `radius` centred on the clicked points."""
     m = np.zeros(shape, np.uint8)
     for (x, y) in points:
         cv2.circle(m, (int(x), int(y)), int(max(radius, 1)), 1, -1)
@@ -115,41 +35,23 @@ def gt_disc_mask(shape, points, radius):
 
 
 def evaluate_one(region, points, shape, gt_radius, denom_px=None):
-    """Cluster-level numbers for a single image.
-
-    Returns the per-image record. `points` may be empty — the image was marked
-    "no contact" — and then every cluster is a false positive and the
-    point-based metrics are UNDEFINED rather than zero.
-
-    `denom_px` is the area a_i is a share OF. It defaults to the whole image,
-    which is right when the whole image could have been predicted. It must be
-    overridden when the prediction was restricted to part of the image, because
-    otherwise a_i is diluted by territory the method was never allowed to use —
-    and Lift, being Sensitivity / a_i, is inflated by exactly that factor.
-    """
     h, w = shape
     n_lab, lab = cv2.connectedComponents(region.astype(np.uint8))
     n_clusters = max(n_lab - 1, 0)
 
-    # Which cluster, if any, contains each clicked point.
     hit_of = []
     for (x, y) in points:
         xx = int(np.clip(x, 0, w - 1))
         yy = int(np.clip(y, 0, h - 1))
-        hit_of.append(int(lab[yy, xx]))          # 0 = background = miss
+        hit_of.append(int(lab[yy, xx]))
 
     covered = [c for c in hit_of if c > 0]
     hitting = set(covered)
-    # A cluster is a false positive when it covers no GT point at all.
     fp_clusters = n_clusters - len(hitting)
 
     area = float(region.sum())
     a_i = area / float(denom_px if denom_px else (h * w))
 
-    # Metric 6. Area of the clusters covering no GT point at all. FPPI counts
-    # how MANY places are wrongly proposed; this is how much of the prediction
-    # they consume, which is a different failure: one huge blind blob and ten
-    # specks give the same FPPI and very different blind area.
     sizes_all = np.bincount(lab.ravel(), minlength=n_lab).astype(float)
     blind = float(sum(sizes_all[c] for c in range(1, n_lab)
                       if c not in hitting))
@@ -168,8 +70,6 @@ def evaluate_one(region, points, shape, gt_radius, denom_px=None):
         "blind_frac": (blind / area) if area > 0 else float("nan"),
     }
 
-    # Metric 5. Denominator is the union of the GT discs in this image, so two
-    # clicks a few pixels apart do not inflate it.
     if covered:
         gt_area = float(gt_disc_mask((h, w), points, gt_radius).sum())
         q = [sizes_all[c] / gt_area for c in covered] if gt_area > 0 else []
@@ -182,11 +82,8 @@ def evaluate_one(region, points, shape, gt_radius, denom_px=None):
 
 
 def render(bgr, region, lab, hitting, points, gt_radius, rec):
-    """Crop with clusters coloured, GT discs outlined and each click marked."""
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
 
-    # Every cluster gets its own colour; the ones covering no GT point share a
-    # single warning colour, because their COUNT is the metric, not their hue.
     for c in range(1, int(lab.max()) + 1):
         sel = lab == c
         if not sel.any():
@@ -228,47 +125,24 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="train",
-                    choices=["train", "val", "test", "all", "known_interact"],
-                    help="all covers every session, which is what "
-                         "annotate_contact now samples over. Stage 2 "
-                         "fits nothing, so a held-out split protects "
-                         "against nothing here")
+                    choices=["train", "val", "test", "all", "known_interact"])
     ap.add_argument("--reading", default="dilated",
                     choices=["overlap", "gap", "surface", "dilated"])
     ap.add_argument("--dilate-px", type=int, default=22)
     ap.add_argument("--touch-px", type=int, default=10)
     ap.add_argument("--strip-px", type=int, default=6)
-    ap.add_argument("--gt-dilate-scale", type=float, default=0.5,
-                    help="GT disc radius as a multiple of --dilate-px")
-    ap.add_argument("--gt-dilate-px", type=int, default=None,
-                    help="GT disc radius in pixels; overrides --gt-dilate-scale")
-    ap.add_argument("--depth-tol", type=float, default=None,
-                    help="apply depth gates to the region before evaluating")
-    ap.add_argument("--depth-gate", default="pair",
-                    help="comma-separated: pair, body, step")
-    ap.add_argument("--min-cluster-px", type=int, default=0,
-                    help="drop clusters smaller than this before evaluating. 0 "
-                         "keeps every speck, which is the honest default: "
-                         "raising it improves FPPI by definition, so any value "
-                         "above 0 must be reported alongside the number")
-    ap.add_argument("--limit", type=int, default=0, help="0 = every annotated crop")
+    ap.add_argument("--gt-dilate-scale", type=float, default=0.5)
+    ap.add_argument("--gt-dilate-px", type=int, default=None)
+    ap.add_argument("--depth-tol", type=float, default=None)
+    ap.add_argument("--depth-gate", default="pair")
+    ap.add_argument("--min-cluster-px", type=int, default=0)
+    ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--source", default="sam3_text",
-                    choices=["sam3_text", "cache"],
-                    help="sam3_text (default) runs SAM 3 concept segmentation "
-                         "here and now; cache reads a prebuilt mask cache. This "
-                         "is what decides WHICH segmenter is measured, so it is "
-                         "echoed in the output")
-    ap.add_argument("--weights", default=None,
-                    help="Hugging Face id or a local snapshot DIRECTORY")
-    ap.add_argument("--text", default="cow",
-                    help="noun phrase for concept segmentation")
-    ap.add_argument("--conf", type=float, default=None,
-                    help="SAM 3 score floor; default is data.sam3_conf "
-                         "from config.yaml, which mirrors the value the "
-                         "detector stage used")
-    ap.add_argument("--mask-dir", default=None,
-                    help="cache to read when --source cache, overriding "
-                         "data.mask_dir")
+                    choices=["sam3_text", "cache"])
+    ap.add_argument("--weights", default=None)
+    ap.add_argument("--text", default="cow")
+    ap.add_argument("--conf", type=float, default=None)
+    ap.add_argument("--mask-dir", default=None)
     ap.add_argument("--gt", default=None)
     ap.add_argument("--no-images", action="store_true")
     args = ap.parse_args()
@@ -320,7 +194,7 @@ def main():
                 got = seg.assign_to_boxes(bgr, boxes)
                 masks = ([(np.asarray(g) > 0.5).astype(np.uint8) for g in got]
                          if got is not None else None)
-            except Exception as err:                   # noqa: BLE001
+            except Exception as err:
                 print(f"[eval] SAM 3 failed on {rel}: {err}")
                 masks = None
         if masks is None or len(masks) < 2 or masks[0].sum() == 0 \
@@ -383,12 +257,6 @@ def main():
     if not rows:
         raise SystemExit("nothing evaluated - run precompute_masks.py first")
 
-    # ---- aggregate ----------------------------------------------------------
-    # Every non-skip crop is in `rows` and every metric below is computed over
-    # all of them. Crops marked "no contact" are not a separate arm: they carry
-    # no GT points, so they contribute nothing to the point-weighted metrics by
-    # arithmetic rather than by exclusion, and their area and clusters count
-    # towards a-bar, FPPI and blind area like any other crop's.
     n_img = len(rows)
     n_none = sum(r["no_contact"] for r in rows)
 
@@ -407,8 +275,6 @@ def main():
     blind_frac = tot_blind / tot_area if tot_area else float("nan")
 
     q = [r["hit_quality"] for r in rows if np.isfinite(r["hit_quality"])]
-    # Weighted by covered points so the mean is over MEASUREMENTS, matching the
-    # per-point definition, rather than over images.
     wq = [(r["hit_quality"], r["n_covered"]) for r in rows
           if np.isfinite(r["hit_quality"])]
     hit_q = (sum(v * n for v, n in wq) / sum(n for _, n in wq)) if wq else float("nan")
@@ -416,9 +282,7 @@ def main():
     if no_mask:
         what = ("produced no usable pair of instances" if seg is not None
                 else "have no cached mask")
-        print(f"[eval] {no_mask} crops skipped: {what}. They are EXCLUDED from\n"
-              "       every number below, so a large count makes the rest\n"
-              "       optimistic - it is a success rate, not a neutral filter.")
+        print(f"[eval] {no_mask} crops skipped: {what}")
     if no_depth:
         print(f"[eval] {no_depth} crops evaluated ungated - no cached depth map")
 
@@ -438,24 +302,8 @@ def main():
     print(f"  6  Blind area    {blind_frac:>9.3f}   {tot_blind}/{tot_area} px in "
           "clusters covering no GT")
 
-    if np.isfinite(blind_frac):
-        print(f"\n  Blind area {blind_frac:.1%} of everything predicted sits in "
-              "clusters that")
-        print("  cover no GT point. Read it with FPPI: the same FPPI with a low "
-              "blind")
-        print("  area means the wrong proposals are small, with a high one means "
-              "they are")
-        print("  eating the budget that a-bar charges for.")
-
-    if np.isfinite(hit_q):
-        print(f"\n  Hit quality {hit_q:.2f} means the cluster that found a contact "
-              f"is on average")
-        print(f"  {hit_q:.1f}x the area of the ground truth in that image. 1.0 would "
-              "be exact;")
-        print("  a large value is a hit that carries little localisation.")
     if args.min_cluster_px > 0:
-        print(f"\n  NOTE: clusters under {args.min_cluster_px}px were discarded, "
-              "which improves FPPI by construction. Report that alongside it.")
+        print(f"\n  min_cluster_px = {args.min_cluster_px}")
 
     per = os.path.join(out_dir, "evaluation.csv")
     keys = ["rel_image", "no_contact", "n_points", "n_covered", "sensitivity",
@@ -485,9 +333,6 @@ def main():
     print(f"\n[eval] per-image numbers -> {per}")
     if not args.no_images:
         print(f"[eval] images -> {out_dir} (worst sensitivity first)")
-        print("[eval] each cluster has its own colour; RED clusters cover no GT")
-        print("[eval] point. Yellow circles are the GT discs metric 5 divides by.")
-        print("[eval] green dot = covered click, red dot = uncovered.")
 
 
 if __name__ == "__main__":

@@ -1,25 +1,3 @@
-"""Draw the scored band together with the clicked ground truth.
-
-Usage (from the repository root):
-
-    python -m contactTest.visualize_score --split train --dilate-px 22
-    python -m contactTest.visualize_score --split train --dilate-px 22 --reading gap
-
-Writes to contactTest/log/score_vis/<split>/ only.
-
-The numbers from score_contact say 77% of clicks land inside the band at
-dilate_px 22; this shows which 77%. Files are named by hit rate, so the crops
-the band gets wrong sort to the top and can be looked at rather than guessed at.
-
-The region is drawn FILLED, not only outlined. Outlining with RETR_EXTERNAL
-does not draw holes — a pixel inside a hole
-looks enclosed but scores as a miss. Here what is shaded is exactly the array the
-scorer indexes, so a point that reads as a miss can be seen to be one.
-
-Every miss is drawn with a line to its nearest band pixel: that segment is the
-"miss dist" column, and it separates a click a few pixels outside the edge from
-one on the wrong animal entirely.
-"""
 
 import argparse
 import os
@@ -37,21 +15,14 @@ from contactTest.src.utils import load_config
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
-C_HIT = (90, 220, 110)      # RGB
+C_HIT = (90, 220, 110)
 C_MISS = (235, 90, 80)
 C_BAND = (120, 235, 130)
-C_CUT = (150, 120, 190)     # band pixels the depth gate removed
+C_CUT = (150, 120, 190)
 C_I, C_J = (214, 120, 42), (52, 104, 235)
 
 
 def render(bgr, boxes, region, points, mi, mj, cut=None):
-    """Crop, the two masks, the scored region, and each click marked hit or miss.
-
-    `cut` is the part of the ungated band that the depth gate discarded. It is
-    shaded separately so that what depth removed can be judged by eye: a gate
-    that is working takes away floor and occluded torso, and a gate that is not
-    takes away the place the animals actually meet.
-    """
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
 
     for m, c in ((mi, C_I), (mj, C_J)):
@@ -76,8 +47,6 @@ def render(bgr, boxes, region, points, mi, mj, cut=None):
         inside = bool(region[y, x])
         hits += inside
         if not inside and dt is not None:
-            # Straight to the nearest band pixel, found by walking the distance
-            # transform's gradient - the drawn segment is the scored distance.
             near, best = None, 1e9
             ys, xs = np.nonzero(region)
             if len(xs):
@@ -105,23 +74,15 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="train",
-                    choices=["train", "val", "test", "all", "known_interact"],
-                    help="all covers every session, which is what "
-                         "annotate_contact now samples over. Stage 2 "
-                         "fits nothing, so a held-out split protects "
-                         "against nothing here")
+                    choices=["train", "val", "test", "all", "known_interact"])
     ap.add_argument("--reading", default="dilated",
                     choices=["overlap", "gap", "surface", "dilated"])
     ap.add_argument("--dilate-px", type=int, default=22)
     ap.add_argument("--touch-px", type=int, default=10)
     ap.add_argument("--strip-px", type=int, default=6)
     ap.add_argument("--limit", type=int, default=60)
-    ap.add_argument("--depth-tol", type=float, default=None,
-                    help="apply the depth gates at this tolerance and shade what "
-                         "they removed. Needs precompute_depth.py")
-    ap.add_argument("--depth-gate", default="body",
-                    help="comma-separated gates to apply: body (floor and feet), "
-                         "step (occlusion edges), pair (animals at different range)")
+    ap.add_argument("--depth-tol", type=float, default=None)
+    ap.add_argument("--depth-gate", default="body")
     ap.add_argument("--gt", default=None)
     args = ap.parse_args()
 
@@ -203,7 +164,6 @@ def main():
     if not made:
         raise SystemExit("nothing rendered - run precompute_masks.py first")
 
-    # Worst first: the point of looking is to see what is being got wrong.
     made.sort(key=lambda t: t[0])
     for i, (rate, img, name) in enumerate(made[:args.limit]):
         tag = "none" if rate < 0 else f"{int(round(rate * 100)):03d}"
@@ -222,13 +182,6 @@ def main():
         print(f"[vis] control: the region is non-empty in {none_fired}/{none_total} "
               "crops marked 'no contact'")
     print(f"[vis] wrote {min(len(made), args.limit)} images to {out_dir}")
-    print("[vis] green dot = click inside, red dot = outside with a line to the")
-    print("      nearest band pixel. Files sort worst-first; 'none_*' are the")
-    print("      control crops, which carry no clicks.")
-    if args.depth_tol is not None:
-        print("[vis] purple = band pixels the depth gate removed. Look at whether")
-        print("      those are floor and occluded torso, or the place the two")
-        print("      animals actually meet.")
 
 
 if __name__ == "__main__":

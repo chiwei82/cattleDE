@@ -1,40 +1,3 @@
-"""Derive candidate contact pixels from two SAM instance masks, four ways.
-
-Usage (from the repository root):
-
-    python -m contactTest.sam_contact_region --limit 16
-    python -m contactTest.sam_contact_region --split val --limit 40 --no-images
-    python -m contactTest.sam_contact_region --limit 16 --touch-px 12
-
-Writes to contactTest/log/sam_contact/<split>/ only.
-
-The masks are the useful part of SAM here; its per-pixel confidence turned out
-not to be (fragmented uncertainty maps, and a crop-mode "mutual claim" that
-collapses once the prompts are correct). What remains is a geometry question:
-given two good instance masks, which pixels are candidates for contact? The
-answer is not unique, so all four readings are computed and drawn side by side.
-
-    overlap   mask_i AND mask_j
-              Where the projections literally coincide. Unambiguous but sparse,
-              and in an overhead view it means occlusion as often as contact.
-
-    gap       dist_to_i + dist_to_j <= touch_px
-              The strip between the two surfaces, thresholded on the true local
-              separation rather than on an arbitrary dilation radius. Includes
-              the floor visible in the gap when the animals are close but apart.
-
-    surface   the boundary pixels of each mask that lie within touch_px of the
-              other animal, dilated into a strip.
-              Contact happens ON a body surface, so this keeps skin rather than
-              the air between. Closest to "which part of the animal is touching".
-
-    dilated   dilate(mask_i, r) AND dilate(mask_j, r)
-              The current default, kept for comparison. r has no physical
-              meaning, which is exactly why the others are worth measuring.
-
-`surface` is the one to look at first if the goal is per-pixel contact on the
-animals; `gap` if the goal is the interface region between them.
-"""
 
 import argparse
 import csv
@@ -51,12 +14,11 @@ from contactTest.src.data import load_records, relative_boxes, split_records
 from contactTest.src.utils import load_config
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
-C_I, C_J = (214, 120, 42), (52, 104, 235)          # RGB, cow i / cow j
+C_I, C_J = (214, 120, 42), (52, 104, 235)
 C_HIT = (60, 235, 90)
 
 
 def load_masks(record, shape):
-    """Cached SAM masks for a pair, or None."""
     if not record.get("mask_path"):
         return None
     data = np.load(record["mask_path"])
@@ -68,14 +30,6 @@ def load_masks(record, shape):
 
 
 def load_depth(record, shape):
-    """Cached Depth Anything V2 map for a pair as (depth, range), or None.
-
-    `range` is the robust 2nd-to-98th percentile spread of the map, which is what
-    a depth tolerance is quoted as a fraction of. The relative checkpoints
-    predict inverse depth up to an unknown scale and shift, so no absolute
-    meaning survives; a fraction of the spread WITHIN one crop does, and that is
-    the only comparison made.
-    """
     if not record.get("depth_path"):
         return None
     data = np.load(record["depth_path"])
@@ -88,34 +42,10 @@ def load_depth(record, shape):
 
 
 def farness(depth, inverse):
-    """Depth rewritten so that a larger number always means further away.
-
-    The relative checkpoints predict inverse depth (larger = nearer) and the
-    metric ones predict metres (larger = further). Every comparison below is
-    about which of two things is further from the lens, so the direction is
-    normalised once here instead of being re-derived, and got wrong, at each use.
-    """
     return -depth if inverse else depth
 
 
 def body_reference(depth, boxes, inverse, disc_frac=0.10):
-    """The animals' own depth, read where the image is known to be animal.
-
-    The detector put a box round each cow, so the centre of that box is on the
-    animal. That single fact is the anchor, and it is deliberately the ONLY
-    thing assumed about which pixels are cattle.
-
-    It replaces an earlier rule that took the nearest mode of the depth
-    histogram to be the cattle. That is not true of this camera: the ceiling
-    mount is angled, so railings, feed barriers and pipework routinely sit
-    NEARER the lens than a cow's back, and the near mode is then hardware, not
-    an animal. The far end carries no such ambiguity, which is why the floor is
-    identified from that end and the cattle from the box centre.
-
-    A small disc is used rather than the single centre pixel so that one noisy
-    prediction cannot set the reference. Returns one depth per box, plus the
-    disc radius used.
-    """
     h, w = depth.shape
     refs = []
     for b in boxes:
@@ -133,30 +63,10 @@ def body_reference(depth, boxes, inverse, disc_frac=0.10):
 
 
 def ground_split(depth, inverse, boxes, spread, margin=0.05):
-    """Separate the cattle from the ground, anchored on what is actually known.
-
-    The floor is everything lying further from the lens than the animals by more
-    than `margin` of the crop's depth spread. Both ends are pinned by something
-    reliable: the animals' depth comes from the box centres, and "further than
-    that" is the direction in which an angled ceiling camera can only be looking
-    at ground.
-
-    Nothing is claimed about what sits NEARER than the cattle. Railings and feed
-    barriers live there, and they are not floor, so they are not put in the far
-    class — but they are not contact either, which the two-sided `body` reading
-    handles without needing to identify them.
-
-    Returns (floor, refs, separation, floor_share), or None when the box centres
-    give no usable reading. `floor_share` near zero means no ground is visible
-    in this crop, so the separation is not a body-to-floor distance and should
-    not be read as one.
-    """
     refs = body_reference(depth, boxes, inverse)
     if refs is None:
         return None
     f = farness(depth, inverse)
-    # Furthest of the two animals: a pixel only counts as ground when it is
-    # beyond BOTH, otherwise the further cow's own back is called floor.
     ref_far = max(farness(np.float32(r), inverse) for r in refs)
     floor = f > (ref_far + margin * spread)
     if not floor.any():
@@ -166,12 +76,6 @@ def ground_split(depth, inverse, boxes, spread, margin=0.05):
 
 
 def nearest_value(mask, value):
-    """For every pixel, `value` sampled at the nearest pixel inside `mask`.
-
-    The distance transform's DIST_LABEL_PIXEL labels are turned into a lookup by
-    reading each label at the mask pixel that owns it, which is exact and does
-    not rely on the order in which OpenCV enumerates them.
-    """
     if not mask.any():
         return None
     _, lab = cv2.distanceTransformWithLabels(
@@ -187,55 +91,6 @@ DEPTH_STATS = ["body", "step", "pair"]
 
 
 def depth_stats(mi, mj, depth, spread, inverse=True, boxes=None):
-    """Three per-pixel depth readings, each in units of the crop's depth spread.
-
-    Depth Anything V2 performs no amodal completion: it emits the range of the
-    VISIBLE surface at each pixel and has no notion that anything is hidden. All
-    three readings below are therefore plain lookups into that one map — nothing
-    here tries to recover an occluded surface, because nothing can.
-
-    body  distance from the NEARER of the two animals' own depths
-          How far this pixel sits from cattle depth, where that depth is read at
-          the box centres — the one place the detector guarantees is animal.
-          This removes the pen surface: the band's habit of running along the
-          ground between two animals, and of catching feet where they meet it.
-
-          Two-sided on purpose. Rejecting only what lies FURTHER than the cattle
-          would keep the railings and feed barriers that an angled ceiling
-          camera sees nearer than a cow's back, and those are not contact
-          either. Taking the smaller distance to either animal, rather than to
-          one pooled depth, keeps it right when one cow stands nearer than the
-          other.
-
-          Anchored neither on the masks (which would inherit their errors) nor
-          on the near mode of the histogram (which on this camera is as likely
-          to be hardware as an animal). Needs `boxes`; without them there is no
-          trustworthy anchor and the reading is not formed at all.
-
-          It cannot distinguish a genuinely low contact from the floor, because
-          there is nothing in a depth map that would: a head lowered to another
-          animal's leg is at floor depth by definition. Watch selectivity.
-
-    step  |grad depth|, per pixel
-          Contact is where two surfaces MEET, so depth runs continuously across
-          the junction. Occlusion is where one surface passes in front of
-          another, which puts a step in the depth map at the silhouette edge.
-          The size of that step is the signal, and it is available precisely
-          because the model does not try to smooth occlusion away.
-
-    pair  |depth of the nearest exclusive pixel of i - the same for j|
-          Whether the two animals are at the same range at all. Unlike `step`
-          this fires over the whole interior of an occluding overlap rather than
-          only at its edge, which is the one thing the other two readings miss.
-          Each side is read from the part of that animal the other mask does not
-          cover: inside the intersection both masks contain the pixel, so
-          sampling either one there returns the same single value and the
-          difference would be identically zero — an occluding pair would score
-          as perfectly agreeing.
-
-    Returns None for a reading that cannot be formed, rather than a zero map that
-    would silently pass everything.
-    """
     out = {}
 
     refs = body_reference(depth, boxes, inverse) if boxes is not None else None
@@ -244,7 +99,6 @@ def depth_stats(mi, mj, depth, spread, inverse=True, boxes=None):
 
     gx = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
-    # Sobel's 3x3 kernel carries a factor of 8 relative to a per-pixel slope.
     out["step"] = np.sqrt(gx * gx + gy * gy) / (8.0 * spread)
 
     out["pair"] = depth_disagreement(mi, mj, depth, spread)
@@ -252,29 +106,6 @@ def depth_stats(mi, mj, depth, spread, inverse=True, boxes=None):
 
 
 def depth_disagreement(mi, mj, depth, spread):
-    """Per pixel: how far apart the two animals' surfaces are in depth, in units
-    of the crop's depth spread.
-
-    At a given pixel there is only one depth value, so comparing "the depth
-    there" against itself says nothing. The quantity that distinguishes contact
-    from occlusion is whether the two SURFACES are at the same range where their
-    silhouettes meet, so each animal's own depth is carried in from its nearest
-    mask pixel and the two are differenced. Touching animals agree; one passing
-    behind the other does not, however much their projections overlap.
-
-    Each depth is read from the part of that animal the OTHER mask does not
-    cover. This matters, and getting it wrong makes the gate useless precisely
-    where it is needed: inside the intersection both masks contain the pixel, so
-    sampling either mask there returns the same single value and the difference
-    is identically zero — an occluding pair would be scored as perfectly
-    agreeing. A depth map only ever holds the range of the FRONT surface, so the
-    occluded animal's depth is not observable inside the intersection at all and
-    has to be carried in from where that animal is actually visible.
-
-    Returns None when either animal has no exclusive region, i.e. one silhouette
-    lies entirely inside the other. There is then no independent reading of the
-    hidden animal and the honest answer is that depth cannot judge this pair.
-    """
     mi_only = (mi > 0) & ~(mj > 0)
     mj_only = (mj > 0) & ~(mi > 0)
     di = nearest_value(mi_only.astype(np.uint8), depth)
@@ -285,29 +116,15 @@ def depth_disagreement(mi, mj, depth, spread):
 
 
 def distance_to(mask):
-    """Distance from every pixel to the nearest pixel inside `mask`."""
     return cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 3)
 
 
 def boundary(mask):
-    """One-pixel outline of a binary mask."""
     er = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1)
     return (mask.astype(bool) & ~er.astype(bool)).astype(np.uint8)
 
 
 def dilated_band(mi, mj, dilate_px):
-    """dilate(mi, r) AND dilate(mj, r) — the ROI, on its own.
-
-    Callers that only want this reading should use it instead of
-    contact_readings(...)["dilated"]: the four readings are computed in one pass,
-    so asking for all of them costs two distance transforms and a boundary pass
-    that are then thrown away, and it forces the caller to supply touch_px and
-    strip_px, which have no bearing whatsoever on this band. That is how a file
-    drawing only the green outline came to carry two parameters it never used.
-
-    contact_readings calls this, so there is one definition of the band and the
-    figures cannot drift from the numbers.
-    """
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1,) * 2)
     return (cv2.dilate(mi, k) > 0) & (cv2.dilate(mj, k) > 0)
 
@@ -315,19 +132,10 @@ def dilated_band(mi, mj, dilate_px):
 def contact_readings(mi, mj, touch_px, dilate_px, strip_px,
                      depth=None, spread=None, gates=None, inverse=True,
                      boxes=None):
-    """Four candidate definitions of the contact region.
-
-    `gates` is {stat name: tolerance}; a pixel survives only where every named
-    reading of depth_stats is at or below its tolerance. Gating can only ever
-    REMOVE pixels, so it is worth keeping only if it removes area faster than it
-    removes true contact points — which is what score_contact measures, and is
-    not something to assume.
-    """
     di, dj = distance_to(mi), distance_to(mj)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1,) * 2)
     ks = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * strip_px + 1,) * 2)
 
-    # Surface pixels of one animal that are within touch_px of the other.
     touch_i = (boundary(mi) > 0) & (dj <= touch_px)
     touch_j = (boundary(mj) > 0) & (di <= touch_px)
     surface = cv2.dilate((touch_i | touch_j).astype(np.uint8), ks) > 0
@@ -393,14 +201,10 @@ def main():
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="train", choices=["train", "val", "test"])
     ap.add_argument("--limit", type=int, default=16)
-    ap.add_argument("--balance", action="store_true",
-                    help="half interaction / half not, for viewing only")
-    ap.add_argument("--touch-px", type=int, default=10,
-                    help="separation at or below which two surfaces count as touching")
-    ap.add_argument("--dilate-px", type=int, default=15,
-                    help="radius for the 'dilated' reading, for comparison only")
-    ap.add_argument("--strip-px", type=int, default=6,
-                    help="half-width of the 'surface' strip")
+    ap.add_argument("--balance", action="store_true")
+    ap.add_argument("--touch-px", type=int, default=10)
+    ap.add_argument("--dilate-px", type=int, default=15)
+    ap.add_argument("--strip-px", type=int, default=6)
     ap.add_argument("--no-images", action="store_true")
     args = ap.parse_args()
 
@@ -463,7 +267,6 @@ def main():
 
     print(f"\n[contact] {len(report)} pairs, touch_px={args.touch_px}\n")
     print("panels: masks | " + " | ".join(order))
-    print("green = the contact candidates that reading selects\n")
     print(f"{'reading':<10}{'nonempty':>10}{'area':>11}{'of crop':>9}"
           f"{'blobs':>7}{'on animal':>11}")
     summary = {}
@@ -478,9 +281,6 @@ def main():
                          "on_animal_median": float(onan)}
         print(f"{name:<10}{ne:>9.0%}{px:>9.0f}px{frac:>9.1%}{comp:>7.1f}{onan:>10.0%}")
 
-    print("\n'on animal' = the share of the region that lies on either mask.")
-    print("Contact happens on a body surface, so the higher this is, the more of")
-    print("what was selected is skin rather than the air between the animals.")
 
     with open(os.path.join(out_dir, "contact_report.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(report[0].keys()))

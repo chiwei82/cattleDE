@@ -1,20 +1,3 @@
-"""
-Action metric-learning training — image only (no pose), config-driven.
-
-Follows reproduction/CattleAct/metric/action_with_image.py: a timm ViT-B/16 is
-fine-tuned as an EMBEDDING encoder with a triplet loss (batch-all mining) plus a
-zero-mean latent regularization that keeps the embedding distribution centered
-and compact. This yields a discriminative action latent space; the interaction
-model reuses this checkpoint's ViT backbone.
-
-Evaluation is k-NN (1-NN) in the embedding space (knn accuracy + macro-F1).
-Reads data/annotated/annotated_action.csv; the 6:2:2 split is taken from the
-train/val/test folder in each image path.
-
-Run from the repo root:
-  python -m train.action_with_image
-"""
-
 import argparse
 import os
 import re

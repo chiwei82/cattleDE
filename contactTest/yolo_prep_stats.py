@@ -1,49 +1,3 @@
-"""Count what yolo_prep's source actually contains: sessions, footage, boxes.
-
-Usage (from the repository root):
-
-    python -m contactTest.yolo_prep_stats
-    python -m contactTest.yolo_prep_stats --exact          # decode to count frames
-    python -m contactTest.yolo_prep_stats --csv log/yolo_prep_stats.csv
-
-Reads only. Nothing under the camera tree is written or modified.
-
-WHAT IT WALKS
-
-yolo_prep.discover_sessions expects
-
-    <data_root>/<camera>/<session>/tracklets.json
-    <data_root>/<camera>/<session>.mp4
-
-and skips any session missing either file. This reproduces that walk exactly,
-and reports the skips instead of passing over them silently, because a session
-dropped for a missing video is still footage that exists.
-
-WHAT "SOURCE BOX" MEANS HERE
-
-Every entry in tracklets.json under a track id, excluding the "stats" key. Those
-boxes are NOT human annotation: per the project's own account the tracklets were
-produced by SAM 3, so this counts machine output that the YOLO detector was then
-trained on. Two numbers are reported because they differ:
-
-    boxes           every box in the file
-    boxes sampled   boxes on frames where frame_number % frame_step == 0
-
-Only the second reached the dataset. frame_step is 16 in global_config.yaml, so
-most of the file is never used.
-
-The defaults for data_root, cameras and frame_step are copied from
-global_config.yaml rather than read from it, because contactTest does not read
-that file. Override them with the flags if they drift.
-
-VIDEO LENGTH
-
-Taken from the container metadata (CAP_PROP_FRAME_COUNT / CAP_PROP_FPS), which
-is instant but can be wrong on a stream with a broken index. --exact decodes
-every video and counts frames, which is correct and slow. The two are printed
-side by side under --exact so the size of the discrepancy is visible rather than
-assumed.
-"""
 
 import argparse
 import csv
@@ -55,7 +9,6 @@ import cv2
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
-# From global_config.yaml: paths.data_root and yolo_prep.camera_dirs/frame_step.
 DEFAULT_ROOT = "/user/work/sf24225/data/Full_behav/Marco"
 DEFAULT_CAMERAS = ["camera128", "camera133", "camera26", "camera27", "camera48"]
 DEFAULT_FRAME_STEP = 16
@@ -67,7 +20,6 @@ def hms(seconds):
 
 
 def count_frames(path):
-    """Frames counted by decoding. Correct, and slow."""
     cap = cv2.VideoCapture(path)
     n = 0
     while True:
@@ -96,7 +48,6 @@ def video_info(path, exact):
 
 
 def tracklet_stats(path, frame_step):
-    """Boxes in one tracklets.json, in total and on sampled frames."""
     with open(path) as f:
         data = json.load(f)
     tracks = boxes = sampled = 0
@@ -122,14 +73,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-root", default=DEFAULT_ROOT)
-    ap.add_argument("--cameras", default=",".join(DEFAULT_CAMERAS),
-                    help="comma-separated, in global_config order")
+    ap.add_argument("--cameras", default=",".join(DEFAULT_CAMERAS))
     ap.add_argument("--frame-step", type=int, default=DEFAULT_FRAME_STEP)
-    ap.add_argument("--exact", action="store_true",
-                    help="decode every video to count frames instead of "
-                         "trusting the container metadata")
-    ap.add_argument("--csv", default="log/yolo_prep_stats.csv",
-                    help="per-session output, relative to contactTest/")
+    ap.add_argument("--exact", action="store_true")
+    ap.add_argument("--csv", default="log/yolo_prep_stats.csv")
     args = ap.parse_args()
 
     cameras = [c.strip() for c in args.cameras.split(",") if c.strip()]
@@ -137,8 +84,6 @@ def main():
         raise SystemExit(f"no such data_root: {args.data_root}")
     print(f"[stats] {args.data_root}")
     print(f"[stats] cameras: {', '.join(cameras)}   frame_step={args.frame_step}")
-    if not args.exact:
-        print("[stats] video length from container metadata; --exact decodes")
 
     rows, skipped = [], []
     for cam in cameras:
@@ -205,8 +150,6 @@ def main():
     print(f"[stats] {af} frames carry at least one box, out of "
           f"{sum(x['frames'] for x in rows)} frames of footage "
           f"({af / max(sum(x['frames'] for x in rows), 1):.1%})")
-    print("[stats] these boxes are SAM 3 output, not human annotation — the "
-          "detector trained on them inherits whatever they got wrong")
 
     if args.exact:
         bad = [r for r in rows if r["frames"] != r["meta_frames"]]

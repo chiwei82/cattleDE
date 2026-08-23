@@ -1,34 +1,3 @@
-"""Draw the YOLO detector's boxes on one frame, for a figure.
-
-Usage (from the repository root):
-
-    python -m contactTest.yolo_example
-    python -m contactTest.yolo_example --video 20250802T082154_20250802T084303 \
-        --frame 8125 --out simu/yoloexample.jpg
-
-Writes one image. Nothing is measured and nothing else is touched.
-
-WHY THE FRAME IS DECODED, NOT SEEKED
-
-`frame_number` in the dataset is the count of successful cap.read() calls that
-interaction_prep made, so it addresses a position in the DECODE ORDER, not a
-timestamp. cap.set(CAP_PROP_POS_FRAMES) addresses the decoder instead, and on
-this HEVC footage it returns frames rebuilt from reference frames it never
-decoded — cap.read() still reports success, so the wrong frame arrives silently.
-Reading straight through and counting is the only way to land on the same frame
-the crops were cut from. It costs a few minutes at frame 8125.
-
-SETTINGS
-
-conf and imgsz default to what interaction_prep used (global_config.yaml,
-interaction_prep.yolo_conf 0.6 / yolo_imgsz 1280) so the boxes drawn here are
-the boxes that produced the dataset. They are repeated as defaults rather than
-read from that file, because contactTest never reads global_config.yaml.
-
-The checkpoint is an OBB model. `_extract_boxes` is copied verbatim from
-interaction_prep, so what is drawn is the axis-aligned rectangle the pairing
-stage actually consumed, not the rotated quad.
-"""
 
 import argparse
 import os
@@ -46,7 +15,6 @@ VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv")
 
 
 def _extract_boxes(results):
-    """Verbatim from prep/interaction_prep.py — see the module docstring."""
     boxes = []
     if results.boxes is not None and len(results.boxes):
         for box in results.boxes:
@@ -74,7 +42,6 @@ def find_video(root, stem):
 
 
 def read_frame(path, wanted):
-    """The `wanted`-th successfully decoded frame, counted from 0."""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise SystemExit(f"cannot open {path}")
@@ -117,16 +84,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
-    ap.add_argument("--video", default="20250802T082154_20250802T084303",
-                    help="source video STEM, without the extension")
+    ap.add_argument("--video", default="20250802T082154_20250802T084303")
     ap.add_argument("--frame", type=int, default=8125)
-    ap.add_argument("--video-dir", default=None,
-                    help="default: data.video_dir from config.yaml")
+    ap.add_argument("--video-dir", default=None)
     ap.add_argument("--weights", default="checkpoints/yolo_pseudo.pt")
-    ap.add_argument("--conf", type=float, default=0.6,
-                    help="interaction_prep.yolo_conf")
-    ap.add_argument("--imgsz", type=int, default=1280,
-                    help="interaction_prep.yolo_imgsz")
+    ap.add_argument("--conf", type=float, default=0.6)
+    ap.add_argument("--imgsz", type=int, default=1280)
     ap.add_argument("--out", default="simu/yoloexample.jpg")
     args = ap.parse_args()
 

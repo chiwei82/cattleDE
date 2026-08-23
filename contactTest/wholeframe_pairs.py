@@ -1,62 +1,3 @@
-"""SAM 3 on the whole frame: instances, then pairs by BOX IoU, then the figure.
-
-Usage (from the repository root):
-
-    python -m contactTest.wholeframe_pairs --split train --limit 12
-    python -m contactTest.wholeframe_pairs --split train --text cow --conf 0.25
-    python -m contactTest.wholeframe_pairs --split train --crop-to-pair
-
-Writes to contactTest/log/wholeframe_pairs/<split>/ only.
-
-WHAT IT DOES
-
-    frame  ──►  SAM 3, text prompt  ──►  masks + boxes + scores
-                                              │
-                    every unordered pair of instances
-                                              │
-                    iou_low < box_iou(box_i, box_j) < iou_high
-                                              │
-                    dilate(mask_i, r) AND dilate(mask_j, r)
-                                              │
-                    the three-panel figure from visualize_sam3_confusion
-
-The frame is uncropped: no detector, no candidate region, nothing chosen in
-advance. SAM 3 finds the animals, and the SAME overlap rule the detector stage
-used decides which of them are a pair.
-
-PAIRING IS ON BOXES, AND ONLY ON BOXES
-
-`box_iou(boxes[i], boxes[j])` where `boxes` is SAM 3's own `pred_boxes`. Not the
-extent of the masks. The rule being reproduced is the one interaction_prep
-applied to YOLO's `box.xyxy`, so the substitute detector has to supply the same
-kind of quantity; a box measured off a mask is something neither pipeline
-produced, and pairing on it would make this a comparison between YOLO and a
-post-processing step rather than between two detectors.
-
-The masks are used for the region and for nothing else. That split — boxes
-decide WHICH pair, masks decide WHERE the contact is — is the whole reason
-Sam3.detect returns both, index-aligned.
-
-WHAT THE FIGURE SHOWS
-
-Per pair, the three panels of visualize_sam3_confusion, built by the same
-function so the two are readable against each other:
-
-    1  the frame with the two instances' boxes
-    2  the two instance masks
-    3  the uncertainty product, with the contact band outlined in green
-
-`--crop-to-pair` renders each pair cut to its own merged box instead of the full
-1920x1080, because at frame scale a pair is a few percent of the picture and
-nothing about it can be judged. The measurement is identical either way; only
-the framing of the image changes.
-
-THIS DRAWS, IT DOES NOT SCORE
-
-No ground truth is read and no metric is computed. Scoring lives in
-evaluate_wholeframe.py, which applies the annotation and the six metrics. This
-is for looking at what the pairing rule actually selects.
-"""
 
 import argparse
 import collections
@@ -103,32 +44,18 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="train",
-                    choices=["train", "val", "test", "all", "known_interact"],
-                    help="which ground-truth set to read. 'all' and "
-                         "'known_interact' are the sets annotate_contact "
-                         "now builds; they are not CSV splits, so the row "
-                         "index spans everything and the GT decides "
-                         "membership")
-    ap.add_argument("--video-root", default=None,
-                    help="default: data.video_dir from config.yaml")
-    ap.add_argument("--weights", default=None,
-                    help="Hugging Face id or a local snapshot DIRECTORY")
+                    choices=["train", "val", "test", "all", "known_interact"])
+    ap.add_argument("--video-root", default=None)
+    ap.add_argument("--weights", default=None)
     ap.add_argument("--text", default="cow")
-    ap.add_argument("--conf", type=float, default=None,
-                    help="SAM 3 score floor; default is data.sam3_conf "
-                         "from config.yaml, which mirrors the value the "
-                         "detector stage used")
-    ap.add_argument("--iou-low", type=float, default=None,
-                    help="default: data.pair_iou_low, mirroring what prep used")
+    ap.add_argument("--conf", type=float, default=None)
+    ap.add_argument("--iou-low", type=float, default=None)
     ap.add_argument("--iou-high", type=float, default=None)
     ap.add_argument("--dilate-px", type=int, default=22)
-    ap.add_argument("--frames", type=int, default=6, help="frames to process")
-    ap.add_argument("--limit", type=int, default=24, help="pairs to draw")
-    ap.add_argument("--crop-to-pair", action="store_true",
-                    help="render each pair cut to its own merged box. At frame "
-                         "scale a pair is a few percent of the picture")
-    ap.add_argument("--pad", type=int, default=60,
-                    help="context round the pair when --crop-to-pair")
+    ap.add_argument("--frames", type=int, default=6)
+    ap.add_argument("--limit", type=int, default=24)
+    ap.add_argument("--crop-to-pair", action="store_true")
+    ap.add_argument("--pad", type=int, default=60)
     ap.add_argument("--no-images", action="store_true")
     args = ap.parse_args()
 
@@ -153,7 +80,6 @@ def main():
     if not src.index:
         raise SystemExit(f"no videos under {args.video_root}")
 
-    # Resolve the videos before loading a 3.45 GB checkpoint.
     missing = {os.path.splitext(v)[0] for v in by_video} - set(src.index)
     if missing == {os.path.splitext(v)[0] for v in by_video}:
         raise SystemExit(f"none of the videos were found under {args.video_root}")
@@ -172,8 +98,6 @@ def main():
             n_frames += 1
             H, W = frame.shape[:2]
 
-            # Continuous masks: panel 3 is an uncertainty product and needs the
-            # per-pixel score, not a threshold of it.
             masks, boxes, scores = seg.detect(frame, binary=False)
             usable = [k for k, b in enumerate(boxes) if b is not None]
             if len(usable) < 2:
@@ -185,7 +109,6 @@ def main():
             scores = [scores[k] for k in usable]
             hard = [(m > 0.5).astype(np.uint8) for m in masks]
 
-            # THE pairing step. Boxes only.
             pairs = [(i, j) for i in range(len(boxes))
                      for j in range(i + 1, len(boxes))
                      if args.iou_low < box_iou(boxes[i], boxes[j]) < args.iou_high]
@@ -243,10 +166,6 @@ def main():
     band = np.array([r["band_px"] for r in rows], float)
     print(f"[wfp] band size: median {np.median(band):.0f} px, "
           f"empty on {np.mean(band == 0):.0%} of pairs")
-    if np.mean(band == 0) > 0.1:
-        print("[wfp] a pair whose band is empty passed the box rule while its "
-              "MASKS are further apart than 2x the dilation radius — the boxes "
-              "overlap but the animals do not")
 
     path = os.path.join(out_dir, "pairs.csv")
     with open(path, "w", newline="") as f:
@@ -256,8 +175,6 @@ def main():
     print(f"[wfp] wrote {path}")
     if not args.no_images:
         print(f"[wfp] figures -> {out_dir}")
-        print("[wfp] panels: frame + the two boxes | the two masks | "
-              "uncertainty + band")
 
 
 if __name__ == "__main__":

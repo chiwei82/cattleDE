@@ -1,63 +1,3 @@
-"""Recall against area for every candidate ROI, as curves rather than one point.
-
-Usage (from the repository root):
-
-    python -m contactTest.roi_sweep --split known_interact
-    python -m contactTest.roi_sweep --split all --source cache
-    python -m contactTest.roi_sweep --split all --baselines-only    # no GPU
-
-Writes contactTest/log/roi_sweep/<split>/ : one CSV of every (family, parameter)
-point and one PNG of the curves.
-
-WHY A CURVE
-
-This is a PROPOSAL task, not a prediction task. The question is whether a region
-can be proposed that carries the contact in less area than simply taking the
-detector's boxes. Point coverage and area are then two ends of one trade-off, not two
-independent scores, and a single operating point cannot express a trade-off —
-`dilate_px = 22` picks one point on a curve nobody has drawn.
-
-Drawing it also settles what r = 22 is worth. If the SAM 3 curve lies above the
-rectangle curves along its whole length, the conclusion does not depend on that
-constant; if the curves cross, the constant is doing the work and has to be
-justified.
-
-THE FAMILIES, AND WHAT EACH ONE WOULD PROVE
-
-    merged box        the whole crop. What the pipeline hands downstream today,
-                      so it is the incumbent: coverage 1.0 at area 1.0 by
-                      definition, and every other row is measured against it.
-
-    box intersection  where the two detector boxes overlap, scaled about its
-                      centre. Uses NO model: if this matches SAM 3 at equal
-                      area, the segmentation is buying nothing.
-
-    inscribed ellipse the same rectangle's inscribed ellipse. A rectangle has
-                      corners the contact interface never reaches, so this
-                      separates "a better SHAPE" from "a better place".
-
-    midpoint disc     a disc on the line between the two box centres. The
-                      crudest possible localisation.
-
-    SAM 3 overlap     mask_i AND mask_j, no dilation. One point, no parameter.
-
-    SAM 3 dilated     dilate(mask_i, r) AND dilate(mask_j, r), r swept. The
-                      method under test.
-
-POINT COVERAGE IS OVER POINTS, AREA IS OVER IMAGES
-
-Matching evaluate_contact, so the numbers here are readable against it:
-point coverage = covered clicks / all clicks; a-bar = mean over images of
-area/crop.
-
-Images marked "no contact" are excluded: coverage is undefined without clicks, so
-they can only dilute the area axis. Their cost is real and is printed
-separately, not folded into the curve.
-
-An image where the region comes out EMPTY stays in, contributing 0 coverage and 0
-area. In a proposal task "proposed nothing" is a failure, not a perfectly small
-region, and dropping those images would flatter whichever family produced them.
-"""
 
 import argparse
 import csv
@@ -76,16 +16,9 @@ from contactTest.src.utils import load_config
 
 CONTACT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
-# Sparse defaults for a single --split run. The values are round numbers on a
-# roughly geometric ladder with 22 forced in so the incumbent operating point
-# lands on the curve; there is no deeper justification, which is why
-# --all-compare uses the dense grids below instead.
 RADII = [4, 8, 12, 16, 22, 30, 40, 55]
 SCALES = [0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0]
 
-# --all-compare. Dense enough that the sampling grid stops being a choice worth
-# defending: every radius is visited, and the scale axis is log-spaced because
-# the plot's x axis is.
 DENSE_RADII = list(range(1, 51))
 DENSE_SCALES = list(np.geomspace(0.001, 1.0, 100))
 
@@ -98,7 +31,6 @@ MAPPING = {
 
 FAM_ORDER = ["merged box", "box intersection", "inscribed ellipse",
              "midpoint disc", "SAM 3 overlap", "SAM 3 dilated"]
-# Families with no parameter, drawn as a single marker rather than a line.
 SINGLE_POINT = {"merged box", "SAM 3 overlap"}
 STYLE = {
     "merged box":        ("0.35",             "s"),
@@ -111,7 +43,6 @@ STYLE = {
 
 
 def scaled_rect(b, factor, h, w):
-    """`b` scaled about its centre so its area is `factor` x the original."""
     cx, cy = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
     s = float(np.sqrt(max(factor, 0.0)))
     hw, hh = (b[2] - b[0]) / 2.0 * s, (b[3] - b[1]) / 2.0 * s
@@ -158,7 +89,6 @@ def covered(region, points):
     return n
 
 def sweep(split, cfg, seg, radii, scales, gt_path=None, limit=0):
-    """Every family on one split. Returns (rows, n_images, n_points)."""
     gt_path = gt_path or os.path.join(CONTACT_ROOT, "log", "annotate", split,
                                       "contact_gt.csv")
     if not os.path.exists(gt_path):
@@ -190,13 +120,11 @@ def sweep(split, cfg, seg, radii, scales, gt_path=None, limit=0):
             try:
                 masks = (load_masks(rec, shape) if seg is None
                          else seg.assign_to_boxes(bgr, [b1, b2]))
-            except Exception as err:                 # noqa: BLE001
+            except Exception as err:
                 print(f"[roi] SAM 3 failed on {rel}: {err}")
                 masks = None
             if masks is None or len(masks) < 2:
                 no_mask += 1
-                # Kept, not skipped: producing nothing on an image is a failure
-                # of the proposal, and dropping it would hide that.
                 masks = [np.zeros(shape, np.uint8), np.zeros(shape, np.uint8)]
             masks = [np.asarray(m).astype(np.uint8) for m in masks]
 
@@ -213,9 +141,6 @@ def sweep(split, cfg, seg, radii, scales, gt_path=None, limit=0):
         for r in radii:
             regions[("midpoint disc", float(r))] = disc_mask(shape, mid, r)
         if masks is not None:
-            # r = 0 IS the plain mask intersection, so it is the same family's
-            # left-hand end, not a separate method. It is named apart only so
-            # the figure can mark it.
             regions[("SAM 3 overlap", 0.0)] = (masks[0] > 0) & (masks[1] > 0)
             for r in radii:
                 regions[("SAM 3 dilated", float(r))] = band(masks[0], masks[1], r)
@@ -262,9 +187,6 @@ def write_csv(rows, path):
 
 
 def draw_panel(ax, rows, title, n_img, n_pts, mark_r=22.0, legend=False):
-    """One panel. Dense families are drawn as lines with no per-point markers;
-    only the r = mark_r operating point and the two single-point families get
-    a marker, so the curve stays readable at 50-100 samples."""
     by = {}
     for r in rows:
         by.setdefault(r["family"], []).append(r)
@@ -312,21 +234,15 @@ def main():
     ap.add_argument("--config", default=os.path.join(CONTACT_ROOT, "config.yaml"))
     ap.add_argument("--split", default="all",
                     choices=["train", "val", "test", "all", "known_interact"])
-    ap.add_argument("--all-compare", action="store_true",
-                    help="sweep all, train and known_interact on the dense "
-                         "grids and draw them as three panels side by side. "
-                         "Ignores --split, --radii and --scales")
+    ap.add_argument("--all-compare", action="store_true")
     ap.add_argument("--source", default="sam3_text", choices=["sam3_text", "cache"])
-    ap.add_argument("--baselines-only", action="store_true",
-                    help="skip every SAM 3 family; needs no model and no GPU")
+    ap.add_argument("--baselines-only", action="store_true")
     ap.add_argument("--weights", default=None)
     ap.add_argument("--text", default="cow")
     ap.add_argument("--conf", type=float, default=None)
     ap.add_argument("--radii", default=",".join(str(r) for r in RADII))
     ap.add_argument("--scales", default=",".join(str(s) for s in SCALES))
-    ap.add_argument("--mark-r", type=float, default=22.0,
-                    help="operating point circled on the radius-parameterised "
-                         "curves")
+    ap.add_argument("--mark-r", type=float, default=22.0)
     ap.add_argument("--gt", default=None)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--no-plot", action="store_true")

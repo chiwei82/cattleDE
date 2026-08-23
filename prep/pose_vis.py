@@ -1,15 +1,3 @@
-"""
-Visualize HRNet pose estimation on random dataset frames.
-
-Randomly samples frames from data/object/{train,val,test}/images/, runs the
-same YOLO -> crop -> HRNet pipeline as interaction_prep.py, and draws the
-17 AP-10K keypoints + skeleton of every detected cow onto the full frame.
-Results are written to simu/pose/.
-
-Usage (from the repo root):
-  python prep/pose_vis.py [--num 20] [--conf_kp 0.3] [--device cuda]
-"""
-
 import argparse
 import os
 import random

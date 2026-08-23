@@ -1,34 +1,3 @@
-"""
-Auto-fill missing cattle labels across all splits using an independent COCO
-detector, producing a corrected dataset the OBB model can be RETRAINED on.
-
-Motivation: the original labels (from tracklets.json) miss ~22% of cattle.
-During training those unlabeled cattle act as negatives, so the model is
-punished for confidently detecting real cows -> it learns to output low
-confidence (high recall only at a low confidence threshold). Filling the
-missing labels removes that penalty.
-
-Method: run an off-the-shelf COCO-pretrained YOLO (class "cow") as an
-INDEPENDENT second opinion on every split, and add any cow it finds that has no
-overlapping existing label.
-
-Caveats (state these when reporting results):
-  - NO manual annotation — this is a pseudo-label set, not clean ground truth.
-  - COCO outputs AXIS-ALIGNED boxes; added labels therefore have no orientation,
-    which slightly degrades OBB tightness supervision on the added ~22%.
-  - COCO's cattle are mostly side-view vs this dataset's overhead view, so it
-    may also miss some cattle (a recall ceiling this cannot fix).
-
-Output (does NOT touch the original dataset):
-  <output_dir><suffix>/
-    <split>/images/   -> symlinks to the original images
-    <split>/labels/   -> original labels + added cow boxes (axis-aligned OBB)
-    object_pseudo.yaml
-
-Usage (from the repo root, on a machine with the venv):
-  python prep/pseudo_label.py
-"""
-
 import argparse
 import os
 import shutil

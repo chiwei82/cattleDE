@@ -1,19 +1,3 @@
-"""
-HRNet-W32 backbone matching mmpose 0.x AP-10K checkpoint keys exactly.
-
-Key layout in checkpoint:
-  backbone.conv1 / bn1 / conv2 / bn2          — stem (stride-2 twice → H/4)
-  backbone.layer1.{0-3}.*                      — 4 Bottleneck blocks, 64→256 ch
-  backbone.transition1.{0,1}.*                 — split 256 → [32, 64]
-  backbone.stage2.0.branches.{0,1}.{0-3}.*    — 2-branch HRModule, BasicBlock×4
-  backbone.stage2.0.fuse_layers.*
-  backbone.transition2.{2}.*                  — add 128-ch branch
-  backbone.stage3.{0-3}.*                     — 4× HRModule, 3 branches
-  backbone.transition3.{3}.*                  — add 256-ch branch
-  backbone.stage4.{0-2}.*                     — 3× HRModule, 4 branches
-  keypoint_head.final_layer.weight/bias        — (17, 32, 1, 1)
-"""
-
 import torch
 import torch.nn as nn
 

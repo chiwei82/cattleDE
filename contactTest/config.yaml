@@ -1,191 +1,81 @@
-# Configuration for the weakly-supervised contact-localisation experiment.
-#
-# This file is SELF-CONTAINED: contactTest never reads or writes global_config.yaml.
-# Every input path is relative to the repository root (cattleDE/); every output
-# path is relative to contactTest/ so that nothing outside this folder is touched.
 
 random_seed: 42
 
-# ── Inputs (read-only, resolved against the repository root) ──────────────────
 data:
-  # Annotation CSV produced by data/merge_label_studio_export.py.
   csv: data/annotated/annotated_interaction_test.csv
-  # Crop images are referenced by the CSV 'image_path' column, which is already
-  # repo-root-relative (data/interaction/{split}/crops/{video}/frame_*.jpg).
-  # The crop is exactly the merged_bbox region of the source frame, un-resized;
-  # it is clipped at the frame border, so rel-boxes are clamped to the real size.
 
-  # Per-pair SAM instance masks, written by precompute_masks.py. Path is under
-  # contactTest/. When a mask file exists the candidate region R is built from
-  # the dilated MASK intersection — a band along where the outlines actually
-  # meet — instead of the dilated BOX intersection, which is a rectangle
-  # covering ~23% of the canvas and mostly torso, floor and railing.
   mask_dir: log/mask_cache
 
-  # Append mask_i / mask_j / proximity as input planes (3 RGB -> 6 channels).
-  # RGB alone never says which pixels belong to which animal, so the network has
-  # to infer the instance boundary from 240 positives. These planes hand it over
-  # directly, and the proximity plane is specifically the quantity that
-  # separates contact from mere closeness. Requires the mask cache.
   mask_channels: false
-  # proximity = exp(-(dist_to_i + dist_to_j) / gap_scale_px), evaluated on the
-  # letterboxed canvas: 1 where the two surfaces touch, decaying with the gap.
   gap_scale_px: 15.0
-  # SAM 3 is loaded by contactTest/sam3.py from the Hugging Face hub, not from a
-  # local .pt. The default id lives in that module; --weights takes an id or a
-  # local snapshot DIRECTORY. `sam_weights` below is dead and nothing reads it.
-  # sam_weights: sam_b.pt
 
-  # Source videos, for evaluate_wholeframe.py. The crops were cut straight from
-  # video rather than from stored frames, so the whole-frame control has to
-  # decode them; `frame_number` in the CSV is the raw decoder index, so seeking
-  # is exact. The search is recursive, so the parent of the batch folders works
-  # and the spaces in their names never have to be typed.
-  #
-  # Mirrors interaction_prep.video_dir of global_config.yaml, and the pair rule
-  # below mirrors interaction_prep.iou_low / iou_high. Duplicated rather than
-  # imported so contactTest stays self-contained, exactly as the pose block is.
-  # Read-only. If prep is ever re-run against different footage, these are the
-  # two entries that have to be brought back into step.
   video_dir: "/user/work/sf24225/data/Full_behav/Videos to process batch 1 - social contacts"
   pair_iou_low: 0.1
   pair_iou_high: 0.8
-  # Frames per second at which prep walked each video. Mirrors
-  # interaction_prep.sample_fps; prep_sam3 needs it to visit the same frames
-  # rather than only the ones the other detector already produced a pair in.
   sample_fps: 1.0
-  # Confidence floor for SAM 3 concept segmentation, used EVERYWHERE SAM 3 is
-  # asked to do the first stage's job. Mirrors the VALUE of
-  # interaction_prep.yolo_conf, which was chosen on best F1 for the detector.
-  #
-  # It is not the same QUANTITY. YOLO's conf is a detection confidence; SAM 3's
-  # is pred_logits.sigmoid() * presence_logits.sigmoid(). Equal numbers do not
-  # mean equal strictness, and nothing here claims they do — the value is
-  # matched so that neither stage is quietly given an easier threshold than the
-  # other, which is what happened while this was left at a default nobody had
-  # discussed.
   sam3_conf: 0.6
 
-# ── Label mapping ─────────────────────────────────────────────────────────────
-# Mirrors the rule already used by train/interaction_with_image.py so that this
-# experiment trains on exactly the same rows as the stage-2 classifier.
 labels:
   no_interaction_names: [no_interaction, none, no, "0"]
-  exclude_names: ["not well-cropped"]   # bad crops -> dropped
-  # label_v2 values to drop from the POSITIVE class. 'interest' denotes attention
-  # towards another animal, which need not involve physical contact — keeping it
-  # injects positives with no contact to localise. Empty list = keep parity with
-  # the existing binary classifier. See README.md before changing this.
+  exclude_names: ["not well-cropped"]
   exclude_positive_v2: []
 
-# ── Depth (Depth Anything V2) ─────────────────────────────────────────────────
-# The contact band is built from two silhouettes, which is an image-plane
-# statement only: from an overhead camera, two projections that meet may be
-# touching or may be a metre apart with one animal behind the other. Depth is
-# the axis that separates those, and it is the one thing tuning the dilation
-# radius can never supply.
-#
-# Written by precompute_depth.py; read by sam_contact_region.py when a tolerance
-# is supplied. Nothing outside contactTest/ is touched.
 depth:
   cache_dir: log/depth_cache
-  encoder: vitl            # vits | vitb | vitl  (relative checkpoints)
-  # Tolerance is a fraction of the crop's own robust depth spread (2nd to 98th
-  # percentile), not an absolute distance: the relative checkpoints predict
-  # inverse depth up to an unknown scale, so only within-crop comparisons mean
-  # anything. Two surfaces count as "the same range" when they differ by less
-  # than this. Measure before trusting any value — score_contact reports whether
-  # the gate beats deleting the same number of pixels at random.
+  encoder: vitl
   tol: 0.05
 
-# ── Contact-candidate region R_ij ─────────────────────────────────────────────
 region:
-  # Dilation radius in pixels, applied AFTER letterboxing (i.e. in model input
-  # space, not source-frame space).
   dilate_px: 15
-  # If the dilated intersection ends up smaller than this many pixels, fall back
-  # to the dilated union so the MIL pooling always has a non-empty bag.
   min_area_px: 64
 
-# ── Pose (HRNet-W32 / AP-10K, 17 quadruped keypoints) ─────────────────────────
-# Values mirror the hrnet block of global_config.yaml. They are duplicated here
-# rather than imported so contactTest stays self-contained; the checkpoint itself
-# is only ever read, never written.
 pose:
   hrnet_ckpt: checkpoints/hrnet_w32_ap10k_256x256-18aac840_20211029.pth
   num_joints: 17
   input_size: 256
   hmap_size: 64
-  # Feed cached keypoints to the model. Requires precompute_pose.py to have run;
-  # pair with model.pooling = keypoint. Leaving this false reproduces the
-  # pixel-space baseline, so the two are a clean ablation of each other.
   use_in_model: false
   cache_dir: log/pose_cache
-  radius_px: 18       # disk radius around a joint, in canvas pixels
-  proximity_px: 60    # a joint joins the bag only if this close to the other cow
-  pool_topk: 3        # joints averaged to form the pair score
+  radius_px: 18
+  proximity_px: 60
+  pool_topk: 3
 
-  # Soft contact prior. The only route that tolerates unreliable keypoints:
-  # a Gaussian hint at the shortest head-to-body link, applied to POSITIVES
-  # only, per-sample scaled by pose confidence. The binary label — negatives
-  # above all — still does the correcting, so the model has to learn what
-  # separates contact from mere proximity instead of copying the rule.
-  # Needs use_in_model: true (the keypoints come from the same cache).
   prior:
     enabled: false
-    weight: 0.15      # keep small; large values just reproduce the rule
-    sigma_scale: 0.5  # blob sigma = this x the link length, so a long
-    sigma_min_px: 12  # (uncertain) link yields a broad and therefore weak hint
+    weight: 0.15
+    sigma_scale: 0.5
+    sigma_min_px: 12
     sigma_max_px: 45
     conf_weighting: true
-  # Keypoints below this heatmap confidence are treated as missing. HRNet was
-  # trained on ground-level animal photos, so an overhead pen camera is out of
-  # distribution — check the per-joint confidences the visualiser reports before
-  # relying on any of this.
   min_conf: 0.3
 
-# ── Model ─────────────────────────────────────────────────────────────────────
 model:
-  image_size: 224           # must be a multiple of the backbone patch size
-  # 'timm' keeps the dependency set identical to the rest of the repo and can be
-  # initialised from the existing action encoder. 'dinov2' needs torch.hub access
-  # (downloads weights) but gives noticeably sharper spatial features.
-  backbone: timm            # timm | dinov2
+  image_size: 224
+  backbone: timm
   timm_name: vit_base_patch16_224
   dinov2_name: dinov2_vitl14
-  # Warm-start the timm ViT from the stage-1 action encoder. Read-only use of an
-  # external checkpoint; null disables it and falls back to ImageNet weights.
   action_ckpt: checkpoints/action.ckpt
-  freeze_blocks: 8          # number of leading transformer blocks kept frozen
-  # MIL pooling over the candidate region.
-  #   topk  average the highest `topk_frac` of R. The score depends on many
-  #         pixels at once, so the model must commit to a REGION. Preferred.
-  #   lse   log-sum-exp with the tau schedule below. At tau_end = 10 this
-  #         degenerates into a max: only the argmax pixel receives gradient and
-  #         the heatmap collapses to a single point. Kept for comparison only.
-  pooling: topk             # topk | lse
-  topk_frac: 0.05           # fraction of |R| averaged; 5% of ~17.6k px ~= 880 px
-  tau_start: 1.0            # (lse only) temperature at epoch 0   — mean-like
-  tau_end: 3.0              # (lse only) temperature at the last epoch
+  freeze_blocks: 8
+  pooling: topk
+  topk_frac: 0.05
+  tau_start: 1.0
+  tau_end: 3.0
 
-# ── Losses ────────────────────────────────────────────────────────────────────
 loss:
-  lambda_sparsity: 0.01     # L1 on the heatmap, area-normalised
-  lambda_tv: 0.3            # total variation, encourages one connected blob
-  auto_pos_weight: true     # BCE pos_weight = n_neg / n_pos from the train split
+  lambda_sparsity: 0.01
+  lambda_tv: 0.3
+  auto_pos_weight: true
 
-# ── Training ──────────────────────────────────────────────────────────────────
 train:
   epochs: 20
   batch_size: 16
-  lr_backbone: 0.000005     # 5e-6
-  lr_head: 0.0001           # 1e-4
+  lr_backbone: 0.000005
+  lr_head: 0.0001
   weight_decay: 0.05
   num_workers: 8
   amp: true
   hflip_prob: 0.5
 
-# ── Outputs (relative to contactTest/, never written outside it) ──────────────
 output:
   run_dir: log/contact
   ckpt_name: contact_mil.pt

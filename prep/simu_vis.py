@@ -1,16 +1,3 @@
-"""
-Visualize the YOLO OBB training data produced by yolo_prep.py.
-
-For every image in data/object/{split}/images/, reads the same-name .txt
-label, denormalizes the 4 OBB corner points back to pixel coordinates, and
-draws each box on the image — i.e. exactly what the model will be trained
-on. Results are written to simu/{split}/ with the split and box count
-stamped on the image.
-
-Usage (from the repo root):
-  python prep/simu_vis.py [--limit N]   # N images per split, default all
-"""
-
 import argparse
 import os
 

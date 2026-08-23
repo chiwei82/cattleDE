@@ -1,19 +1,3 @@
-"""Cache AP-10K keypoints for every labelled pair crop.
-
-Usage (from the repository root):
-
-    python -m contactTest.precompute_pose                # all splits
-    python -m contactTest.precompute_pose --split train  # one split
-    python -m contactTest.precompute_pose --overwrite    # rebuild the cache
-
-Writes one .npz per pair under contactTest/log/pose_cache/, mirroring the crop's
-relative path. Each file holds a (2, 17, 3) array of [x, y, conf] in PAIR-CROP
-pixel coordinates, plus the crop size the coordinates refer to.
-
-Pose is cached rather than computed in the data loader: HRNet is heavier than
-the contact model itself, the keypoints never change between epochs, and caching
-keeps the training step free of a second network.
-"""
 
 import argparse
 import os
@@ -79,7 +63,6 @@ def main():
             print(f"[pose] {i + 1}/{len(records)}  written {done}  skipped {skipped}")
 
     print(f"[pose] done: {done} written, {skipped} already cached, {failed} unreadable")
-    print(f"[pose] set pose.use_in_model: true in the config to train with these")
 
 
 if __name__ == "__main__":
