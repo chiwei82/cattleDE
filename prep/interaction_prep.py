@@ -20,7 +20,6 @@ import yaml
 # hrnet.py lives in customization/src/ (distinct from the repo-root src/ package).
 # Inserting customization/ at the front of sys.path makes this src resolve first.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from src.hrnet import HRNetW32
 
 # ── Config (see global_config.yaml at the repository root) ────────────────────
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -53,33 +52,41 @@ CSV_FIELDNAMES = [
 
 # ── HRNet ──────────────────────────────────────────────────────────────────────
 
-class KeypointHead(nn.Module):
-    def __init__(self, in_channels: int = 32, num_joints: int = NUM_JOINTS):
-        super().__init__()
-        self.final_layer = nn.Conv2d(in_channels, num_joints, kernel_size=1)
+# HRNet-W32 config matching the Animal Kingdom checkpoint (leoxiaobin pose_hrnet,
+# trained with experiments/mpii/hrnet/w32_256x256_adam_lr1e-3_akP1.yaml). The
+# final_layer outputs NUM_JOINTS (23 for AK) channels; the model returns heatmaps
+# directly, so no separate keypoint head is needed.
+_AK_HRNET_CFG = {
+    "MODEL": {
+        "NUM_JOINTS": NUM_JOINTS,
+        "INIT_WEIGHTS": False,
+        "PRETRAINED": "",
+        "EXTRA": {
+            "PRETRAINED_LAYERS": ["*"],
+            "FINAL_CONV_KERNEL": 1,
+            "STAGE2": {"NUM_MODULES": 1, "NUM_BRANCHES": 2, "BLOCK": "BASIC",
+                       "NUM_BLOCKS": [4, 4], "NUM_CHANNELS": [32, 64],
+                       "FUSE_METHOD": "SUM"},
+            "STAGE3": {"NUM_MODULES": 4, "NUM_BRANCHES": 3, "BLOCK": "BASIC",
+                       "NUM_BLOCKS": [4, 4, 4], "NUM_CHANNELS": [32, 64, 128],
+                       "FUSE_METHOD": "SUM"},
+            "STAGE4": {"NUM_MODULES": 3, "NUM_BRANCHES": 4, "BLOCK": "BASIC",
+                       "NUM_BLOCKS": [4, 4, 4, 4],
+                       "NUM_CHANNELS": [32, 64, 128, 256], "FUSE_METHOD": "SUM"},
+        },
+    },
+}
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.final_layer(x)
 
-
-class HRNetPoseModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.backbone = HRNetW32()
-        self.keypoint_head = KeypointHead()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.keypoint_head(self.backbone(x))
-
-
-def load_hrnet(ckpt_path: str, device: torch.device) -> HRNetPoseModel:
-    model = HRNetPoseModel().to(device)
+def load_hrnet(ckpt_path: str, device: torch.device) -> nn.Module:
+    """Build the AK pose_hrnet (23 joints) and load the trained checkpoint.
+    final_state.pth is a plain model state_dict; checkpoint.pth wraps it under
+    'state_dict'. Both are handled."""
+    from src.pose_hrnet import get_pose_net
+    model = get_pose_net(_AK_HRNET_CFG, is_train=False).to(device)
     raw   = torch.load(ckpt_path, map_location=device, weights_only=True)
-    state = raw.get("state_dict", raw.get("model", raw))
-    state = {
-        k.removeprefix("module.").removeprefix("model.").removeprefix("net."): v
-        for k, v in state.items()
-    }
+    state = raw.get("state_dict", raw) if isinstance(raw, dict) else raw
+    state = {k.removeprefix("module."): v for k, v in state.items()}
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
         print(f"  [WARN] HRNet: {len(missing)} missing keys (e.g. {missing[0]})")
@@ -109,7 +116,7 @@ def decode_heatmaps(heatmaps: np.ndarray) -> np.ndarray:
 
 
 @torch.no_grad()
-def run_hrnet(crops_pil: List[Image.Image], model: HRNetPoseModel,
+def run_hrnet(crops_pil: List[Image.Image], model: nn.Module,
               device: torch.device) -> np.ndarray:
     """Returns heatmaps (N, J, H, W)."""
     tensor = torch.stack([_HRNET_TRANSFORM(img) for img in crops_pil]).to(device)
@@ -238,7 +245,7 @@ def process_video(
     output_dir: str,
     split: str,
     yolo_model: YOLO,
-    hrnet_model: HRNetPoseModel,
+    hrnet_model: nn.Module,
     device: torch.device,
     sample_fps: float,
     iou_low: float,

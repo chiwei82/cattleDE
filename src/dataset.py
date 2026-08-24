@@ -574,7 +574,7 @@ class CattleCroppedInteractionDataset(Dataset):
             pose = torch.cat((pose1, pose2), dim=-1)
         else:
             num_coords = 3
-            num_joints = 17
+            num_joints = 23  # Animal Kingdom keypoint count
             pose = torch.zeros(
                 (num_coords, 1, num_joints, self.num_instance), dtype=torch.float32
             )

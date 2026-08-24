@@ -13,7 +13,7 @@ paths:
   annotated_dir: data/annotated   # annotated_{action,interaction}.csv live here
   data_root: /user/work/sf24225/data/Full_behav/Marco
   clips_dir: /user/work/sf24225/data/Full_behav/Marco/clips
-  hrnet_ckpt: checkpoints/hrnet_w32_ap10k_256x256-18aac840_20211029.pth
+  hrnet_ckpt: checkpoints/AK_hrnet_final.pth  # HRNet-W32 trained on Animal Kingdom (23 kpts)
   yolo_ckpt: checkpoints/yolo_pseudo.pt  # retrained on pseudo-labels (fixes confidence suppression)
   action_ckpt: checkpoints/action.ckpt        # produced by train/action_with_image.py
   interaction_ckpt: checkpoints/interaction.ckpt  # produced by train/interaction_with_image.py
@@ -76,6 +76,16 @@ interaction_train:
   pre_fusion_temperature: 0.07   # InfoNCE temperature
   pre_fusion_margin: 0.2         # (used only when pre_fusion_loss = triplet)
   pre_fusion_weight: 0.1         # weight of the pre-fusion loss
+  # Skeleton-aware Cutout on the training crops (needs HRNet poses in the CSV,
+  # i.e. interaction_prep run with use_pose: true). Masks around the interaction-
+  # defining joints (head/neck/torso) using the AK 23-keypoint joint map.
+  skeleton_aug:
+    use: true
+    cutout_prob: 0.5
+    n_holes: 3
+    scale: [0.02, 0.2]
+    ratio: [0.3, 3.3]
+    margin: 10
 
 # ── YOLO OBB training (main_task.sh) ──────────────────────────────────────────
 yolo_train:
@@ -118,7 +128,7 @@ pseudo_label:
 interaction_prep:
   video_dir: "/user/work/sf24225/data/Full_behav/Videos to process batch 1 - social contacts"
   output_dir: data/interaction
-  use_pose: false         # false = skip HRNet entirely; pose columns stay empty
+  use_pose: true          # run HRNet (AK 23-kpt) and fill pose_path_1/2 in the CSV
   sample_fps: 1.0
   iou_low: 0.1
   iou_high: 0.8
@@ -136,6 +146,6 @@ action_prep:
 
 # ── HRNet constants ────────────────────────────────────────────────────────────
 hrnet:
-  num_joints: 17
+  num_joints: 23         # Animal Kingdom keypoint count (was 17 for AP-10K)
   input_size: 256
   hmap_size: 64

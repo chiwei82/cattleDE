@@ -56,7 +56,7 @@ def load_pose_model():
 
 
 def estimate_poses(frames_bgr, pose_model, device):
-    """Return 17 keypoints [x, y, conf] per frame (whole cow crop) in crop-pixel
+    """Return 23 keypoints [x, y, conf] per frame (whole cow crop) in crop-pixel
     coordinates. CattleActionDataset normalizes them by the image size."""
     from interaction_prep import run_hrnet, decode_heatmaps, HMAP_SIZE
     results = []

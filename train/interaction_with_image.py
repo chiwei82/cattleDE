@@ -23,6 +23,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.dataset import CattleCroppedInteractionDataset
 from src.loss_utils import InfoNCE, LDAMLoss, FocalLoss
+from src.interaction_eval import PredictionCollector
+from src.augmentation import ImageMaskingFromSkeletonForInteraction, AK_JOINT_MAP
 
 # ── Config (see global_config.yaml at the repository root) ────────────────────
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -237,6 +239,11 @@ class LitHybridStreamFusion(pl.LightningModule):
         self.val_metrics = metrics.clone(prefix="val_")
         self.test_metrics = metrics.clone(prefix="test_")
 
+        # Optional per-sample prediction logger for the test split (set by main()).
+        # When present, test_step records image_path / predicted / truth for the
+        # confusion matrix and false-case CSVs.
+        self.test_collector = None
+
     def load_vit_backbone_from_checkpoint(self, ckpt_path: str) -> None:
         print(f"Loading ViT backbone weights from checkpoint: {ckpt_path}")
         state_dict = torch.load(ckpt_path, map_location="cpu")["state_dict"]
@@ -345,11 +352,21 @@ class LitHybridStreamFusion(pl.LightningModule):
         return self.pre_fusion_criterion(anchor_embs, positive_embs, negative_embs)
 
     def _shared_step(self, batch, stage: str) -> torch.Tensor:
-        images1, images2, images_context, labels, _ = batch
+        images1, images2, images_context, labels, supp = batch
         logits, pre_fusion_features, features_context_infonce = self(
             images1, images2, images_context
         )
         features1, features2, _ = pre_fusion_features
+
+        # Record per-sample predictions on the test split for confusion-matrix
+        # and false-case analysis (image_path comes from the batch supplement).
+        if stage == "test" and self.test_collector is not None:
+            preds = logits.argmax(dim=1)
+            self.test_collector.add(
+                supp["image_path"],
+                preds.detach().cpu().tolist(),
+                labels.detach().cpu().tolist(),
+            )
 
         main_loss = self.classification_criterion(logits, labels)
         pre_fusion_loss = self._compute_pre_fusion_loss(
@@ -424,6 +441,12 @@ class LitHybridStreamFusion(pl.LightningModule):
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
         self.test_metrics.reset()
 
+        if self.test_collector is not None and self.test_collector.rows:
+            pred_csv, false_csv = self.test_collector.write()
+            print(self.test_collector.report())
+            print(f"[interaction] per-sample predictions -> {pred_csv}")
+            print(f"[interaction] false cases (FP+FN)    -> {false_csv}")
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -461,6 +484,24 @@ class CattleInteractionDataModule(pl.LightningDataModule):
             T.Resize((image_size, image_size)), T.ToTensor(), normalize,
         ])
 
+        # Skeleton-aware Cutout on the merged two-cow crop (needs HRNet poses).
+        # When enabled, the train dataset loads poses (use_pose=True) and masks
+        # around the interaction-defining joints. Falls back to no masking on any
+        # sample whose poses are missing/invalid.
+        sk = cfg.get("skeleton_aug", {}) or {}
+        self.use_skeleton_aug = bool(sk.get("use", False))
+        if self.use_skeleton_aug:
+            self.skeleton_aware_transform = ImageMaskingFromSkeletonForInteraction(
+                joint_map=AK_JOINT_MAP,
+                cutout_prob=sk.get("cutout_prob", 0.5),
+                n_holes=sk.get("n_holes", 3),
+                scale=tuple(sk.get("scale", [0.02, 0.2])),
+                ratio=tuple(sk.get("ratio", [0.3, 3.3])),
+                margin=sk.get("margin", 10),
+            )
+        else:
+            self.skeleton_aware_transform = None
+
     def _binary_label(self, row):
         """Map a CSV row to a binary label: 0 = no interaction, 1 = interaction.
         Prefers an explicit has_interaction/label column, else derives from
@@ -480,6 +521,11 @@ class CattleInteractionDataModule(pl.LightningDataModule):
             return None            # unlabelled or excluded -> dropped from training
         return 0 if v1 in no_names else 1
 
+    def _resolve(self, p):
+        """Join a repo-relative path onto repo_root; empty stays empty."""
+        p = (p or "").strip()
+        return os.path.join(self.cfg["repo_root"], p) if p else ""
+
     def _load_entries(self):
         import csv
         entries = []
@@ -493,6 +539,10 @@ class CattleInteractionDataModule(pl.LightningDataModule):
                     "bbox1_xyxy": row.get("bbox1_xyxy", "[0 0 0 0]"),
                     "bbox2_xyxy": row.get("bbox2_xyxy", "[0 0 0 0]"),
                     "merged_bbox_xyxy": row.get("merged_bbox_xyxy", "[0 0 0 0]"),
+                    # HRNet pose .npy for each cow (needed by the skeleton-aware
+                    # transform; empty if interaction_prep ran with use_pose=false).
+                    "pose_path_1": self._resolve(row.get("pose_path_1", "")),
+                    "pose_path_2": self._resolve(row.get("pose_path_2", "")),
                     "split": (row.get("split") or "").strip(),
                     "label": label,
                 })
@@ -521,8 +571,12 @@ class CattleInteractionDataModule(pl.LightningDataModule):
         if self._val_empty:
             print("[interaction] [WARN] val split empty — checkpointing on the last epoch.")
 
+        # Train applies skeleton-aware Cutout (needs poses); val/test stay clean.
         self.train_dataset = CattleCroppedInteractionDataset(
-            entries=buckets["train"], transform=self.transform_train, use_pose=False)
+            entries=buckets["train"], transform=self.transform_train,
+            use_pose=self.use_skeleton_aug,
+            skeleton_aware_transform=self.skeleton_aware_transform,
+            is_aware_skeleton=self.use_skeleton_aug)
         self.val_dataset = CattleCroppedInteractionDataset(
             entries=buckets["val"], transform=self.transform_val, use_pose=False)
         self.test_dataset = CattleCroppedInteractionDataset(
@@ -666,6 +720,8 @@ def main() -> None:
 
     best = checkpoint_callback.best_model_path or checkpoint_callback.last_model_path
     if not getattr(data_module, "_test_empty", False):
+        # Log per-sample test predictions (confusion matrix + false-case CSVs).
+        model.test_collector = PredictionCollector(out_dir=run_dir, split="test")
         trainer.test(datamodule=data_module, ckpt_path=best)
     else:
         print("[interaction] test split empty — skipping test.")
