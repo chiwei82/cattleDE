@@ -69,6 +69,13 @@ interaction_train:
   # Loss (output stays BINARY). main_loss shapes the classifier; pre_fusion_loss
   # (InfoNCE) aligns the interaction/context feature with its constituent cattle
   # (action) features before fusion. Values follow reproduction/CattleAct.
+  # Training-set resampling for the class imbalance:
+  #   weighted       -> WeightedRandomSampler, balance to 50/50 in a fixed budget
+  #                     (drops ~half the negatives, repeats positives ~n0/n1 x)
+  #   oversample_pos -> keep ALL negatives once, repeat each positive oversample_factor
+  #                     times (null = repeat to match the negative count)
+  sampler: weighted
+  oversample_factor: null
   main_loss: ldam                # cross_entropy | focal | ldam
   ldam_max_m: 0.5
   ldam_s: 30.0

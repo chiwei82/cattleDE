@@ -66,17 +66,26 @@ class PredictionCollector:
         return out
 
     def metrics(self):
-        """Derived scores from the confusion matrix (interaction = positive)."""
+        """Derived scores from the confusion matrix (interaction = positive).
+        Includes the counts (TP/TN/FP/FN), the four rates (TPR/TNR/FPR/FNR) and
+        balanced accuracy = (TPR + TNR) / 2."""
         c = self.confusion()
         tp, fp, tn, fn = c["TP"], c["FP"], c["TN"], c["FN"]
         total = tp + fp + tn + fn
+        tpr = tp / (tp + fn) if (tp + fn) else 0.0   # recall / sensitivity
+        tnr = tn / (tn + fp) if (tn + fp) else 0.0   # specificity
+        fpr = fp / (fp + tn) if (fp + tn) else 0.0   # 1 - TNR
+        fnr = fn / (fn + tp) if (fn + tp) else 0.0   # 1 - TPR
         precision = tp / (tp + fp) if (tp + fp) else 0.0
-        recall = tp / (tp + fn) if (tp + fn) else 0.0
-        f1 = (2 * precision * recall / (precision + recall)
-              if (precision + recall) else 0.0)
+        f1 = (2 * precision * tpr / (precision + tpr)
+              if (precision + tpr) else 0.0)
         accuracy = (tp + tn) / total if total else 0.0
-        return {"precision": precision, "recall": recall,
-                "f1": f1, "accuracy": accuracy, "n": total}
+        balanced_accuracy = (tpr + tnr) / 2
+        return {"tp": tp, "tn": tn, "fp": fp, "fn": fn,
+                "tpr": tpr, "tnr": tnr, "fpr": fpr, "fnr": fnr,
+                "precision": precision, "recall": tpr, "f1": f1,
+                "accuracy": accuracy, "balanced_accuracy": balanced_accuracy,
+                "n": total}
 
     # ── output ──────────────────────────────────────────────────────────────
     def _dump(self, path, rows, fieldnames):
@@ -104,8 +113,12 @@ class PredictionCollector:
             f"                 truth T   truth F\n"
             f"    pred T   {c['TP']:8d}  {c['FP']:8d}   (TP, FP)\n"
             f"    pred F   {c['FN']:8d}  {c['TN']:8d}   (FN, TN)\n"
-            f"    n={m['n']}  acc={m['accuracy']:.4f}  "
-            f"precision={m['precision']:.4f}  recall={m['recall']:.4f}  "
+            f"    counts   TP={m['tp']}  TN={m['tn']}  FP={m['fp']}  FN={m['fn']}  n={m['n']}\n"
+            f"    rates    TPR={m['tpr']:.4f}  TNR={m['tnr']:.4f}  "
+            f"FPR={m['fpr']:.4f}  FNR={m['fnr']:.4f}\n"
+            f"    balanced_accuracy={m['balanced_accuracy']:.4f}  "
+            f"accuracy={m['accuracy']:.4f}\n"
+            f"    precision={m['precision']:.4f}  recall(TPR)={m['tpr']:.4f}  "
             f"f1(interaction)={m['f1']:.4f}\n"
             f"    false cases: {c['FP']} FP + {c['FN']} FN = "
             f"{c['FP'] + c['FN']}"

@@ -15,8 +15,8 @@ import yaml
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import CSVLogger
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from torchmetrics import Accuracy, F1Score, MetricCollection
+from torch.utils.data import DataLoader, WeightedRandomSampler, Sampler
+from torchmetrics import Accuracy, F1Score, MetricCollection, MatthewsCorrCoef
 
 # add the parent directory to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -227,12 +227,19 @@ class LitHybridStreamFusion(pl.LightningModule):
         else:
             self.pre_fusion_criterion = None
 
+        # Imbalance-aware metrics: a majority-only classifier scores acc~=0.95 but
+        # bal_acc=0.5, macro-F1~=0.49, and mcc=0 — so these expose "just guess the
+        # majority" instead of rewarding it.
         metrics = MetricCollection(
             {
                 "acc": Accuracy(task="multiclass", num_classes=num_classes),
+                "bal_acc": Accuracy(
+                    task="multiclass", num_classes=num_classes, average="macro"
+                ),
                 "f1score": F1Score(
                     task="multiclass", num_classes=num_classes, average="macro"
                 ),
+                "mcc": MatthewsCorrCoef(task="multiclass", num_classes=num_classes),
             }
         )
         self.train_metrics = metrics.clone(prefix="train_")
@@ -463,6 +470,37 @@ class LitHybridStreamFusion(pl.LightningModule):
         }
 
 
+class OversampleMinoritySampler(Sampler):
+    """Keep every negative once and repeat each positive `factor` times, reshuffled
+    each epoch. Unlike WeightedRandomSampler (which balances to 50/50 within a fixed
+    budget and drops ~half the negatives), this keeps ALL negatives and only
+    oversamples the positives. factor=None -> repeat positives to match the negative
+    count (round(n0/n1))."""
+
+    def __init__(self, labels, factor=None):
+        labels = np.asarray(labels)
+        self.neg_idx = np.where(labels == 0)[0]
+        self.pos_idx = np.where(labels == 1)[0]
+        n0, n1 = len(self.neg_idx), len(self.pos_idx)
+        if n1 == 0:
+            self.k = 1
+        elif factor is None:
+            self.k = max(1, round(n0 / n1))       # match the negative count
+        else:
+            self.k = max(1, int(factor))
+        self.base = np.concatenate([self.neg_idx, np.tile(self.pos_idx, self.k)])
+        print(f"[interaction] oversample_pos sampler: {n0} negatives kept, "
+              f"{n1} positives x{self.k} = {len(self.base)} samples/epoch")
+
+    def __iter__(self):
+        idx = self.base.copy()
+        np.random.shuffle(idx)
+        return iter(idx.tolist())
+
+    def __len__(self):
+        return len(self.base)
+
+
 class CattleInteractionDataModule(pl.LightningDataModule):
     """Image-only, BINARY interaction DataModule reading annotated_interaction.csv.
     The split is read from the CSV 'split' column (6:2:2 from interaction_prep)."""
@@ -586,15 +624,23 @@ class CattleInteractionDataModule(pl.LightningDataModule):
         for e in buckets["train"]:
             counts[e["label"]] += 1
         self.cls_num_list = [int(c) for c in counts]
+        self.train_labels = [e["label"] for e in buckets["train"]]
         weights = 1.0 / torch.where(counts > 0, counts, torch.tensor(float("inf")))
         self.train_sampler_weights = torch.tensor(
             [weights[e["label"]] for e in buckets["train"]])
         print(f"[interaction] class counts (binary): {self.cls_num_list}")
 
     def train_dataloader(self):
-        sampler = WeightedRandomSampler(
-            weights=self.train_sampler_weights,
-            num_samples=len(self.train_sampler_weights), replacement=True)
+        mode = self.cfg.get("sampler", "weighted")
+        if mode == "oversample_pos":
+            # Keep all negatives, only repeat positives (see OversampleMinoritySampler).
+            sampler = OversampleMinoritySampler(
+                self.train_labels, factor=self.cfg.get("oversample_factor"))
+        else:
+            # Default: 50/50 balance within a fixed budget (drops ~half the negatives).
+            sampler = WeightedRandomSampler(
+                weights=self.train_sampler_weights,
+                num_samples=len(self.train_sampler_weights), replacement=True)
         return DataLoader(self.train_dataset, batch_size=self.cfg["batch_size"],
                           sampler=sampler, num_workers=self.cfg["num_workers"],
                           pin_memory=True)
@@ -623,12 +669,24 @@ def main() -> None:
                          "(True->action, False->random). Non-action runs write to "
                          "log/checkpoint paths suffixed with the init name so they "
                          "don't overwrite the action run.")
+    ap.add_argument("--skeleton_aug", choices=["on", "off"], default=None,
+                    help="Override skeleton_aug.use (pose-aware Cutout). "
+                         "Default: config value.")
+    ap.add_argument("--tag", default=None,
+                    help="Explicit suffix for the run_dir/checkpoint (e.g. _full). "
+                         "Overrides the backbone_init auto-suffix so several "
+                         "ablations don't overwrite each other.")
     args = ap.parse_args()
 
     pl.seed_everything(_CFG["random_seed"], workers=True)
 
     icfg = dict(_CFG["interaction_train"])
     icfg["repo_root"] = _REPO_ROOT
+    # CLI override of the pose-aware Cutout switch (copy the nested dict so we
+    # don't mutate the shared config object).
+    if args.skeleton_aug is not None:
+        icfg["skeleton_aug"] = dict(icfg.get("skeleton_aug", {}) or {})
+        icfg["skeleton_aug"]["use"] = (args.skeleton_aug == "on")
     icfg["interaction_csv"] = os.path.join(
         _REPO_ROOT, _CFG["paths"]["annotated_dir"], args.csv)
 
@@ -690,9 +748,12 @@ def main() -> None:
         imagenet_pretrained=imagenet_pretrained,
     )
 
-    # Non-action runs get a suffixed run_dir / checkpoint so the ablation does not
-    # overwrite the canonical action run's log/checkpoint.
-    tag = "" if backbone_init == "action" else f"_{backbone_init}"
+    # Output suffix: explicit --tag wins; otherwise non-action runs get the
+    # backbone_init name so ablations don't overwrite each other.
+    if args.tag:
+        tag = args.tag if args.tag.startswith("_") else "_" + args.tag
+    else:
+        tag = "" if backbone_init == "action" else f"_{backbone_init}"
     run_dir = os.path.join(_REPO_ROOT, icfg["run_dir"] + tag)
     if data_module._val_empty:
         checkpoint_callback = ModelCheckpoint(
