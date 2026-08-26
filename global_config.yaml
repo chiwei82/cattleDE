@@ -52,13 +52,13 @@ action_train:
 # NOTE: needs labelled data — annotated_interaction.csv label columns are blank
 # until human annotation, so this step stays disabled in main_task.sh for now.
 interaction_train:
-  epochs: 50
+  epochs: 100                  # reproduction: max_epochs 100
   batch_size: 32
   learning_rate: 0.0001
   image_size: 224
   num_workers: 8
   fusion_type: attention      # 'attention' or 'mlp'
-  pooling_type: gap           # flatten | gmp | gap | gap_gmp
+  pooling_type: flatten       # flatten | gmp | gap | gap_gmp (reproduction: flatten)
   freeze_backbone: false
   pretrained_backbone: true   # init ViT from paths.action_ckpt
   run_dir: log/interaction
@@ -86,12 +86,12 @@ interaction_train:
   # Skeleton-aware Cutout on the training crops (needs HRNet poses in the CSV,
   # i.e. interaction_prep run with use_pose: true). Masks around the interaction-
   # defining joints (head/neck/torso) using the AK 23-keypoint joint map.
-  skeleton_aug:
+  skeleton_aug:                # values follow reproduction masking_from_skeleton
     use: true
-    cutout_prob: 0.5
-    n_holes: 3
-    scale: [0.02, 0.2]
-    ratio: [0.3, 3.3]
+    cutout_prob: 1.0
+    n_holes: 5
+    scale: [0.02, 0.1]
+    ratio: [0.5, 3.0]
     margin: 10
 
 # ── YOLO OBB training (main_task.sh) ──────────────────────────────────────────

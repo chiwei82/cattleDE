@@ -82,7 +82,6 @@ class LitHybridStreamFusion(pl.LightningModule):
         pre_fusion_loss_cfg: DictConfig,
         pooling_type: str,
         pre_fusion_loss_weight: float,
-        imagenet_pretrained: bool = True,
     ):
         super().__init__()
 
@@ -119,15 +118,11 @@ class LitHybridStreamFusion(pl.LightningModule):
 
         self.save_hyperparameters(ignore=["main_loss_cfg", "pre_fusion_loss_cfg"])
 
-        is_load_pretrained = bool(vit_ckpt_path) and os.path.exists(vit_ckpt_path)
-        # The action checkpoint (if loaded) fully overrides the backbone, so the
-        # ImageNet-vs-random choice only affects the no-action-space runs.
         self.backbone_vit = timm.create_model(
-            "vit_base_patch16_224",
-            pretrained=(imagenet_pretrained and not is_load_pretrained),
-            num_classes=0,
+            "vit_base_patch16_224", pretrained=False, num_classes=0
         )
 
+        is_load_pretrained = bool(vit_ckpt_path) and os.path.exists(vit_ckpt_path)
         if is_load_pretrained:
             self.load_vit_backbone_from_checkpoint(vit_ckpt_path)
         elif vit_ckpt_path:
@@ -135,8 +130,7 @@ class LitHybridStreamFusion(pl.LightningModule):
                 f"Warning: ViT checkpoint path provided but not found at {vit_ckpt_path}."
             )
         else:
-            src = "ImageNet" if imagenet_pretrained else "random"
-            print(f"Info: No action checkpoint — backbone uses {src} weights.")
+            print("Info: No ViT checkpoint path provided. Using random weights.")
 
         if self.hparams.freeze_vit and is_load_pretrained:
             print("Freezing ViT backbone weights.")
@@ -660,15 +654,13 @@ def main() -> None:
     ap.add_argument("--csv", default="annotated_interaction.csv",
                     help="CSV filename under paths.annotated_dir "
                          "(e.g. annotated_interaction_test.csv).")
-    ap.add_argument("--backbone_init", choices=["action", "imagenet", "random"],
+    ap.add_argument("--backbone_init", choices=["action", "random"],
                     default=None,
-                    help="ViT backbone init for the ablation. 'action' = pre-train "
-                         "with the individual action space (loads paths.action_ckpt); "
-                         "'random' = no pre-training (random weights); 'imagenet' = "
-                         "ImageNet weights. Default: config pretrained_backbone "
-                         "(True->action, False->random). Non-action runs write to "
-                         "log/checkpoint paths suffixed with the init name so they "
-                         "don't overwrite the action run.")
+                    help="ViT backbone init (matches the reproduction original, "
+                         "which is either the action checkpoint or random weights "
+                         "with pretrained=False). 'action' loads paths.action_ckpt; "
+                         "'random' loads no checkpoint. Default: config "
+                         "pretrained_backbone (True->action, False->random).")
     ap.add_argument("--skeleton_aug", choices=["on", "off"], default=None,
                     help="Override skeleton_aug.use (pose-aware Cutout). "
                          "Default: config value.")
@@ -699,13 +691,8 @@ def main() -> None:
         "action" if icfg["pretrained_backbone"] else "random")
     if backbone_init == "action":
         vit_ckpt = os.path.join(_REPO_ROOT, _CFG["paths"]["action_ckpt"])
-        imagenet_pretrained = True          # irrelevant: action ckpt overrides it
-    elif backbone_init == "imagenet":
+    else:                                    # random: no checkpoint (pretrained=False)
         vit_ckpt = None
-        imagenet_pretrained = True
-    else:                                    # random = no pre-training at all
-        vit_ckpt = None
-        imagenet_pretrained = False
     print(f"[interaction] backbone_init={backbone_init}  (vit_ckpt={vit_ckpt})")
 
     # Build the loss configs (output stays binary; these only shape the objective).
@@ -745,7 +732,6 @@ def main() -> None:
         pre_fusion_loss_cfg=pre_fusion_loss_cfg,
         pooling_type=icfg["pooling_type"],
         pre_fusion_loss_weight=pre_fusion_weight,
-        imagenet_pretrained=imagenet_pretrained,
     )
 
     # Output suffix: explicit --tag wins; otherwise non-action runs get the
